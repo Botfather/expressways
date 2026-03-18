@@ -1,0 +1,11 @@
+[package]
+name = "expressways-policy"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+expressways-protocol = { path = "../expressways-protocol" }
+serde.workspace = true
+thiserror.workspace = true

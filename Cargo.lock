@@ -3,111 +3,6 @@
 version = 4
 
 [[package]]
-name = "aetherbus-audit"
-version = "0.1.0"
-dependencies = [
- "aetherbus-protocol",
- "chrono",
- "hex",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "aetherbus-auth"
-version = "0.1.0"
-dependencies = [
- "aetherbus-protocol",
- "anyhow",
- "base64",
- "chrono",
- "ed25519-dalek",
- "hex",
- "rand_core",
- "serde",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "aetherbus-client"
-version = "0.1.0"
-dependencies = [
- "aetherbus-auth",
- "aetherbus-protocol",
- "anyhow",
- "chrono",
- "clap",
- "futures-util",
- "hex",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "uuid",
-]
-
-[[package]]
-name = "aetherbus-policy"
-version = "0.1.0"
-dependencies = [
- "aetherbus-protocol",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "aetherbus-protocol"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "aetherbus-server"
-version = "0.1.0"
-dependencies = [
- "aetherbus-audit",
- "aetherbus-auth",
- "aetherbus-policy",
- "aetherbus-protocol",
- "aetherbus-storage",
- "anyhow",
- "chrono",
- "clap",
- "futures-util",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "aetherbus-storage"
-version = "0.1.0"
-dependencies = [
- "aetherbus-protocol",
- "bincode",
- "chrono",
- "serde",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -427,6 +322,111 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "expressways-audit"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "expressways-protocol",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "expressways-auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "ed25519-dalek",
+ "expressways-protocol",
+ "hex",
+ "rand_core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "expressways-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "expressways-auth",
+ "expressways-protocol",
+ "futures-util",
+ "hex",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "expressways-policy"
+version = "0.1.0"
+dependencies = [
+ "expressways-protocol",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "expressways-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "expressways-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "expressways-audit",
+ "expressways-auth",
+ "expressways-policy",
+ "expressways-protocol",
+ "expressways-storage",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "expressways-storage"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "chrono",
+ "expressways-protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

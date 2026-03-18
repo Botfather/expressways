@@ -1,0 +1,26 @@
+[package]
+name = "expressways-server"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+expressways-audit = { path = "../expressways-audit" }
+expressways-auth = { path = "../expressways-auth" }
+expressways-policy = { path = "../expressways-policy" }
+expressways-protocol = { path = "../expressways-protocol" }
+expressways-storage = { path = "../expressways-storage" }
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

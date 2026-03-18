@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-The original AetherBus concept includes advanced transport, clustering, discovery, and stream-processing capabilities. Building all of that in the first iteration would create too many simultaneous risks and make the system hard to reason about or validate.
+The original Expressways concept includes advanced transport, clustering, discovery, and stream-processing capabilities. Building all of that in the first iteration would create too many simultaneous risks and make the system hard to reason about or validate.
 
 ## Decision
 

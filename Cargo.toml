@@ -1,12 +1,12 @@
 [workspace]
 members = [
-  "crates/aetherbus-audit",
-  "crates/aetherbus-auth",
-  "crates/aetherbus-client",
-  "crates/aetherbus-policy",
-  "crates/aetherbus-protocol",
-  "crates/aetherbus-server",
-  "crates/aetherbus-storage",
+  "crates/expressways-audit",
+  "crates/expressways-auth",
+  "crates/expressways-client",
+  "crates/expressways-policy",
+  "crates/expressways-protocol",
+  "crates/expressways-server",
+  "crates/expressways-storage",
 ]
 resolver = "2"
 

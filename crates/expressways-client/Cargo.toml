@@ -1,0 +1,20 @@
+[package]
+name = "expressways-client"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+expressways-auth = { path = "../expressways-auth" }
+expressways-protocol = { path = "../expressways-protocol" }
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
