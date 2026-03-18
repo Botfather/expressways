@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub quotas: crate::quota::QuotaConfig,
     #[serde(default)]
     pub registry: RegistrySection,
+    #[serde(default)]
+    pub resilience: ResilienceSection,
     pub policy: PolicyConfig,
 }
 
@@ -51,6 +53,32 @@ pub struct StorageSection {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditSection {
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResilienceSection {
+    #[serde(default = "default_allow_degraded_startup")]
+    pub allow_degraded_startup: bool,
+    #[serde(default = "default_allow_degraded_runtime")]
+    pub allow_degraded_runtime: bool,
+    #[serde(default = "default_audit_retry_attempts")]
+    pub audit_retry_attempts: u32,
+    #[serde(default = "default_audit_retry_backoff_ms")]
+    pub audit_retry_backoff_ms: u64,
+    #[serde(default = "default_listener_retry_delay_ms")]
+    pub listener_retry_delay_ms: u64,
+}
+
+impl Default for ResilienceSection {
+    fn default() -> Self {
+        Self {
+            allow_degraded_startup: default_allow_degraded_startup(),
+            allow_degraded_runtime: default_allow_degraded_runtime(),
+            audit_retry_attempts: default_audit_retry_attempts(),
+            audit_retry_backoff_ms: default_audit_retry_backoff_ms(),
+            listener_retry_delay_ms: default_listener_retry_delay_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +130,26 @@ fn default_registry_stream_send_timeout_ms() -> u64 {
 
 fn default_registry_stream_idle_keepalive_limit() -> u64 {
     12
+}
+
+fn default_allow_degraded_startup() -> bool {
+    true
+}
+
+fn default_allow_degraded_runtime() -> bool {
+    true
+}
+
+fn default_audit_retry_attempts() -> u32 {
+    3
+}
+
+fn default_audit_retry_backoff_ms() -> u64 {
+    50
+}
+
+fn default_listener_retry_delay_ms() -> u64 {
+    250
 }
 
 impl AppConfig {

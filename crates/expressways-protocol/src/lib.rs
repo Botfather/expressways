@@ -312,6 +312,12 @@ pub struct StreamMetricsView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResilienceMetricsView {
+    pub service_mode: String,
+    pub degraded_components: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrokerMetricsView {
     pub uptime_seconds: u64,
     pub total_requests: u64,
@@ -327,6 +333,7 @@ pub struct BrokerMetricsView {
     pub storage: StorageMetricsView,
     pub audit: AuditMetricsView,
     pub streams: StreamMetricsView,
+    pub resilience: ResilienceMetricsView,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

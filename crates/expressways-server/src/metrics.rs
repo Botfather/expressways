@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use expressways_audit::AuditLogSummary;
 use expressways_protocol::{
-    Action, AuditMetricsView, BrokerMetricsView, OperationMetricsView, StorageMetricsView,
-    StreamMetricsView,
+    Action, AuditMetricsView, BrokerMetricsView, OperationMetricsView, ResilienceMetricsView,
+    StorageMetricsView, StreamMetricsView,
 };
 use expressways_storage::StorageStats;
 
@@ -134,7 +134,13 @@ impl MetricsCollector {
         self.state.lock().expect("metrics lock").idle_timeouts += 1;
     }
 
-    pub fn snapshot(&self, storage: StorageStats, audit: AuditLogSummary) -> BrokerMetricsView {
+    pub fn snapshot(
+        &self,
+        storage: StorageStats,
+        audit: AuditLogSummary,
+        service_mode: String,
+        degraded_components: Vec<String>,
+    ) -> BrokerMetricsView {
         let state = self.state.lock().expect("metrics lock");
         BrokerMetricsView {
             uptime_seconds: self.started_at.elapsed().as_secs(),
@@ -172,6 +178,10 @@ impl MetricsCollector {
                 slow_consumer_drops: state.slow_consumer_drops,
                 idle_timeouts: state.idle_timeouts,
                 watch_stream: operation_view(&state.stream_watch),
+            },
+            resilience: ResilienceMetricsView {
+                service_mode,
+                degraded_components,
             },
         }
     }
@@ -232,6 +242,8 @@ mod tests {
                 event_count: 3,
                 last_hash: Some("abc".to_owned()),
             },
+            "ok".to_owned(),
+            Vec::new(),
         );
 
         assert_eq!(snapshot.total_requests, 1);
@@ -246,5 +258,6 @@ mod tests {
         assert_eq!(snapshot.streams.events_delivered, 3);
         assert_eq!(snapshot.streams.watch_stream.requests, 1);
         assert_eq!(snapshot.streams.watch_stream.successes, 1);
+        assert_eq!(snapshot.resilience.service_mode, "ok");
     }
 }

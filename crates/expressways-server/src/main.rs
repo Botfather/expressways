@@ -4,13 +4,16 @@ mod quota;
 mod registry;
 mod registry_events;
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
-use expressways_audit::{AuditDecision, AuditOutcome, AuditSink, DraftAuditEvent};
+use expressways_audit::{
+    AuditDecision, AuditError, AuditLogSummary, AuditOutcome, AuditSink, DraftAuditEvent,
+};
 use expressways_auth::{AuthSnapshot, CapabilityVerifier, RevocationList, VerifiedCapability};
 use expressways_policy::PolicyEngine;
 use expressways_protocol::{
@@ -30,7 +33,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{AppConfig, RegistryBackend, ServerConfig, TransportKind};
+use crate::config::{AppConfig, RegistryBackend, ResilienceSection, ServerConfig, TransportKind};
 use crate::metrics::MetricsCollector;
 use crate::quota::QuotaManager;
 use crate::registry::AgentRegistry;
@@ -48,12 +51,14 @@ struct BrokerState {
     verifier: CapabilityVerifier,
     policy: PolicyEngine,
     quotas: QuotaManager,
+    resilience: ResilienceRuntime,
+    service_mode: ServiceModeTracker,
     metrics: MetricsCollector,
-    storage: Mutex<Storage>,
+    storage: Mutex<Option<Storage>>,
     registry: Mutex<AgentRegistry>,
     registry_events: RegistryEventHub,
     stream_limits: StreamLimits,
-    audit: Mutex<AuditSink>,
+    audit: Mutex<ManagedAuditSink>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +73,142 @@ struct RequestIdentity {
     principal_kind: String,
     quota_profile: String,
     token_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResilienceRuntime {
+    allow_degraded_runtime: bool,
+    listener_retry_delay: Duration,
+}
+
+#[derive(Debug, Default)]
+struct ServiceModeState {
+    degraded_components: BTreeMap<&'static str, String>,
+}
+
+#[derive(Debug, Default)]
+struct ServiceModeTracker {
+    inner: StdMutex<ServiceModeState>,
+}
+
+impl ServiceModeTracker {
+    fn mark_degraded(&self, component: &'static str, detail: impl Into<String>) {
+        self.inner
+            .lock()
+            .expect("service mode lock")
+            .degraded_components
+            .insert(component, detail.into());
+    }
+
+    fn clear_component(&self, component: &'static str) {
+        self.inner
+            .lock()
+            .expect("service mode lock")
+            .degraded_components
+            .remove(component);
+    }
+
+    fn status(&self) -> String {
+        if self
+            .inner
+            .lock()
+            .expect("service mode lock")
+            .degraded_components
+            .is_empty()
+        {
+            "ok".to_owned()
+        } else {
+            "degraded".to_owned()
+        }
+    }
+
+    fn degraded_components(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("service mode lock")
+            .degraded_components
+            .iter()
+            .map(|(component, detail)| format!("{component}: {detail}"))
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct ManagedAuditSink {
+    path: std::path::PathBuf,
+    sink: Option<AuditSink>,
+    retry_attempts: u32,
+    retry_backoff: Duration,
+}
+
+impl ManagedAuditSink {
+    fn new(path: std::path::PathBuf, resilience: &ResilienceSection) -> Result<Self, AuditError> {
+        Ok(Self {
+            sink: Some(AuditSink::new(&path)?),
+            path,
+            retry_attempts: resilience.audit_retry_attempts.max(1),
+            retry_backoff: Duration::from_millis(resilience.audit_retry_backoff_ms.max(1)),
+        })
+    }
+
+    fn disabled(path: std::path::PathBuf, resilience: &ResilienceSection) -> Self {
+        Self {
+            path,
+            sink: None,
+            retry_attempts: resilience.audit_retry_attempts.max(1),
+            retry_backoff: Duration::from_millis(resilience.audit_retry_backoff_ms.max(1)),
+        }
+    }
+
+    async fn append(
+        &mut self,
+        draft: DraftAuditEvent,
+    ) -> Result<expressways_audit::AuditEvent, AuditError> {
+        let mut last_error = None;
+
+        for attempt in 0..self.retry_attempts {
+            match self.try_append(draft.clone()) {
+                Ok(event) => return Ok(event),
+                Err(error) => {
+                    last_error = Some(error);
+                    self.sink = None;
+                    if attempt + 1 < self.retry_attempts {
+                        tokio::time::sleep(self.retry_backoff).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.expect("audit append should fail with an error"))
+    }
+
+    fn try_append(
+        &mut self,
+        draft: DraftAuditEvent,
+    ) -> Result<expressways_audit::AuditEvent, AuditError> {
+        if self.sink.is_none() {
+            self.sink = Some(AuditSink::new(&self.path)?);
+        }
+
+        self.sink
+            .as_mut()
+            .expect("audit sink should be initialized")
+            .append(draft)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn summary(&self) -> AuditLogSummary {
+        self.sink
+            .as_ref()
+            .map(AuditSink::summary)
+            .unwrap_or(AuditLogSummary {
+                event_count: 0,
+                last_hash: None,
+            })
+    }
 }
 
 enum ListenerHandle {
@@ -157,7 +298,13 @@ fn init_tracing(log_level: &str) -> anyhow::Result<()> {
 }
 
 fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
-    let storage = Storage::new(StorageConfig {
+    let service_mode = ServiceModeTracker::default();
+    let resilience = ResilienceRuntime {
+        allow_degraded_runtime: config.resilience.allow_degraded_runtime,
+        listener_retry_delay: Duration::from_millis(config.resilience.listener_retry_delay_ms.max(1)),
+    };
+
+    let storage = match Storage::new(StorageConfig {
         data_dir: config.server.data_dir.clone(),
         segment_max_bytes: config.storage.segment_max_bytes,
         default_retention_class: config.storage.retention_class.clone(),
@@ -171,8 +318,24 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
             max_total_bytes: config.storage.max_total_bytes,
             reclaim_target_bytes: config.storage.reclaim_target_bytes,
         },
-    })?;
-    let audit = AuditSink::new(&config.audit.path)?;
+    }) {
+        Ok(storage) => Some(storage),
+        Err(error) if config.resilience.allow_degraded_startup => {
+            service_mode.mark_degraded("storage", error.to_string());
+            warn!(error = %error, "storage initialization failed; starting in degraded mode");
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let audit = match ManagedAuditSink::new(config.audit.path.clone(), &config.resilience) {
+        Ok(audit) => audit,
+        Err(error) if config.resilience.allow_degraded_startup => {
+            service_mode.mark_degraded("audit", error.to_string());
+            warn!(error = %error, "audit initialization failed; starting in degraded mode");
+            ManagedAuditSink::disabled(config.audit.path.clone(), &config.resilience)
+        }
+        Err(error) => return Err(error.into()),
+    };
     let verifier = CapabilityVerifier::from_config(&config.auth)?;
     let quotas = QuotaManager::new(config.quotas.clone())?;
     let registry = build_registry(config);
@@ -190,6 +353,8 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
         verifier,
         policy: PolicyEngine::new(config.policy.clone()),
         quotas,
+        resilience,
+        service_mode,
         metrics: MetricsCollector::new(),
         storage: Mutex::new(storage),
         registry: Mutex::new(registry),
@@ -292,8 +457,17 @@ async fn run_tcp_listener(listener: TcpListener, state: Arc<BrokerState>) -> any
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                let (stream, remote) = accept.context("failed to accept TCP connection")?;
-                stream.set_nodelay(true).context("failed to set TCP_NODELAY")?;
+                let (stream, remote) = match accept {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        warn!(error = %error, retry_delay_ms = state.resilience.listener_retry_delay.as_millis(), "failed to accept TCP connection; retrying");
+                        tokio::time::sleep(state.resilience.listener_retry_delay).await;
+                        continue;
+                    }
+                };
+                if let Err(error) = stream.set_nodelay(true) {
+                    warn!(error = %error, remote = %remote, "failed to set TCP_NODELAY");
+                }
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, state).await {
@@ -317,7 +491,14 @@ async fn run_unix_listener(listener: UnixListener, state: Arc<BrokerState>) -> a
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                let (stream, _) = accept.context("failed to accept Unix connection")?;
+                let (stream, _) = match accept {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        warn!(error = %error, retry_delay_ms = state.resilience.listener_retry_delay.as_millis(), "failed to accept Unix connection; retrying");
+                        tokio::time::sleep(state.resilience.listener_retry_delay).await;
+                        continue;
+                    }
+                };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, state).await {
@@ -863,7 +1044,7 @@ async fn handle_health(state: &BrokerState, capability_token: String) -> Control
 
     ControlResponse::Health {
         node_name: state.node_name.clone(),
-        status: "ok".to_owned(),
+        status: state.service_mode.status(),
     }
 }
 
@@ -893,27 +1074,29 @@ async fn handle_get_metrics(state: &BrokerState, capability_token: String) -> Co
         return response;
     }
 
-    let storage_stats = {
-        let storage = state.storage.lock().await;
-        match storage.stats() {
-            Ok(stats) => stats,
-            Err(error) => {
-                state.metrics.record_storage_failure();
-                let message = error.to_string();
-                let _ = finalize_failure(
-                    state,
-                    &identity,
-                    Action::Admin,
-                    &resource,
-                    Some(message.clone()),
-                )
-                .await;
-                return ControlResponse::error("metrics_error", message);
-            }
+    let storage_stats = match with_storage(state, |storage| storage.stats()).await {
+        Ok(stats) => stats,
+        Err(message) if is_degraded_service_response(&message) => unavailable_storage_stats(),
+        Err(message) => {
+            state.metrics.record_storage_failure();
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            return ControlResponse::error("metrics_error", message);
         }
     };
     let audit_summary = state.audit.lock().await.summary();
-    let metrics = state.metrics.snapshot(storage_stats, audit_summary);
+    let metrics = state.metrics.snapshot(
+        storage_stats,
+        audit_summary,
+        state.service_mode.status(),
+        state.service_mode.degraded_components(),
+    );
 
     if let Err(error) = finalize_success(
         state,
@@ -1520,10 +1703,7 @@ async fn handle_create_topic(
         return response;
     }
 
-    let created = {
-        let storage = state.storage.lock().await;
-        storage.ensure_topic(topic)
-    };
+    let created = with_storage(state, move |storage| storage.ensure_topic(topic)).await;
 
     match created {
         Ok(topic) => {
@@ -1561,7 +1741,7 @@ async fn handle_create_topic(
                 Some(message.clone()),
             )
             .await;
-            ControlResponse::error("storage_error", message)
+            storage_error_response(message)
         }
     }
 }
@@ -1762,10 +1942,11 @@ async fn handle_publish(
         return response;
     }
 
-    let appended = {
-        let storage = state.storage.lock().await;
-        storage.append(&topic, &identity.principal, classification, payload)
-    };
+    let principal = identity.principal.clone();
+    let appended = with_storage(state, move |storage| {
+        storage.append(&topic, &principal, classification, payload)
+    })
+    .await;
 
     match appended {
         Ok(message) => {
@@ -1817,7 +1998,7 @@ async fn handle_publish(
                 Some(message.clone()),
             )
             .await;
-            ControlResponse::error("storage_error", message)
+            storage_error_response(message)
         }
     }
 }
@@ -1859,15 +2040,16 @@ async fn handle_consume(
         return response;
     }
 
-    let result = {
-        let storage = state.storage.lock().await;
-        let messages = storage.read_from(&topic, offset, limit);
-        let next_offset = storage.next_offset(&topic);
-        (messages, next_offset)
-    };
+    let topic_for_read = topic.clone();
+    let result = with_storage(state, move |storage| {
+        let messages = storage.read_from(&topic_for_read, offset, limit)?;
+        let next_offset = storage.next_offset(&topic_for_read)?;
+        Ok((messages, next_offset))
+    })
+    .await;
 
     match result {
-        (Ok(messages), Ok(next_offset)) => {
+        Ok((messages, next_offset)) => {
             if let Err(error) = finalize_success(
                 state,
                 &identity,
@@ -1902,7 +2084,7 @@ async fn handle_consume(
                 next_offset,
             }
         }
-        (Err(error), _) | (_, Err(error)) => {
+        Err(error) => {
             state.metrics.record_storage_failure();
             state
                 .metrics
@@ -1916,7 +2098,7 @@ async fn handle_consume(
                 Some(message.clone()),
             )
             .await;
-            ControlResponse::error("storage_error", message)
+            storage_error_response(message)
         }
     }
 }
@@ -1955,6 +2137,53 @@ async fn revocation_failure_response(
     )
     .await;
     ControlResponse::error("revocation_error", detail)
+}
+
+fn unavailable_storage_stats() -> expressways_storage::StorageStats {
+    expressways_storage::StorageStats {
+        topic_count: 0,
+        segment_count: 0,
+        total_bytes: 0,
+        maintenance: expressways_storage::MaintenanceStats::default(),
+    }
+}
+
+async fn with_storage<T>(
+    state: &BrokerState,
+    op: impl FnOnce(&Storage) -> Result<T, expressways_storage::StorageError>,
+) -> Result<T, String> {
+    let storage = state.storage.lock().await;
+    let storage = match storage.as_ref() {
+        Some(storage) => storage,
+        None => {
+            return Err("storage subsystem unavailable; broker is running in degraded mode"
+                .to_owned())
+        }
+    };
+
+    match op(storage) {
+        Ok(result) => {
+            state.service_mode.clear_component("storage");
+            Ok(result)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            state.service_mode.mark_degraded("storage", &message);
+            Err(message)
+        }
+    }
+}
+
+fn is_degraded_service_response(message: &str) -> bool {
+    message.contains("degraded mode")
+}
+
+fn storage_error_response(message: String) -> ControlResponse {
+    if is_degraded_service_response(&message) {
+        ControlResponse::error("service_degraded", message)
+    } else {
+        ControlResponse::error("storage_error", message)
+    }
 }
 
 async fn enforce_publish_quota(
@@ -2181,9 +2410,9 @@ async fn record_attempt(
     )
     .await
     .map(|_| ())
-    .map_err(|error| {
-        state.metrics.record_audit_failure();
-        ControlResponse::error("audit_failure", error.to_string())
+    .or_else(|error| {
+        handle_audit_failure(state, error)
+            .map_err(|error| ControlResponse::error("audit_failure", error.to_string()))
     })
 }
 
@@ -2205,6 +2434,7 @@ async fn finalize_success(
     )
     .await
     .map(|_| ())
+    .or_else(|error| handle_audit_failure(state, error))
 }
 
 async fn finalize_failure(
@@ -2225,6 +2455,19 @@ async fn finalize_failure(
     )
     .await
     .map(|_| ())
+    .or_else(|error| handle_audit_failure(state, error))
+}
+
+fn handle_audit_failure(state: &BrokerState, error: anyhow::Error) -> anyhow::Result<()> {
+    state.metrics.record_audit_failure();
+    if state.resilience.allow_degraded_runtime {
+        let detail = error.to_string();
+        state.service_mode.mark_degraded("audit", &detail);
+        warn!(error = %detail, "audit subsystem degraded; continuing to serve requests");
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 fn with_identity_detail(detail: Option<String>, identity: &RequestIdentity) -> Option<String> {
@@ -2288,14 +2531,17 @@ async fn record_internal_event(
     detail: Option<String>,
 ) -> anyhow::Result<()> {
     let mut audit = state.audit.lock().await;
-    let event = audit.append(DraftAuditEvent {
+    let event = audit
+        .append(DraftAuditEvent {
         principal: principal.to_owned(),
         action,
         resource: resource.to_owned(),
         decision,
         outcome,
         detail,
-    })?;
+    })
+        .await?;
+    state.service_mode.clear_component("audit");
 
     info!(
         audit_path = %audit.path().display(),
@@ -2331,7 +2577,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::config::{AuditSection, RegistrySection, StorageSection};
+    use crate::config::{AuditSection, RegistrySection, ResilienceSection, StorageSection};
     use crate::quota::{BackpressureMode, QuotaConfig, QuotaProfile};
 
     fn test_root() -> PathBuf {
@@ -2419,6 +2665,7 @@ mod tests {
                 stream_send_timeout_ms: 1_000,
                 stream_idle_keepalive_limit: 12,
             },
+            resilience: ResilienceSection::default(),
             policy: PolicyConfig {
                 default_decision: DefaultDecision::Deny,
                 rules: vec![
@@ -2604,6 +2851,125 @@ mod tests {
                 assert!(revocations.revoked_tokens.contains(&token_id));
             }
             other => panic!("expected revocation update, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_with_unavailable_audit_stays_servable_in_degraded_mode() {
+        let root = test_root();
+        fs::create_dir_all(&root).expect("create root");
+        let blocker = root.join("audit-blocker");
+        fs::write(&blocker, "occupied").expect("write blocker");
+
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.audit.path = blocker.join("audit.jsonl");
+
+        let state = build_state(&config).expect("build degraded broker state");
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: BROKER_RESOURCE.to_owned(),
+                actions: vec![Action::Health],
+            }],
+        );
+
+        let response = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::Health,
+            },
+        )
+        .await;
+
+        match response {
+            ControlResponse::Health { status, .. } => assert_eq!(status, "degraded"),
+            other => panic!("expected health response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_with_unavailable_storage_returns_degraded_service_errors() {
+        let root = test_root();
+        fs::create_dir_all(&root).expect("create root");
+        let blocker = root.join("storage-blocker");
+        fs::write(&blocker, "occupied").expect("write blocker");
+
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.server.data_dir = blocker.join("data");
+
+        let state = build_state(&config).expect("build degraded broker state");
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![
+                CapabilityScope {
+                    resource: BROKER_RESOURCE.to_owned(),
+                    actions: vec![Action::Health, Action::Admin],
+                },
+                CapabilityScope {
+                    resource: "topic:*".to_owned(),
+                    actions: vec![Action::Publish],
+                },
+            ],
+        );
+
+        let health = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::Health,
+            },
+        )
+        .await;
+        match health {
+            ControlResponse::Health { status, .. } => assert_eq!(status, "degraded"),
+            other => panic!("expected health response, got {other:?}"),
+        }
+
+        let publish = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::Publish {
+                    topic: "tasks".to_owned(),
+                    classification: None,
+                    payload: "hello".to_owned(),
+                },
+            },
+        )
+        .await;
+        match publish {
+            ControlResponse::Error { code, message } => {
+                assert_eq!(code, "service_degraded");
+                assert!(message.contains("degraded mode"));
+            }
+            other => panic!("expected degraded error response, got {other:?}"),
+        }
+
+        let metrics = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::GetMetrics,
+            },
+        )
+        .await;
+        match metrics {
+            ControlResponse::Metrics { metrics } => {
+                assert_eq!(metrics.resilience.service_mode, "degraded");
+                assert!(
+                    metrics
+                        .resilience
+                        .degraded_components
+                        .iter()
+                        .any(|component| component.starts_with("storage:"))
+                );
+            }
+            other => panic!("expected metrics response, got {other:?}"),
         }
     }
 
@@ -3522,10 +3888,19 @@ mod tests {
 
         let storage_stats = {
             let storage = state.storage.lock().await;
-            storage.stats().expect("storage stats")
+            storage
+                .as_ref()
+                .expect("storage should be available")
+                .stats()
+                .expect("storage stats")
         };
         let audit_summary = state.audit.lock().await.summary();
-        let metrics = state.metrics.snapshot(storage_stats, audit_summary);
+        let metrics = state.metrics.snapshot(
+            storage_stats,
+            audit_summary,
+            state.service_mode.status(),
+            state.service_mode.degraded_components(),
+        );
         assert_eq!(metrics.streams.slow_consumer_drops, 1);
         assert_eq!(metrics.streams.delivery_failures, 1);
         assert_eq!(metrics.streams.closed_streams, 1);

@@ -13,6 +13,7 @@ The original concept in [docs/main.md](/Users/tusharmohan/Documents/@labs/expres
 - Runtime metrics export for broker, storage, audit state, and registry-watch streams.
 - Retention limits, disk-pressure reclamation, and segment recovery for local workstation safety.
 - Audit verification and export tooling for operators.
+- Configurable resilience controls for retrying subsystems, degraded startup, and degraded runtime serving.
 - File-backed local discovery registry with exact-match filtering, TTL-based freshness, owner heartbeats, stale-entry cleanup, long-poll watch subscriptions, and a dedicated multi-frame watch stream with cursor resume and slow-consumer protection.
 - Explicit compliance metadata and retention classes from day one.
 
@@ -52,6 +53,8 @@ cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev
 ```bash
 cargo run -p expressways-server -- --config configs/expressways.example.toml
 ```
+
+The sample config enables degraded startup/runtime and retryable audit/listener behavior, so the broker can stay servable with reduced capabilities if audit or storage dependencies are impaired.
 
 6. In another shell, verify health:
 

@@ -19,6 +19,13 @@ reclaim_target_bytes = 117440512
 [audit]
 path = "./var/audit/audit.jsonl"
 
+[resilience]
+allow_degraded_startup = true
+allow_degraded_runtime = true
+audit_retry_attempts = 3
+audit_retry_backoff_ms = 50
+listener_retry_delay_ms = 250
+
 [registry]
 backend = "file"
 path = "./var/registry/agents.json"
