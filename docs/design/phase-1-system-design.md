@@ -64,6 +64,10 @@ Coordinates request handling, topic resolution, storage operations, and audit em
 
 Stores agent cards behind a backend seam that currently uses a local JSON file. Registry lookups support exact-match filters on skill, topic, and principal rather than semantic ranking. Ownership is derived from the authenticated principal, not caller-supplied metadata, so the registry does not become a side channel for identity spoofing. Cards also carry TTL-based liveness metadata so stale discovery entries do not linger in normal query results forever. A bounded in-memory event journal supports both long-poll watch subscriptions and a dedicated multi-frame watch stream for orchestrators that need change notifications, while explicit send timeouts and idle keepalive limits bound the server cost of stalled watchers.
 
+### Event-Driven Orchestrator
+
+Consumes the discovery-registry stream to maintain a local, event-driven view of eligible agents. The first orchestrator loop is intentionally small: it bootstraps from `list_agents`, tails the stream with cursor resume, and publishes audited assignment decisions back through the broker so orchestration starts using the same compliance and access-control path as every other action.
+
 ### Segmented Storage
 
 Stores append-only records per topic in binary segment files with sidecar indexes for offset-based reads. Topics also carry default compliance tags and retention classes. The storage layer also enforces per-retention-class byte budgets, a global disk-pressure ceiling, and segment recovery that can rebuild indexes and truncate partial trailing frames after an unclean write.

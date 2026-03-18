@@ -4,6 +4,7 @@ members = [
   "crates/expressways-auth",
   "crates/expressways-bench",
   "crates/expressways-client",
+  "crates/expressways-orchestrator",
   "crates/expressways-policy",
   "crates/expressways-protocol",
   "crates/expressways-server",

@@ -45,6 +45,7 @@ Security, compliance, and auditability are part of the runtime contract. They ar
 - Discovery-card heartbeat and stale cleanup are also audited admin operations.
 - Discovery-registry watch requests are audited admin operations even when they time out without matching changes.
 - Discovery-registry stream-open requests are audited admin operations before a multi-frame stream is established.
+- Orchestrator assignment decisions must flow back through the broker so they inherit broker audit, policy, and compliance controls.
 
 ### Operational Logging
 
@@ -64,6 +65,7 @@ Security, compliance, and auditability are part of the runtime contract. They ar
 - Discovery watch streams must use bounded batching and keepalive frames rather than unbounded server-side buffering.
 - Discovery watch streams must enforce explicit send-timeout and idle-close behavior so slow consumers cannot hold resources indefinitely.
 - Stream lifecycle metrics should expose opened streams, closed streams, keepalives, delivery failures, and slow-consumer drops.
+- Orchestrator local state may be cached on disk, but authoritative assignment decisions must be recorded through an audited broker path before local counters advance.
 
 ### Compliance Metadata
 

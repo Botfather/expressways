@@ -393,6 +393,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "expressways-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "expressways-client",
+ "expressways-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "expressways-policy"
 version = "0.1.0"
 dependencies = [

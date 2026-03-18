@@ -24,6 +24,7 @@ The original concept in [docs/main.md](/Users/tusharmohan/Documents/@labs/expres
 - `crates/expressways-audit`: tamper-evident audit logging primitives.
 - `crates/expressways-storage`: segmented append-only storage abstraction.
 - `crates/expressways-client`: client SDK for control-plane requests.
+- `crates/expressways-orchestrator`: event-driven supervisor and audited assignment CLI.
 - `crates/expressways-bench`: benchmark harness for transport and storage baselines.
 - `crates/expressways-server`: broker daemon and request handling.
 - `docs/reviews`: feasibility review and confidence assessment.
@@ -90,14 +91,21 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 watch-agents-stream --token-file ./var/auth/developer.token --wait-timeout-ms 30000 --resume true
 ```
 
-11. Verify or export the audit trail locally:
+11. Run the event-driven orchestrator and emit an audited assignment decision:
+
+```bash
+cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 supervise --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json
+cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 assign --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --skill summarize
+```
+
+12. Verify or export the audit trail locally:
 
 ```bash
 cargo run -p expressways-client --bin expresswaysctl -- verify-audit --path ./var/audit/audit.jsonl
 cargo run -p expressways-client --bin expresswaysctl -- export-audit --path ./var/audit/audit.jsonl --output ./var/audit/export.json
 ```
 
-12. Capture a benchmark suite with TCP, Unix sockets on Unix hosts, and direct storage throughput:
+13. Capture a benchmark suite with TCP, Unix sockets on Unix hosts, and direct storage throughput:
 
 ```bash
 cargo run -p expressways-bench -- suite --spawn-server --broker-iterations 100 --warmup-iterations 20 --payload-bytes 512 --message-count 2000 --read-batch 250 --output ./var/benchmarks/latest.json
