@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use expressways_auth::AuthConfig;
 use expressways_policy::PolicyConfig;
 use expressways_protocol::{Classification, RetentionClass};
-use anyhow::Context;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +39,11 @@ pub struct StorageSection {
     pub segment_max_bytes: u64,
     pub retention_class: RetentionClass,
     pub default_classification: Classification,
+    pub ephemeral_retention_bytes: u64,
+    pub operational_retention_bytes: u64,
+    pub regulated_retention_bytes: u64,
+    pub max_total_bytes: u64,
+    pub reclaim_target_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

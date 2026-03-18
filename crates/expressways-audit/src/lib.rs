@@ -2,8 +2,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use expressways_protocol::Action;
 use chrono::{DateTime, Utc};
+use expressways_protocol::Action;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -55,11 +55,31 @@ pub enum AuditError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("audit integrity failure: {0}")]
+    Integrity(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditLogSummary {
+    pub event_count: u64,
+    pub last_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditVerificationReport {
+    pub path: PathBuf,
+    pub event_count: u64,
+    pub first_event_id: Option<Uuid>,
+    pub last_event_id: Option<Uuid>,
+    pub first_timestamp: Option<DateTime<Utc>>,
+    pub last_timestamp: Option<DateTime<Utc>>,
+    pub last_hash: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct AuditSink {
     path: PathBuf,
+    event_count: u64,
     previous_hash: Option<String>,
 }
 
@@ -70,15 +90,19 @@ impl AuditSink {
             fs::create_dir_all(parent)?;
         }
 
-        let previous_hash = if path.exists() {
-            last_hash_from_file(&path)?
+        let summary = if path.exists() {
+            summary_from_file(&path)?
         } else {
-            None
+            AuditLogSummary {
+                event_count: 0,
+                last_hash: None,
+            }
         };
 
         Ok(Self {
             path,
-            previous_hash,
+            event_count: summary.event_count,
+            previous_hash: summary.last_hash,
         })
     }
 
@@ -109,6 +133,7 @@ impl AuditSink {
         file.write_all(b"\n")?;
         file.flush()?;
 
+        self.event_count += 1;
         self.previous_hash = Some(hash);
         Ok(event)
     }
@@ -116,26 +141,100 @@ impl AuditSink {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn summary(&self) -> AuditLogSummary {
+        AuditLogSummary {
+            event_count: self.event_count,
+            last_hash: self.previous_hash.clone(),
+        }
+    }
 }
 
-fn last_hash_from_file(path: &Path) -> Result<Option<String>, AuditError> {
+pub fn load_events(path: impl AsRef<Path>) -> Result<Vec<AuditEvent>, AuditError> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
     let file = File::open(path)?;
-    let mut last = None;
+    let mut events = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        events.push(serde_json::from_str(&line)?);
+    }
+
+    Ok(events)
+}
+
+pub fn verify_file(path: impl AsRef<Path>) -> Result<AuditVerificationReport, AuditError> {
+    let path = path.as_ref().to_path_buf();
+    let events = load_events(&path)?;
+    let mut previous_hash: Option<String> = None;
+
+    for event in &events {
+        if event.prev_hash != previous_hash {
+            return Err(AuditError::Integrity(format!(
+                "event {} has an unexpected prev_hash",
+                event.event_id
+            )));
+        }
+
+        let expected_hash = compute_hash(
+            &DraftAuditEvent {
+                principal: event.principal.clone(),
+                action: event.action.clone(),
+                resource: event.resource.clone(),
+                decision: event.decision.clone(),
+                outcome: event.outcome.clone(),
+                detail: event.detail.clone(),
+            },
+            event.timestamp,
+            event.prev_hash.as_deref(),
+        )?;
+
+        if expected_hash != event.hash {
+            return Err(AuditError::Integrity(format!(
+                "event {} hash does not match payload",
+                event.event_id
+            )));
+        }
+
+        previous_hash = Some(event.hash.clone());
+    }
+
+    Ok(AuditVerificationReport {
+        path,
+        event_count: events.len() as u64,
+        first_event_id: events.first().map(|event| event.event_id),
+        last_event_id: events.last().map(|event| event.event_id),
+        first_timestamp: events.first().map(|event| event.timestamp),
+        last_timestamp: events.last().map(|event| event.timestamp),
+        last_hash: previous_hash,
+    })
+}
+
+fn summary_from_file(path: &Path) -> Result<AuditLogSummary, AuditError> {
+    let file = File::open(path)?;
+    let mut event_count = 0;
+    let mut last_hash = None;
 
     for line in BufReader::new(file).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        last = Some(line);
-    }
-
-    if let Some(line) = last {
         let event: AuditEvent = serde_json::from_str(&line)?;
-        return Ok(Some(event.hash));
+        event_count += 1;
+        last_hash = Some(event.hash);
     }
 
-    Ok(None)
+    Ok(AuditLogSummary {
+        event_count,
+        last_hash,
+    })
 }
 
 fn compute_hash(
@@ -196,5 +295,38 @@ mod tests {
             .expect("append second event");
 
         assert_eq!(second.prev_hash, Some(first.hash));
+        assert_eq!(sink.summary().event_count, 2);
+    }
+
+    #[test]
+    fn verification_detects_tampering() {
+        let root = std::env::temp_dir().join(format!("expressways-audit-{}", Uuid::now_v7()));
+        let path = root.join("audit.jsonl");
+
+        let mut sink = AuditSink::new(&path).expect("create sink");
+        sink.append(DraftAuditEvent {
+            principal: "local:developer".to_owned(),
+            action: Action::Admin,
+            resource: "system:broker".to_owned(),
+            decision: AuditDecision::Allow,
+            outcome: AuditOutcome::Succeeded,
+            detail: Some("startup".to_owned()),
+        })
+        .expect("append event");
+
+        let lines = fs::read_to_string(&path).expect("read audit");
+        let mut event: AuditEvent = serde_json::from_str(lines.trim()).expect("parse event");
+        event.resource = "topic:tampered".to_owned();
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&event).expect("serialize tampered event")
+            ),
+        )
+        .expect("rewrite audit");
+
+        let error = verify_file(&path).expect_err("tampered audit should fail");
+        assert!(matches!(error, AuditError::Integrity(_)));
     }
 }

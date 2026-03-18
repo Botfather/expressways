@@ -2,7 +2,7 @@
 
 ## Overview
 
-Phase 1 is a single-node, control-plane-first broker for local agent orchestration. It prioritizes correctness, auditability, and operational clarity over peak throughput. The system is intentionally small enough to run and evolve on a developer workstation, but it now uses a cross-platform local TCP baseline, signed capability tokens, a principal and issuer registry with revocation support, quota-aware request handling, and a binary indexed storage path so the first release is not stuck in “prototype-only” mode.
+Phase 1 is a single-node, control-plane-first broker for local agent orchestration. It prioritizes correctness, auditability, and operational clarity over peak throughput. The system is intentionally small enough to run and evolve on a developer workstation, but it now uses a cross-platform local TCP baseline, signed capability tokens, a principal and issuer registry with revocation support, quota-aware request handling, runtime metrics, audit verification tooling, and a binary indexed storage path with retention and recovery controls so the first release is not stuck in “prototype-only” mode.
 
 ## Goals
 
@@ -11,6 +11,8 @@ Phase 1 is a single-node, control-plane-first broker for local agent orchestrati
 - Enforce signed capability checks and server-side access control before any state-changing operation.
 - Support explicit principal registration, issuer rotation, and revocation without bypassing the broker.
 - Enforce per-principal quota and backpressure policy on size-sensitive and rate-sensitive paths.
+- Surface enough runtime metrics for operators to explain request behavior, storage pressure, and audit volume.
+- Enforce topic retention budgets and global disk-pressure limits before local workstation storage is exhausted.
 - Emit structured logs and tamper-evident audit events for every external action.
 - Carry compliance metadata with topics and messages.
 
@@ -35,6 +37,7 @@ flowchart LR
     B --> S["Binary Segmented Storage + Index"]
     B --> U["Audit Sink"]
     B --> L["Structured Logs"]
+    B --> O["Metrics Snapshot"]
     B --> M["Metadata Catalog"]
 ```
 
@@ -42,7 +45,7 @@ flowchart LR
 
 ### Protocol Layer
 
-Provides strongly typed control-plane requests and responses. Phase 1 uses a simple JSON protocol over local TCP by default, with Unix sockets available as an optional transport on Unix platforms. The protocol includes admin commands for auth-state inspection and revocation changes so operators can manage identity state without editing runtime files by hand.
+Provides strongly typed control-plane requests and responses. Phase 1 uses a simple JSON protocol over local TCP by default, with Unix sockets available as an optional transport on Unix platforms. The protocol includes admin commands for auth-state inspection, revocation changes, and metrics export so operators can manage identity state and inspect runtime health without editing runtime files by hand.
 
 ### AuthN and AuthZ Gate
 
@@ -58,11 +61,15 @@ Coordinates request handling, topic resolution, storage operations, and audit em
 
 ### Segmented Storage
 
-Stores append-only records per topic in binary segment files with sidecar indexes for offset-based reads. Topics also carry default compliance tags and retention classes.
+Stores append-only records per topic in binary segment files with sidecar indexes for offset-based reads. Topics also carry default compliance tags and retention classes. The storage layer also enforces per-retention-class byte budgets, a global disk-pressure ceiling, and segment recovery that can rebuild indexes and truncate partial trailing frames after an unclean write.
 
 ### Audit Sink
 
-Persists append-only audit events with hash chaining so tampering can be detected.
+Persists append-only audit events with hash chaining so tampering can be detected. Operators can also verify and export the audit chain offline.
+
+### Metrics Snapshot
+
+Collects broker counters, publish and consume latency summaries, storage maintenance statistics, and audit log totals so operators can explain current behavior without reading raw files by hand.
 
 ### Metadata Catalog
 
@@ -78,7 +85,8 @@ Tracks topic definitions, retention classes, compliance defaults, and local oper
 6. Broker service executes the action if allowed.
 7. Structured operational log is emitted.
 8. Audit event is appended with the decision and outcome.
-9. Response is returned to the client.
+9. Metrics are updated for the request path and any resulting storage or audit side effects.
+10. Response is returned to the client.
 
 ## Data Model
 
@@ -110,6 +118,20 @@ Tracks topic definitions, retention classes, compliance defaults, and local oper
 - `prev_hash`
 - `hash`
 
+### Broker Metrics Snapshot
+
+- `uptime_seconds`
+- `total_requests`
+- `auth_failures`
+- `policy_denials`
+- `quota_denials`
+- `storage_failures`
+- `audit_failures`
+- `publish`
+- `consume`
+- `storage`
+- `audit`
+
 ### Capability Token
 
 - `token_id`
@@ -135,7 +157,9 @@ Tracks topic definitions, retention classes, compliance defaults, and local oper
 - Capability verification is mandatory.
 - Policy evaluation is mandatory.
 - Quota evaluation is mandatory for publish and consume paths.
+- Storage retention and disk-pressure checks are mandatory for append paths.
 - All logs are structured and machine-readable.
+- Audit logs are locally verifiable after the fact.
 - Compliance classification is explicit, never implied by payload shape.
 
 ## Evolution Path

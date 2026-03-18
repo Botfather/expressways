@@ -1,9 +1,11 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
-use expressways_protocol::{Classification, RetentionClass, StoredMessage, TopicSpec};
 use chrono::Utc;
+use expressways_protocol::{Classification, RetentionClass, StoredMessage, TopicSpec};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -17,11 +19,43 @@ pub struct StorageConfig {
     pub segment_max_bytes: u64,
     pub default_retention_class: RetentionClass,
     pub default_classification: Classification,
+    pub retention_policy: RetentionPolicy,
+    pub disk_pressure: DiskPressurePolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetentionPolicy {
+    pub ephemeral_max_bytes: u64,
+    pub operational_max_bytes: u64,
+    pub regulated_max_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskPressurePolicy {
+    pub max_total_bytes: u64,
+    pub reclaim_target_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MaintenanceStats {
+    pub reclaimed_segments: u64,
+    pub reclaimed_bytes: u64,
+    pub recovered_segments: u64,
+    pub truncated_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageStats {
+    pub topic_count: u64,
+    pub segment_count: u64,
+    pub total_bytes: u64,
+    pub maintenance: MaintenanceStats,
 }
 
 #[derive(Debug)]
 pub struct Storage {
     config: StorageConfig,
+    maintenance: Mutex<MaintenanceStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +69,8 @@ struct TopicState {
 struct SegmentInfo {
     base_offset: u64,
     message_count: u64,
+    segment_bytes: u64,
+    index_bytes: u64,
 }
 
 #[derive(Debug, Error)]
@@ -49,14 +85,30 @@ pub enum StorageError {
     InvalidTopic(String),
     #[error("topic `{0}` does not exist")]
     MissingTopic(String),
+    #[error(
+        "disk pressure cannot be reduced below {max_total_bytes} bytes; current usage is {current_bytes} bytes"
+    )]
+    DiskPressure {
+        current_bytes: u64,
+        max_total_bytes: u64,
+    },
     #[error("index for segment `{segment}` is corrupt")]
     CorruptIndex { segment: String },
 }
 
 impl Storage {
     pub fn new(config: StorageConfig) -> Result<Self, StorageError> {
+        if config.disk_pressure.reclaim_target_bytes > config.disk_pressure.max_total_bytes {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "reclaim_target_bytes must be less than or equal to max_total_bytes",
+            )));
+        }
         fs::create_dir_all(&config.data_dir)?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            maintenance: Mutex::new(MaintenanceStats::default()),
+        })
     }
 
     pub fn ensure_topic(&self, spec: TopicSpec) -> Result<TopicSpec, StorageError> {
@@ -69,6 +121,7 @@ impl Storage {
 
         if state_path.exists() {
             self.ensure_binary_layout(&spec.name)?;
+            self.recover_topic(&spec.name)?;
             let state = self.read_state(&spec.name)?;
             return Ok(state.spec);
         }
@@ -91,6 +144,8 @@ impl Storage {
         payload: String,
     ) -> Result<StoredMessage, StorageError> {
         let spec = self.ensure_topic(self.default_topic_spec(topic))?;
+        self.recover_topic(topic)?;
+        self.enforce_topic_retention(topic, &spec.retention_class)?;
         let mut state = self.read_state(topic)?;
 
         let message = StoredMessage {
@@ -104,7 +159,7 @@ impl Storage {
         };
 
         let encoded = bincode::serialize(&message)?;
-        let entry_len = FRAME_LEN_BYTES + encoded.len() as u64;
+        let entry_len = FRAME_LEN_BYTES + encoded.len() as u64 + INDEX_ENTRY_BYTES;
         let mut segment_base = state.active_segment_base;
         let mut segment_path = self.segment_path(topic, segment_base);
         let mut index_path = self.index_path(topic, segment_base);
@@ -116,6 +171,8 @@ impl Storage {
             segment_path = self.segment_path(topic, segment_base);
             index_path = self.index_path(topic, segment_base);
         }
+
+        self.enforce_global_budget(entry_len)?;
 
         if let Some(parent) = segment_path.parent() {
             fs::create_dir_all(parent)?;
@@ -139,6 +196,7 @@ impl Storage {
 
         state.next_offset += 1;
         self.persist_state(&state)?;
+        self.enforce_topic_retention(topic, &spec.retention_class)?;
 
         Ok(message)
     }
@@ -159,6 +217,7 @@ impl Storage {
             return Err(StorageError::MissingTopic(topic.to_owned()));
         }
         self.ensure_binary_layout(topic)?;
+        self.recover_topic(topic)?;
 
         let mut messages = Vec::new();
         for segment in self.segment_infos(topic)? {
@@ -202,7 +261,42 @@ impl Storage {
 
     pub fn next_offset(&self, topic: &str) -> Result<u64, StorageError> {
         self.ensure_binary_layout(topic)?;
+        self.recover_topic(topic)?;
         Ok(self.read_state(topic)?.next_offset)
+    }
+
+    pub fn stats(&self) -> Result<StorageStats, StorageError> {
+        let mut topic_count = 0;
+        let mut segment_count = 0;
+        let mut total_bytes = 0;
+
+        if self.config.data_dir.exists() {
+            for entry in fs::read_dir(&self.config.data_dir)? {
+                let path = entry?.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                topic_count += 1;
+                let topic_name = path
+                    .file_name()
+                    .and_then(|item| item.to_str())
+                    .ok_or_else(|| StorageError::InvalidTopic(path.display().to_string()))?;
+                self.recover_topic(topic_name)?;
+
+                for segment in self.segment_infos(topic_name)? {
+                    segment_count += 1;
+                    total_bytes += segment.segment_bytes + segment.index_bytes;
+                }
+            }
+        }
+
+        Ok(StorageStats {
+            topic_count,
+            segment_count,
+            total_bytes,
+            maintenance: self.maintenance.lock().expect("maintenance lock").clone(),
+        })
     }
 
     fn default_topic_spec(&self, topic: &str) -> TopicSpec {
@@ -240,6 +334,7 @@ impl Storage {
             return Ok(());
         }
 
+        self.recover_topic(topic)?;
         let mut messages = self.read_legacy_messages(&legacy_segments)?;
         messages.extend(self.read_binary_messages(topic)?);
         messages.sort_by_key(|message| message.offset);
@@ -253,37 +348,45 @@ impl Storage {
         Ok(())
     }
 
-    fn segment_infos(&self, topic: &str) -> Result<Vec<SegmentInfo>, StorageError> {
+    fn recover_topic(&self, topic: &str) -> Result<(), StorageError> {
+        validate_topic_name(topic)?;
         let segments_dir = self.topic_dir(topic).join("segments");
-        let mut infos = Vec::new();
+        if !segments_dir.exists() {
+            return Ok(());
+        }
 
-        for entry in fs::read_dir(segments_dir)? {
+        for entry in fs::read_dir(&segments_dir)? {
             let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
-                continue;
+            if path.extension().and_then(|ext| ext.to_str()) == Some("idx")
+                && !self.segment_path_exists_for_index(&path)
+            {
+                fs::remove_file(path)?;
             }
+        }
 
-            let stem = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .ok_or_else(|| StorageError::CorruptIndex {
-                    segment: path.display().to_string(),
-                })?;
-            let base_offset = stem
-                .parse::<u64>()
-                .map_err(|_| StorageError::CorruptIndex {
-                    segment: path.display().to_string(),
-                })?;
-            let len = fs::metadata(&path)?.len();
-            if len % INDEX_ENTRY_BYTES != 0 {
+        for base_offset in self.segment_bases(topic)? {
+            self.recover_segment(topic, base_offset)?;
+        }
+
+        Ok(())
+    }
+
+    fn segment_infos(&self, topic: &str) -> Result<Vec<SegmentInfo>, StorageError> {
+        let mut infos = Vec::new();
+        for base_offset in self.segment_bases(topic)? {
+            let segment_path = self.segment_path(topic, base_offset);
+            let index_path = self.index_path(topic, base_offset);
+            let index_len = fs::metadata(&index_path)?.len();
+            if index_len % INDEX_ENTRY_BYTES != 0 {
                 return Err(StorageError::CorruptIndex {
-                    segment: path.display().to_string(),
+                    segment: index_path.display().to_string(),
                 });
             }
-
             infos.push(SegmentInfo {
                 base_offset,
-                message_count: len / INDEX_ENTRY_BYTES,
+                message_count: index_len / INDEX_ENTRY_BYTES,
+                segment_bytes: fs::metadata(&segment_path)?.len(),
+                index_bytes: index_len,
             });
         }
 
@@ -421,6 +524,235 @@ impl Storage {
         self.topic_dir(topic).join("legacy.migrated")
     }
 
+    fn retention_limit(&self, class: &RetentionClass) -> u64 {
+        match class {
+            RetentionClass::Ephemeral => self.config.retention_policy.ephemeral_max_bytes,
+            RetentionClass::Operational => self.config.retention_policy.operational_max_bytes,
+            RetentionClass::Regulated => self.config.retention_policy.regulated_max_bytes,
+        }
+    }
+
+    fn segment_bases(&self, topic: &str) -> Result<Vec<u64>, StorageError> {
+        let segments_dir = self.topic_dir(topic).join("segments");
+        if !segments_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut bases = Vec::new();
+        for entry in fs::read_dir(segments_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("seg") {
+                continue;
+            }
+
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| StorageError::CorruptIndex {
+                    segment: path.display().to_string(),
+                })?;
+            let base_offset = stem
+                .parse::<u64>()
+                .map_err(|_| StorageError::CorruptIndex {
+                    segment: path.display().to_string(),
+                })?;
+            bases.push(base_offset);
+        }
+
+        bases.sort_unstable();
+        Ok(bases)
+    }
+
+    fn recover_segment(&self, topic: &str, base_offset: u64) -> Result<(), StorageError> {
+        let segment_path = self.segment_path(topic, base_offset);
+        let index_path = self.index_path(topic, base_offset);
+        let mut segment = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&segment_path)?;
+        let end = segment.seek(SeekFrom::End(0))?;
+        segment.seek(SeekFrom::Start(0))?;
+
+        let mut positions = Vec::new();
+        let mut position = 0u64;
+        let mut truncated_bytes = 0u64;
+
+        loop {
+            if position == end {
+                break;
+            }
+            let mut len_bytes = [0u8; 4];
+            match segment.read_exact(&mut len_bytes) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    if end > position {
+                        segment.set_len(position)?;
+                        truncated_bytes = end - position;
+                    }
+                    break;
+                }
+                Err(error) => return Err(StorageError::Io(error)),
+            }
+
+            let frame_len = u32::from_le_bytes(len_bytes) as u64;
+            let frame_end = position + FRAME_LEN_BYTES + frame_len;
+            if frame_end > end {
+                segment.set_len(position)?;
+                truncated_bytes = end - position;
+                break;
+            }
+
+            let mut payload = vec![0u8; frame_len as usize];
+            segment.read_exact(&mut payload)?;
+
+            positions.push(position);
+            position = frame_end;
+        }
+
+        if let Some(parent) = index_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let existing_index = if index_path.exists() {
+            fs::read(&index_path)?
+        } else {
+            Vec::new()
+        };
+        let mut rebuilt_index = Vec::with_capacity(positions.len() * INDEX_ENTRY_BYTES as usize);
+        for position in &positions {
+            rebuilt_index.extend_from_slice(&position.to_le_bytes());
+        }
+        if existing_index != rebuilt_index {
+            fs::write(&index_path, &rebuilt_index)?;
+            self.bump_recovered_segments(1);
+        }
+        if truncated_bytes > 0 {
+            self.bump_truncated_bytes(truncated_bytes);
+        }
+
+        Ok(())
+    }
+
+    fn segment_path_exists_for_index(&self, index_path: &Path) -> bool {
+        let Some(stem) = index_path.file_stem().and_then(|stem| stem.to_str()) else {
+            return false;
+        };
+        let Some(parent) = index_path.parent() else {
+            return false;
+        };
+        parent.join(format!("{stem}.seg")).exists()
+    }
+
+    fn enforce_topic_retention(
+        &self,
+        topic: &str,
+        retention_class: &RetentionClass,
+    ) -> Result<(), StorageError> {
+        let limit = self.retention_limit(retention_class);
+        let mut segments = self.segment_infos(topic)?;
+        if segments.len() <= 1 {
+            return Ok(());
+        }
+
+        let mut total_bytes = segments
+            .iter()
+            .map(|segment| segment.segment_bytes + segment.index_bytes)
+            .sum::<u64>();
+        while total_bytes > limit && segments.len() > 1 {
+            let oldest = segments.remove(0);
+            total_bytes -= self.remove_segment(topic, &oldest)?;
+        }
+
+        Ok(())
+    }
+
+    fn enforce_global_budget(&self, reserved_bytes: u64) -> Result<(), StorageError> {
+        let mut total_bytes = self.total_storage_bytes()?;
+        if total_bytes + reserved_bytes <= self.config.disk_pressure.max_total_bytes {
+            return Ok(());
+        }
+
+        let mut reclaimable = self.reclaimable_segments()?;
+        reclaimable.sort_by_key(|candidate| candidate.modified);
+
+        for candidate in reclaimable {
+            if total_bytes + reserved_bytes <= self.config.disk_pressure.reclaim_target_bytes {
+                break;
+            }
+            total_bytes -= self.remove_segment(&candidate.topic, &candidate.segment)?;
+        }
+
+        if total_bytes + reserved_bytes > self.config.disk_pressure.max_total_bytes {
+            return Err(StorageError::DiskPressure {
+                current_bytes: total_bytes + reserved_bytes,
+                max_total_bytes: self.config.disk_pressure.max_total_bytes,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn total_storage_bytes(&self) -> Result<u64, StorageError> {
+        Ok(self.stats()?.total_bytes)
+    }
+
+    fn reclaimable_segments(&self) -> Result<Vec<ReclaimCandidate>, StorageError> {
+        let mut reclaimable = Vec::new();
+        if !self.config.data_dir.exists() {
+            return Ok(reclaimable);
+        }
+
+        for entry in fs::read_dir(&self.config.data_dir)? {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let topic = path
+                .file_name()
+                .and_then(|item| item.to_str())
+                .ok_or_else(|| StorageError::InvalidTopic(path.display().to_string()))?
+                .to_owned();
+            self.recover_topic(&topic)?;
+            let segments = self.segment_infos(&topic)?;
+            let active_base = self.read_state(&topic)?.active_segment_base;
+            if segments.len() <= 1 {
+                continue;
+            }
+
+            for segment in segments
+                .into_iter()
+                .filter(|segment| segment.base_offset != active_base)
+            {
+                let modified = fs::metadata(self.segment_path(&topic, segment.base_offset))?
+                    .modified()
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                reclaimable.push(ReclaimCandidate {
+                    topic: topic.clone(),
+                    modified,
+                    segment,
+                });
+            }
+        }
+
+        Ok(reclaimable)
+    }
+
+    fn remove_segment(&self, topic: &str, segment: &SegmentInfo) -> Result<u64, StorageError> {
+        let segment_path = self.segment_path(topic, segment.base_offset);
+        let index_path = self.index_path(topic, segment.base_offset);
+        let bytes = segment.segment_bytes + segment.index_bytes;
+
+        if segment_path.exists() {
+            fs::remove_file(segment_path)?;
+        }
+        if index_path.exists() {
+            fs::remove_file(index_path)?;
+        }
+
+        self.bump_reclaimed(1, bytes);
+        Ok(bytes)
+    }
+
     fn topic_dir(&self, topic: &str) -> PathBuf {
         self.config.data_dir.join(topic)
     }
@@ -436,6 +768,29 @@ impl Storage {
             .join("segments")
             .join(format!("{base_offset:020}.idx"))
     }
+
+    fn bump_reclaimed(&self, segments: u64, bytes: u64) {
+        let mut maintenance = self.maintenance.lock().expect("maintenance lock");
+        maintenance.reclaimed_segments += segments;
+        maintenance.reclaimed_bytes += bytes;
+    }
+
+    fn bump_recovered_segments(&self, segments: u64) {
+        let mut maintenance = self.maintenance.lock().expect("maintenance lock");
+        maintenance.recovered_segments += segments;
+    }
+
+    fn bump_truncated_bytes(&self, bytes: u64) {
+        let mut maintenance = self.maintenance.lock().expect("maintenance lock");
+        maintenance.truncated_bytes += bytes;
+    }
+}
+
+#[derive(Debug)]
+struct ReclaimCandidate {
+    topic: String,
+    modified: SystemTime,
+    segment: SegmentInfo,
 }
 
 fn validate_topic_name(name: &str) -> Result<(), StorageError> {
@@ -470,6 +825,15 @@ mod tests {
             segment_max_bytes,
             default_retention_class: RetentionClass::Operational,
             default_classification: Classification::Internal,
+            retention_policy: RetentionPolicy {
+                ephemeral_max_bytes: 256,
+                operational_max_bytes: 1024,
+                regulated_max_bytes: 2048,
+            },
+            disk_pressure: DiskPressurePolicy {
+                max_total_bytes: 4096,
+                reclaim_target_bytes: 3072,
+            },
         })
         .expect("create storage")
     }
@@ -573,5 +937,88 @@ mod tests {
         assert_eq!(messages[0].payload, "from legacy");
         assert!(segments_dir.join("00000000000000000000.seg").exists());
         assert!(segments_dir.join("00000000000000000000.idx").exists());
+    }
+
+    #[test]
+    fn retention_reclaims_old_segments() {
+        let storage = test_storage(180);
+        storage
+            .ensure_topic(TopicSpec {
+                name: "ephemeral".to_owned(),
+                retention_class: RetentionClass::Ephemeral,
+                default_classification: Classification::Internal,
+            })
+            .expect("create topic");
+
+        for index in 0..4 {
+            storage
+                .append(
+                    "ephemeral",
+                    "local:developer",
+                    None,
+                    format!("message-{index}-{}", "x".repeat(48)),
+                )
+                .expect("append message");
+        }
+
+        let stats = storage.stats().expect("storage stats");
+        assert!(stats.maintenance.reclaimed_segments >= 1);
+        assert!(stats.segment_count >= 1);
+    }
+
+    #[test]
+    fn disk_pressure_rejects_when_no_more_segments_can_be_reclaimed() {
+        let data_dir = std::env::temp_dir().join(format!("expressways-storage-{}", Uuid::now_v7()));
+        let storage = Storage::new(StorageConfig {
+            data_dir,
+            segment_max_bytes: 4096,
+            default_retention_class: RetentionClass::Operational,
+            default_classification: Classification::Internal,
+            retention_policy: RetentionPolicy {
+                ephemeral_max_bytes: 4096,
+                operational_max_bytes: 4096,
+                regulated_max_bytes: 4096,
+            },
+            disk_pressure: DiskPressurePolicy {
+                max_total_bytes: 220,
+                reclaim_target_bytes: 180,
+            },
+        })
+        .expect("create storage");
+
+        let error = storage
+            .append("tasks", "local:developer", None, "x".repeat(512))
+            .expect_err("append should fail under disk pressure");
+
+        assert!(matches!(error, StorageError::DiskPressure { .. }));
+    }
+
+    #[test]
+    fn recovers_truncated_segment_by_rebuilding_index() {
+        let storage = test_storage(4096);
+        storage
+            .append("tasks", "local:developer", None, "hello".to_owned())
+            .expect("append first");
+        storage
+            .append("tasks", "local:developer", None, "world".to_owned())
+            .expect("append second");
+
+        let segment_path = storage.segment_path("tasks", 0);
+        let segment_len = fs::metadata(&segment_path).expect("segment metadata").len();
+        fs::write(storage.index_path("tasks", 0), b"corrupt").expect("corrupt index");
+        OpenOptions::new()
+            .write(true)
+            .open(&segment_path)
+            .expect("open segment")
+            .set_len(segment_len - 3)
+            .expect("truncate segment");
+
+        let messages = storage.read_from("tasks", 0, 10).expect("recover and read");
+        let stats = storage.stats().expect("storage stats");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].payload, "hello");
+        assert!(stats.maintenance.recovered_segments >= 1);
+        assert!(stats.maintenance.truncated_bytes >= 1);
     }
 }

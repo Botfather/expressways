@@ -1,15 +1,16 @@
 use std::fs;
 use std::path::PathBuf;
 
+use anyhow::{Context, bail};
+use chrono::{Duration, Utc};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use expressways_audit::{load_events, verify_file};
 use expressways_auth::CapabilityIssuer;
 use expressways_client::{Client, Endpoint};
 use expressways_protocol::{
     Action, CapabilityClaims, CapabilityScope, Classification, ControlCommand, ControlRequest,
     RetentionClass, TopicSpec,
 };
-use anyhow::{Context, bail};
-use chrono::{Duration, Utc};
-use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -68,6 +69,10 @@ enum Command {
         #[command(flatten)]
         token: TokenArgs,
     },
+    Metrics {
+        #[command(flatten)]
+        token: TokenArgs,
+    },
     RevokeToken {
         #[command(flatten)]
         token: TokenArgs,
@@ -119,6 +124,16 @@ enum Command {
         offset: u64,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+    },
+    VerifyAudit {
+        #[arg(long, default_value = "./var/audit/audit.jsonl")]
+        path: PathBuf,
+    },
+    ExportAudit {
+        #[arg(long, default_value = "./var/audit/audit.jsonl")]
+        path: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -190,6 +205,34 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::VerifyAudit { path } => {
+            let report = verify_file(&path)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::ExportAudit { path, output } => {
+            let verification = verify_file(&path)?;
+            let events = load_events(&path)?;
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(
+                &output,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "verification": verification,
+                    "events": events,
+                }))?,
+            )
+            .with_context(|| format!("failed to write {}", output.display()))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "output": output,
+                    "event_count": events.len(),
+                }))?
+            );
+            Ok(())
+        }
         command => {
             let endpoint = endpoint_from_cli(cli.transport, cli.address, cli.socket)?;
             let mut client = Client::connect(endpoint).await?;
@@ -227,6 +270,10 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
         Command::AuthState { token } => Ok(ControlRequest {
             capability_token: resolve_token(token)?,
             command: ControlCommand::GetAuthState,
+        }),
+        Command::Metrics { token } => Ok(ControlRequest {
+            capability_token: resolve_token(token)?,
+            command: ControlCommand::GetMetrics,
         }),
         Command::RevokeToken { token, token_id } => Ok(ControlRequest {
             capability_token: resolve_token(token)?,
@@ -285,7 +332,10 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
                 limit,
             },
         }),
-        Command::GenerateKeypair { .. } | Command::IssueToken { .. } => {
+        Command::GenerateKeypair { .. }
+        | Command::IssueToken { .. }
+        | Command::VerifyAudit { .. }
+        | Command::ExportAudit { .. } => {
             bail!("this command does not produce a control request")
         }
     }

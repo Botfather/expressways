@@ -10,6 +10,9 @@ The original concept in [docs/main.md](/Users/tusharmohan/Documents/@labs/expres
 - Control-plane-first design with signed capability tokens, multi-issuer principal verification, policy checks, and audit events on every operation.
 - Per-principal quota profiles with explicit backpressure behavior on publish and consume paths.
 - Admin control-plane commands for auth-state inspection and token, principal, or issuer-key revocation.
+- Runtime metrics export for broker, storage, and audit state.
+- Retention limits, disk-pressure reclamation, and segment recovery for local workstation safety.
+- Audit verification and export tooling for operators.
 - Explicit compliance metadata and retention classes from day one.
 
 ## Workspace Layout
@@ -65,7 +68,15 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 
 ```bash
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 auth-state --token-file ./var/auth/developer.token
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 metrics --token-file ./var/auth/developer.token
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 revoke-token --token-file ./var/auth/developer.token --token-id <token-id>
+```
+
+9. Verify or export the audit trail locally:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- verify-audit --path ./var/audit/audit.jsonl
+cargo run -p expressways-client --bin expresswaysctl -- export-audit --path ./var/audit/audit.jsonl --output ./var/audit/export.json
 ```
 
 ## Guardrails
@@ -77,6 +88,7 @@ Every new externally reachable operation must:
 3. emit an audit event,
 4. emit structured operational logs,
 5. carry compliance metadata or inherit it from the topic,
-6. enforce principal-aware quota and backpressure policy when the path is rate- or size-sensitive.
+6. enforce principal-aware quota and backpressure policy when the path is rate- or size-sensitive,
+7. expose enough metrics or verification data for operators to explain the system after the fact.
 
 If any of those are missing, the change is incomplete.

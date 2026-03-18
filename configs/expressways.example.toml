@@ -10,6 +10,11 @@ log_level = "info"
 segment_max_bytes = 1048576
 retention_class = "operational"
 default_classification = "internal"
+ephemeral_retention_bytes = 4194304
+operational_retention_bytes = 16777216
+regulated_retention_bytes = 67108864
+max_total_bytes = 134217728
+reclaim_target_bytes = 117440512
 
 [audit]
 path = "./var/audit/audit.jsonl"

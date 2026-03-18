@@ -362,6 +362,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "expressways-audit",
  "expressways-auth",
  "expressways-protocol",
  "futures-util",

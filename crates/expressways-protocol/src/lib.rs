@@ -191,10 +191,54 @@ pub struct AuthStateView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationMetricsView {
+    pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub average_latency_ms: u64,
+    pub max_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageMetricsView {
+    pub topic_count: u64,
+    pub segment_count: u64,
+    pub total_bytes: u64,
+    pub reclaimed_segments: u64,
+    pub reclaimed_bytes: u64,
+    pub recovered_segments: u64,
+    pub truncated_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditMetricsView {
+    pub event_count: u64,
+    pub last_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrokerMetricsView {
+    pub uptime_seconds: u64,
+    pub total_requests: u64,
+    pub health_requests: u64,
+    pub admin_requests: u64,
+    pub auth_failures: u64,
+    pub policy_denials: u64,
+    pub quota_denials: u64,
+    pub storage_failures: u64,
+    pub audit_failures: u64,
+    pub publish: OperationMetricsView,
+    pub consume: OperationMetricsView,
+    pub storage: StorageMetricsView,
+    pub audit: AuditMetricsView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlCommand {
     Health,
     GetAuthState,
+    GetMetrics,
     CreateTopic {
         topic: TopicSpec,
     },
@@ -231,6 +275,9 @@ pub enum ControlResponse {
     Health {
         node_name: String,
         status: String,
+    },
+    Metrics {
+        metrics: BrokerMetricsView,
     },
     AuthState {
         state: AuthStateView,

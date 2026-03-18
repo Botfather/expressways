@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use expressways_protocol::{Action, CapabilityClaims, CapabilityScope};
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use expressways_protocol::{Action, CapabilityClaims, CapabilityScope};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -38,12 +38,20 @@ Security, compliance, and auditability are part of the runtime contract. They ar
 - Audit events are hash-chained for tamper evidence.
 - Audit events include principal, action, resource, decision, and outcome.
 - Audit detail should include the capability token id when available.
+- Audit trails must be locally verifiable and exportable without requiring the broker to be online.
 
 ### Operational Logging
 
 - Logs are structured JSON.
 - Logs never replace audit events.
 - Sensitive payloads are not logged directly.
+
+### Operations and Recovery
+
+- The broker must expose operator-usable metrics for request outcomes, storage state, and audit volume.
+- Storage must enforce a global disk-pressure ceiling before local workstation disks are exhausted.
+- Storage should recover from truncated trailing frames or stale indexes when safe to do so.
+- Storage retention policy must be explicit for each retention class.
 
 ### Compliance Metadata
 
@@ -73,4 +81,5 @@ No new endpoint, message path, or admin operation ships unless:
 3. the logs are structured,
 4. the data model carries compliance metadata,
 5. tests cover both allow and deny paths,
-6. any publish or consume path has explicit quota behavior.
+6. any publish or consume path has explicit quota behavior,
+7. operator-facing metrics or verification tooling exist for the new path.

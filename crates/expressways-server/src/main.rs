@@ -1,9 +1,13 @@
 mod config;
+mod metrics;
 mod quota;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
+use anyhow::Context;
+use clap::Parser;
 use expressways_audit::{AuditDecision, AuditOutcome, AuditSink, DraftAuditEvent};
 use expressways_auth::{AuthSnapshot, CapabilityVerifier, RevocationList, VerifiedCapability};
 use expressways_policy::PolicyEngine;
@@ -11,9 +15,7 @@ use expressways_protocol::{
     Action, AuthIssuerView, AuthPrincipalView, AuthRevocationView, AuthStateView, BROKER_RESOURCE,
     ControlCommand, ControlRequest, ControlResponse, TopicSpec, topic_resource,
 };
-use expressways_storage::{Storage, StorageConfig};
-use anyhow::Context;
-use clap::Parser;
+use expressways_storage::{DiskPressurePolicy, RetentionPolicy, Storage, StorageConfig};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -25,6 +27,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{AppConfig, ServerConfig, TransportKind};
+use crate::metrics::MetricsCollector;
 use crate::quota::QuotaManager;
 
 #[derive(Debug, Parser)]
@@ -39,6 +42,7 @@ struct BrokerState {
     verifier: CapabilityVerifier,
     policy: PolicyEngine,
     quotas: QuotaManager,
+    metrics: MetricsCollector,
     storage: Mutex<Storage>,
     audit: Mutex<AuditSink>,
 }
@@ -143,6 +147,15 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
         segment_max_bytes: config.storage.segment_max_bytes,
         default_retention_class: config.storage.retention_class.clone(),
         default_classification: config.storage.default_classification.clone(),
+        retention_policy: RetentionPolicy {
+            ephemeral_max_bytes: config.storage.ephemeral_retention_bytes,
+            operational_max_bytes: config.storage.operational_retention_bytes,
+            regulated_max_bytes: config.storage.regulated_retention_bytes,
+        },
+        disk_pressure: DiskPressurePolicy {
+            max_total_bytes: config.storage.max_total_bytes,
+            reclaim_target_bytes: config.storage.reclaim_target_bytes,
+        },
     })?;
     let audit = AuditSink::new(&config.audit.path)?;
     let verifier = CapabilityVerifier::from_config(&config.auth)?;
@@ -160,6 +173,7 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
         verifier,
         policy: PolicyEngine::new(config.policy.clone()),
         quotas,
+        metrics: MetricsCollector::new(),
         storage: Mutex::new(storage),
         audit: Mutex::new(audit),
     })
@@ -318,8 +332,22 @@ where
 }
 
 async fn process_request(state: &BrokerState, request: ControlRequest) -> ControlResponse {
+    let action = match &request.command {
+        ControlCommand::Health => Action::Health,
+        ControlCommand::Publish { .. } => Action::Publish,
+        ControlCommand::Consume { .. } => Action::Consume,
+        ControlCommand::GetAuthState
+        | ControlCommand::GetMetrics
+        | ControlCommand::CreateTopic { .. }
+        | ControlCommand::RevokeToken { .. }
+        | ControlCommand::RevokePrincipal { .. }
+        | ControlCommand::RevokeKey { .. } => Action::Admin,
+    };
+    state.metrics.record_request(&action);
+
     match request.command {
         ControlCommand::Health => handle_health(state, request.capability_token).await,
+        ControlCommand::GetMetrics => handle_get_metrics(state, request.capability_token).await,
         ControlCommand::GetAuthState => {
             handle_get_auth_state(state, request.capability_token).await
         }
@@ -387,6 +415,7 @@ async fn handle_health(state: &BrokerState, capability_token: String) -> Control
     )
     .await
     {
+        state.metrics.record_audit_failure();
         return ControlResponse::error("audit_failure", error.to_string());
     }
 
@@ -394,6 +423,69 @@ async fn handle_health(state: &BrokerState, capability_token: String) -> Control
         node_name: state.node_name.clone(),
         status: "ok".to_owned(),
     }
+}
+
+async fn handle_get_metrics(state: &BrokerState, capability_token: String) -> ControlResponse {
+    let resource = BROKER_RESOURCE.to_owned();
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some("fetch metrics".to_owned()),
+    )
+    .await
+    {
+        return response;
+    }
+
+    let storage_stats = {
+        let storage = state.storage.lock().await;
+        match storage.stats() {
+            Ok(stats) => stats,
+            Err(error) => {
+                state.metrics.record_storage_failure();
+                let message = error.to_string();
+                let _ = finalize_failure(
+                    state,
+                    &identity,
+                    Action::Admin,
+                    &resource,
+                    Some(message.clone()),
+                )
+                .await;
+                return ControlResponse::error("metrics_error", message);
+            }
+        }
+    };
+    let audit_summary = state.audit.lock().await.summary();
+    let metrics = state.metrics.snapshot(storage_stats, audit_summary);
+
+    if let Err(error) = finalize_success(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some("fetched metrics".to_owned()),
+    )
+    .await
+    {
+        return ControlResponse::error("audit_failure", error.to_string());
+    }
+
+    ControlResponse::Metrics { metrics }
 }
 
 async fn handle_get_auth_state(state: &BrokerState, capability_token: String) -> ControlResponse {
@@ -447,6 +539,7 @@ async fn handle_get_auth_state(state: &BrokerState, capability_token: String) ->
     )
     .await
     {
+        state.metrics.record_audit_failure();
         return ControlResponse::error("audit_failure", error.to_string());
     }
 
@@ -501,6 +594,7 @@ async fn handle_create_topic(
             )
             .await
             {
+                state.metrics.record_audit_failure();
                 return ControlResponse::error("audit_failure", error.to_string());
             }
 
@@ -515,6 +609,7 @@ async fn handle_create_topic(
             ControlResponse::TopicCreated { topic }
         }
         Err(error) => {
+            state.metrics.record_storage_failure();
             let message = error.to_string();
             let _ = finalize_failure(
                 state,
@@ -695,6 +790,7 @@ async fn handle_publish(
     classification: Option<expressways_protocol::Classification>,
     payload: String,
 ) -> ControlResponse {
+    let started_at = Instant::now();
     let resource = topic_resource(&topic);
     let identity = match authenticate_and_authorize(
         state,
@@ -740,8 +836,15 @@ async fn handle_publish(
             )
             .await
             {
+                state.metrics.record_audit_failure();
+                state
+                    .metrics
+                    .record_publish_result(false, started_at.elapsed());
                 return ControlResponse::error("audit_failure", error.to_string());
             }
+            state
+                .metrics
+                .record_publish_result(true, started_at.elapsed());
 
             info!(
                 principal = %identity.principal,
@@ -759,6 +862,10 @@ async fn handle_publish(
             }
         }
         Err(error) => {
+            state.metrics.record_storage_failure();
+            state
+                .metrics
+                .record_publish_result(false, started_at.elapsed());
             let message = error.to_string();
             let _ = finalize_failure(
                 state,
@@ -780,6 +887,7 @@ async fn handle_consume(
     offset: u64,
     limit: usize,
 ) -> ControlResponse {
+    let started_at = Instant::now();
     let resource = topic_resource(&topic);
     let identity = match authenticate_and_authorize(
         state,
@@ -827,8 +935,15 @@ async fn handle_consume(
             )
             .await
             {
+                state.metrics.record_audit_failure();
+                state
+                    .metrics
+                    .record_consume_result(false, started_at.elapsed());
                 return ControlResponse::error("audit_failure", error.to_string());
             }
+            state
+                .metrics
+                .record_consume_result(true, started_at.elapsed());
 
             info!(
                 principal = %identity.principal,
@@ -846,6 +961,10 @@ async fn handle_consume(
             }
         }
         (Err(error), _) | (_, Err(error)) => {
+            state.metrics.record_storage_failure();
+            state
+                .metrics
+                .record_consume_result(false, started_at.elapsed());
             let message = error.to_string();
             let _ = finalize_failure(
                 state,
@@ -870,6 +989,7 @@ async fn revocation_success_response(
     if let Err(error) =
         finalize_success(state, identity, Action::Admin, resource, Some(detail)).await
     {
+        state.metrics.record_audit_failure();
         return ControlResponse::error("audit_failure", error.to_string());
     }
 
@@ -908,6 +1028,7 @@ async fn enforce_publish_quota(
     {
         Ok(()) => Ok(()),
         Err(error) => {
+            state.metrics.record_quota_denial();
             warn!(
                 principal = %identity.principal,
                 principal_kind = %identity.principal_kind,
@@ -945,6 +1066,7 @@ async fn enforce_consume_quota(
     {
         Ok(()) => Ok(()),
         Err(error) => {
+            state.metrics.record_quota_denial();
             warn!(
                 principal = %identity.principal,
                 principal_kind = %identity.principal_kind,
@@ -978,6 +1100,7 @@ async fn authenticate_and_authorize(
     let verified = match state.verifier.verify(capability_token) {
         Ok(verified) => verified,
         Err(error) => {
+            state.metrics.record_auth_failure();
             warn!(
                 action = %action,
                 resource = %resource,
@@ -1002,6 +1125,7 @@ async fn authenticate_and_authorize(
     };
 
     if let Err(error) = verified.authorize(resource, &action) {
+        state.metrics.record_policy_denial();
         warn!(
             principal = %verified.principal(),
             principal_kind = %verified.principal_kind().as_str(),
@@ -1065,6 +1189,7 @@ async fn authorize_by_policy(
             Ok(())
         }
         Err(error) => {
+            state.metrics.record_policy_denial();
             warn!(
                 principal = %verified.principal(),
                 principal_kind = %verified.principal_kind().as_str(),
@@ -1114,7 +1239,10 @@ async fn record_attempt(
     )
     .await
     .map(|_| ())
-    .map_err(|error| ControlResponse::error("audit_failure", error.to_string()))
+    .map_err(|error| {
+        state.metrics.record_audit_failure();
+        ControlResponse::error("audit_failure", error.to_string())
+    })
 }
 
 async fn finalize_success(
@@ -1244,6 +1372,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use chrono::{Duration, Utc};
     use expressways_auth::{
         AuthConfig, CapabilityIssuer, IssuerStatus, PrincipalKind, PrincipalRecord,
         PrincipalStatus, TrustedIssuerConfig,
@@ -1253,7 +1382,6 @@ mod tests {
         CapabilityClaims, CapabilityScope, Classification, ControlCommand, ControlResponse,
         RetentionClass,
     };
-    use chrono::{Duration, Utc};
     use uuid::Uuid;
 
     use super::*;
@@ -1312,6 +1440,11 @@ mod tests {
                 segment_max_bytes: 4096,
                 retention_class: RetentionClass::Operational,
                 default_classification: Classification::Internal,
+                ephemeral_retention_bytes: 4096,
+                operational_retention_bytes: 8192,
+                regulated_retention_bytes: 16384,
+                max_total_bytes: 65536,
+                reclaim_target_bytes: 49152,
             },
             audit: AuditSection {
                 path: root.join("audit").join("audit.jsonl"),
@@ -1507,6 +1640,83 @@ mod tests {
                 assert!(revocations.revoked_tokens.contains(&token_id));
             }
             other => panic!("expected revocation update, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_command_reports_runtime_counters() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![
+                CapabilityScope {
+                    resource: BROKER_RESOURCE.to_owned(),
+                    actions: vec![Action::Admin, Action::Health],
+                },
+                CapabilityScope {
+                    resource: "topic:*".to_owned(),
+                    actions: vec![Action::Publish, Action::Consume, Action::Admin],
+                },
+            ],
+        );
+
+        let _ = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::Health,
+            },
+        )
+        .await;
+        let _ = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::CreateTopic {
+                    topic: TopicSpec {
+                        name: "tasks".to_owned(),
+                        retention_class: RetentionClass::Operational,
+                        default_classification: Classification::Internal,
+                    },
+                },
+            },
+        )
+        .await;
+        let _ = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::Publish {
+                    topic: "tasks".to_owned(),
+                    classification: None,
+                    payload: "hello".to_owned(),
+                },
+            },
+        )
+        .await;
+
+        let metrics_response = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::GetMetrics,
+            },
+        )
+        .await;
+
+        match metrics_response {
+            ControlResponse::Metrics { metrics } => {
+                assert!(metrics.total_requests >= 4);
+                assert!(metrics.publish.requests >= 1);
+                assert!(metrics.publish.successes >= 1);
+                assert!(metrics.storage.topic_count >= 1);
+                assert!(metrics.audit.event_count >= 1);
+            }
+            other => panic!("expected metrics response, got {other:?}"),
         }
     }
 }

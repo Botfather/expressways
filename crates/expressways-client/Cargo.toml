@@ -6,6 +6,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+expressways-audit = { path = "../expressways-audit" }
 expressways-auth = { path = "../expressways-auth" }
 expressways-protocol = { path = "../expressways-protocol" }
 anyhow.workspace = true
