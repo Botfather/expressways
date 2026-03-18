@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use expressways_audit::AuditLogSummary;
 use expressways_protocol::{
     Action, AuditMetricsView, BrokerMetricsView, OperationMetricsView, StorageMetricsView,
+    StreamMetricsView,
 };
 use expressways_storage::StorageStats;
 
@@ -25,6 +26,16 @@ struct MetricsState {
     audit_failures: u64,
     publish: OperationStats,
     consume: OperationStats,
+    stream_watch: OperationStats,
+    open_streams: u64,
+    opened_streams: u64,
+    closed_streams: u64,
+    keepalives_sent: u64,
+    event_frames_sent: u64,
+    events_delivered: u64,
+    delivery_failures: u64,
+    slow_consumer_drops: u64,
+    idle_timeouts: u64,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +96,44 @@ impl MetricsCollector {
         update_operation(&mut state.consume, success, latency);
     }
 
+    pub fn record_stream_opened(&self) {
+        let mut state = self.state.lock().expect("metrics lock");
+        state.open_streams += 1;
+        state.opened_streams += 1;
+        state.stream_watch.requests += 1;
+    }
+
+    pub fn record_stream_closed(&self) {
+        let mut state = self.state.lock().expect("metrics lock");
+        state.open_streams = state.open_streams.saturating_sub(1);
+        state.closed_streams += 1;
+    }
+
+    pub fn record_stream_keepalive(&self) {
+        self.state.lock().expect("metrics lock").keepalives_sent += 1;
+    }
+
+    pub fn record_stream_delivery(&self, delivered_events: usize, latency: Duration) {
+        let mut state = self.state.lock().expect("metrics lock");
+        state.event_frames_sent += 1;
+        state.events_delivered += delivered_events as u64;
+        update_operation(&mut state.stream_watch, true, latency);
+    }
+
+    pub fn record_stream_delivery_failure(&self, latency: Duration) {
+        let mut state = self.state.lock().expect("metrics lock");
+        state.delivery_failures += 1;
+        update_operation(&mut state.stream_watch, false, latency);
+    }
+
+    pub fn record_stream_slow_consumer_drop(&self) {
+        self.state.lock().expect("metrics lock").slow_consumer_drops += 1;
+    }
+
+    pub fn record_stream_idle_timeout(&self) {
+        self.state.lock().expect("metrics lock").idle_timeouts += 1;
+    }
+
     pub fn snapshot(&self, storage: StorageStats, audit: AuditLogSummary) -> BrokerMetricsView {
         let state = self.state.lock().expect("metrics lock");
         BrokerMetricsView {
@@ -111,6 +160,18 @@ impl MetricsCollector {
             audit: AuditMetricsView {
                 event_count: audit.event_count,
                 last_hash: audit.last_hash,
+            },
+            streams: StreamMetricsView {
+                open_streams: state.open_streams,
+                opened_streams: state.opened_streams,
+                closed_streams: state.closed_streams,
+                keepalives_sent: state.keepalives_sent,
+                event_frames_sent: state.event_frames_sent,
+                events_delivered: state.events_delivered,
+                delivery_failures: state.delivery_failures,
+                slow_consumer_drops: state.slow_consumer_drops,
+                idle_timeouts: state.idle_timeouts,
+                watch_stream: operation_view(&state.stream_watch),
             },
         }
     }
@@ -155,6 +216,10 @@ mod tests {
         metrics.record_request(&Action::Publish);
         metrics.record_publish_result(true, Duration::from_millis(12));
         metrics.record_auth_failure();
+        metrics.record_stream_opened();
+        metrics.record_stream_keepalive();
+        metrics.record_stream_delivery(3, Duration::from_millis(4));
+        metrics.record_stream_closed();
 
         let snapshot = metrics.snapshot(
             StorageStats {
@@ -175,5 +240,11 @@ mod tests {
         assert_eq!(snapshot.publish.average_latency_ms, 12);
         assert_eq!(snapshot.auth_failures, 1);
         assert_eq!(snapshot.audit.event_count, 3);
+        assert_eq!(snapshot.streams.opened_streams, 1);
+        assert_eq!(snapshot.streams.closed_streams, 1);
+        assert_eq!(snapshot.streams.keepalives_sent, 1);
+        assert_eq!(snapshot.streams.events_delivered, 3);
+        assert_eq!(snapshot.streams.watch_stream.requests, 1);
+        assert_eq!(snapshot.streams.watch_stream.successes, 1);
     }
 }

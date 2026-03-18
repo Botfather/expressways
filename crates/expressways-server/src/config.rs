@@ -62,6 +62,10 @@ pub struct RegistrySection {
     pub default_ttl_seconds: u64,
     #[serde(default = "default_registry_event_history_limit")]
     pub event_history_limit: usize,
+    #[serde(default = "default_registry_stream_send_timeout_ms")]
+    pub stream_send_timeout_ms: u64,
+    #[serde(default = "default_registry_stream_idle_keepalive_limit")]
+    pub stream_idle_keepalive_limit: u64,
 }
 
 impl Default for RegistrySection {
@@ -71,6 +75,8 @@ impl Default for RegistrySection {
             path: None,
             default_ttl_seconds: default_registry_ttl_seconds(),
             event_history_limit: default_registry_event_history_limit(),
+            stream_send_timeout_ms: default_registry_stream_send_timeout_ms(),
+            stream_idle_keepalive_limit: default_registry_stream_idle_keepalive_limit(),
         }
     }
 }
@@ -88,6 +94,14 @@ fn default_registry_ttl_seconds() -> u64 {
 
 fn default_registry_event_history_limit() -> usize {
     1024
+}
+
+fn default_registry_stream_send_timeout_ms() -> u64 {
+    1_000
+}
+
+fn default_registry_stream_idle_keepalive_limit() -> u64 {
+    12
 }
 
 impl AppConfig {

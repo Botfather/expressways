@@ -159,6 +159,10 @@ enum Command {
         max_events: usize,
         #[arg(long, default_value_t = 30000)]
         wait_timeout_ms: u64,
+        #[arg(long, default_value_t = true)]
+        resume: bool,
+        #[arg(long, default_value_t = 250)]
+        retry_delay_ms: u64,
     },
     CleanupStaleAgents {
         #[command(flatten)]
@@ -391,10 +395,10 @@ async fn main() -> anyhow::Result<()> {
             cursor,
             max_events,
             wait_timeout_ms,
+            resume,
+            retry_delay_ms,
         } => {
             let endpoint = endpoint_from_cli(cli.transport, cli.address, cli.socket)?;
-            let client = Client::connect(endpoint).await?;
-            let mut stream = client.into_stream();
             let capability_token = resolve_token(token)?;
             let query = AgentQuery {
                 skill,
@@ -403,41 +407,75 @@ async fn main() -> anyhow::Result<()> {
                 include_stale,
             };
 
-            let opened = stream
-                .open(ControlRequest {
-                    capability_token,
-                    command: ControlCommand::OpenAgentWatchStream {
-                        query,
-                        cursor,
-                        max_events,
-                        wait_timeout_ms,
-                    },
-                })
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&opened)?);
+            let mut next_cursor = cursor;
+            loop {
+                let client = Client::connect(endpoint.clone()).await?;
+                let mut stream = client.into_stream();
 
-            match opened {
-                StreamFrame::AgentWatchOpened { .. } => {}
-                StreamFrame::StreamError { .. } | StreamFrame::StreamClosed { .. } => {
-                    return Ok(());
-                }
-                other => {
-                    bail!("unexpected opening frame for watch-agents-stream: {other:?}");
-                }
-            }
+                let opened = stream
+                    .open(ControlRequest {
+                        capability_token: capability_token.clone(),
+                        command: ControlCommand::OpenAgentWatchStream {
+                            query: query.clone(),
+                            cursor: next_cursor,
+                            max_events,
+                            wait_timeout_ms,
+                        },
+                    })
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&opened)?);
 
-            while let Some(frame) = stream.next_frame().await? {
-                println!("{}", serde_json::to_string_pretty(&frame)?);
-                match frame {
-                    StreamFrame::RegistryEvents { .. } | StreamFrame::KeepAlive { .. } => {}
-                    StreamFrame::StreamError { .. } | StreamFrame::StreamClosed { .. } => break,
-                    StreamFrame::AgentWatchOpened { .. } => {
-                        bail!("unexpected additional opening frame from watch stream");
+                match opened {
+                    StreamFrame::AgentWatchOpened { cursor } => {
+                        next_cursor = Some(cursor);
+                    }
+                    StreamFrame::StreamError { .. } | StreamFrame::StreamClosed { .. } => {
+                        return Ok(());
+                    }
+                    other => {
+                        bail!("unexpected opening frame for watch-agents-stream: {other:?}");
                     }
                 }
-            }
 
-            Ok(())
+                let mut should_resume = false;
+                let mut saw_terminal_frame = false;
+                while let Some(frame) = stream.next_frame().await? {
+                    println!("{}", serde_json::to_string_pretty(&frame)?);
+                    match frame {
+                        StreamFrame::RegistryEvents { cursor, .. }
+                        | StreamFrame::KeepAlive { cursor } => {
+                            next_cursor = Some(cursor);
+                        }
+                        StreamFrame::StreamClosed { cursor, .. } => {
+                            next_cursor = Some(cursor);
+                            should_resume = resume;
+                            saw_terminal_frame = true;
+                            break;
+                        }
+                        StreamFrame::StreamError { code, .. } => {
+                            if resume && code == "connection_closed" {
+                                should_resume = true;
+                                saw_terminal_frame = true;
+                                break;
+                            }
+                            return Ok(());
+                        }
+                        StreamFrame::AgentWatchOpened { .. } => {
+                            bail!("unexpected additional opening frame from watch stream");
+                        }
+                    }
+                }
+
+                if !saw_terminal_frame && resume {
+                    should_resume = true;
+                }
+
+                if !should_resume {
+                    return Ok(());
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+            }
         }
         command => {
             let endpoint = endpoint_from_cli(cli.transport, cli.address, cli.socket)?;

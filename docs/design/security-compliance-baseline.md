@@ -62,6 +62,8 @@ Security, compliance, and auditability are part of the runtime contract. They ar
 - Discovery-registry operators must be able to distinguish active cards from stale cards and explicitly sweep expired entries.
 - Discovery watch history must be bounded so subscriptions cannot grow server memory without limit.
 - Discovery watch streams must use bounded batching and keepalive frames rather than unbounded server-side buffering.
+- Discovery watch streams must enforce explicit send-timeout and idle-close behavior so slow consumers cannot hold resources indefinitely.
+- Stream lifecycle metrics should expose opened streams, closed streams, keepalives, delivery failures, and slow-consumer drops.
 
 ### Compliance Metadata
 

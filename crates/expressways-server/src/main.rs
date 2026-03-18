@@ -6,7 +6,7 @@ mod registry_events;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
@@ -52,7 +52,14 @@ struct BrokerState {
     storage: Mutex<Storage>,
     registry: Mutex<AgentRegistry>,
     registry_events: RegistryEventHub,
+    stream_limits: StreamLimits,
     audit: Mutex<AuditSink>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamLimits {
+    send_timeout: Duration,
+    idle_keepalive_limit: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +194,10 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
         storage: Mutex::new(storage),
         registry: Mutex::new(registry),
         registry_events,
+        stream_limits: StreamLimits {
+            send_timeout: Duration::from_millis(config.registry.stream_send_timeout_ms.max(1)),
+            idle_keepalive_limit: config.registry.stream_idle_keepalive_limit.max(1),
+        },
         audit: Mutex::new(audit),
     })
 }
@@ -394,6 +405,7 @@ where
                     code: "invalid_request".to_owned(),
                     message: "streaming transport only supports open_agent_watch_stream".to_owned(),
                 },
+                state.stream_limits.send_timeout,
             )
             .await?;
             return Ok(());
@@ -411,7 +423,12 @@ where
     {
         Ok(identity) => identity,
         Err(response) => {
-            send_stream_frame(framed, &stream_error_from_response(response)).await?;
+            send_stream_frame(
+                framed,
+                &stream_error_from_response(response),
+                state.stream_limits.send_timeout,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -428,7 +445,12 @@ where
     )
     .await
     {
-        send_stream_frame(framed, &stream_error_from_response(response)).await?;
+        send_stream_frame(
+            framed,
+            &stream_error_from_response(response),
+            state.stream_limits.send_timeout,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -453,6 +475,7 @@ where
                     code: code.to_owned(),
                     message,
                 },
+                state.stream_limits.send_timeout,
             )
             .await?;
             return Ok(());
@@ -464,6 +487,7 @@ where
         &StreamFrame::AgentWatchOpened {
             cursor: next_cursor,
         },
+        state.stream_limits.send_timeout,
     )
     .await
     {
@@ -477,6 +501,8 @@ where
         .await;
         return Ok(());
     }
+
+    state.metrics.record_stream_opened();
 
     if let Err(error) = finalize_success(
         state,
@@ -495,6 +521,7 @@ where
                 code: "audit_failure".to_owned(),
                 message: error.to_string(),
             },
+            state.stream_limits.send_timeout,
         )
         .await?;
         return Ok(());
@@ -512,14 +539,19 @@ where
         "registry watch stream opened"
     );
 
+    let stream_started = Instant::now();
+    let mut idle_keepalives = 0u64;
     loop {
+        let watch_started = Instant::now();
         match state
             .registry_events
             .watch(&query, Some(next_cursor), max_events, wait_timeout_ms)
             .await
         {
             Ok(batch) => {
-                let frame = if batch.timed_out {
+                let timed_out = batch.timed_out;
+                let delivered_events = batch.events.len();
+                let frame = if timed_out {
                     StreamFrame::KeepAlive {
                         cursor: batch.cursor,
                     }
@@ -531,18 +563,77 @@ where
                 };
                 next_cursor = batch.cursor;
 
-                if let Err(error) = send_stream_frame(framed, &frame).await {
-                    info!(
-                        principal = %identity.principal,
-                        principal_kind = %identity.principal_kind,
-                        quota_profile = %identity.quota_profile,
-                        token_id = %identity.token_id,
-                        resource = %resource,
-                        cursor = next_cursor,
-                        error = %error,
-                        "registry watch stream closed by client"
-                    );
-                    break;
+                match send_stream_frame(framed, &frame, state.stream_limits.send_timeout).await {
+                    Ok(()) => {
+                        if timed_out {
+                            idle_keepalives += 1;
+                            state.metrics.record_stream_keepalive();
+                            if idle_keepalives >= state.stream_limits.idle_keepalive_limit {
+                                state.metrics.record_stream_idle_timeout();
+                                let reason =
+                                    format!("idle_timeout_after_{}_keepalives", idle_keepalives);
+                                let _ = send_stream_frame(
+                                    framed,
+                                    &StreamFrame::StreamClosed {
+                                        cursor: next_cursor,
+                                        reason: reason.clone(),
+                                    },
+                                    state.stream_limits.send_timeout,
+                                )
+                                .await;
+                                info!(
+                                    principal = %identity.principal,
+                                    principal_kind = %identity.principal_kind,
+                                    quota_profile = %identity.quota_profile,
+                                    token_id = %identity.token_id,
+                                    resource = %resource,
+                                    cursor = next_cursor,
+                                    opened_for_ms = stream_started.elapsed().as_millis(),
+                                    keepalives = idle_keepalives,
+                                    "registry watch stream closed after idle timeout"
+                                );
+                                break;
+                            }
+                        } else {
+                            idle_keepalives = 0;
+                            state
+                                .metrics
+                                .record_stream_delivery(delivered_events, watch_started.elapsed());
+                        }
+                    }
+                    Err(StreamSendError::TimedOut) => {
+                        state
+                            .metrics
+                            .record_stream_delivery_failure(watch_started.elapsed());
+                        state.metrics.record_stream_slow_consumer_drop();
+                        warn!(
+                            principal = %identity.principal,
+                            principal_kind = %identity.principal_kind,
+                            quota_profile = %identity.quota_profile,
+                            token_id = %identity.token_id,
+                            resource = %resource,
+                            cursor = next_cursor,
+                            send_timeout_ms = state.stream_limits.send_timeout.as_millis(),
+                            "registry watch stream dropped due to slow consumer"
+                        );
+                        break;
+                    }
+                    Err(StreamSendError::Failed(error)) => {
+                        state
+                            .metrics
+                            .record_stream_delivery_failure(watch_started.elapsed());
+                        info!(
+                            principal = %identity.principal,
+                            principal_kind = %identity.principal_kind,
+                            quota_profile = %identity.quota_profile,
+                            token_id = %identity.token_id,
+                            resource = %resource,
+                            cursor = next_cursor,
+                            error = %error,
+                            "registry watch stream closed by client"
+                        );
+                        break;
+                    }
                 }
             }
             Err(error) => {
@@ -566,6 +657,7 @@ where
                         code: code.to_owned(),
                         message,
                     },
+                    state.stream_limits.send_timeout,
                 )
                 .await;
                 break;
@@ -573,19 +665,60 @@ where
         }
     }
 
+    state.metrics.record_stream_closed();
+
     Ok(())
 }
 
 async fn send_stream_frame<T>(
     framed: &mut Framed<T, LinesCodec>,
     frame: &StreamFrame,
-) -> anyhow::Result<()>
+    send_timeout: Duration,
+) -> Result<(), StreamSendError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let serialized = serde_json::to_string(frame)?;
-    framed.send(serialized).await?;
+    let serialized = serde_json::to_string(frame).map_err(StreamSendError::from)?;
+    tokio::time::timeout(send_timeout, framed.send(serialized))
+        .await
+        .map_err(|_| StreamSendError::TimedOut)?
+        .map_err(StreamSendError::from)?;
     Ok(())
+}
+
+#[derive(Debug)]
+enum StreamSendError {
+    TimedOut,
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for StreamSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => formatter.write_str("stream send timed out"),
+            Self::Failed(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for StreamSendError {}
+
+impl From<anyhow::Error> for StreamSendError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<serde_json::Error> for StreamSendError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
+impl From<tokio_util::codec::LinesCodecError> for StreamSendError {
+    fn from(error: tokio_util::codec::LinesCodecError) -> Self {
+        Self::Failed(error.into())
+    }
 }
 
 fn stream_error_from_response(response: ControlResponse) -> StreamFrame {
@@ -2283,6 +2416,8 @@ mod tests {
                 path: Some(root.join("registry").join("agents.json")),
                 default_ttl_seconds: 300,
                 event_history_limit: 64,
+                stream_send_timeout_ms: 1_000,
+                stream_idle_keepalive_limit: 12,
             },
             policy: PolicyConfig {
                 default_decision: DefaultDecision::Deny,
@@ -3123,6 +3258,278 @@ mod tests {
             .await
             .expect("server task join")
             .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn open_agent_watch_stream_closes_after_idle_limit_and_resumes_from_cursor() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.registry.stream_idle_keepalive_limit = 2;
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let (client_stream, server_stream) = duplex(8 * 1024);
+        let server_state = Arc::clone(&state);
+        let server =
+            tokio::spawn(async move { handle_connection(server_stream, server_state).await });
+        let mut client = Framed::new(client_stream, LinesCodec::new());
+
+        client
+            .send(
+                serde_json::to_string(&ControlRequest {
+                    capability_token: developer_token.clone(),
+                    command: ControlCommand::OpenAgentWatchStream {
+                        query: AgentQuery::default(),
+                        cursor: None,
+                        max_events: 10,
+                        wait_timeout_ms: 1,
+                    },
+                })
+                .expect("serialize stream-open request"),
+            )
+            .await
+            .expect("send stream-open request");
+
+        let opened = client
+            .next()
+            .await
+            .expect("opening frame")
+            .expect("opening frame io");
+        let opened: StreamFrame = serde_json::from_str(&opened).expect("parse opening frame");
+        assert!(matches!(
+            opened,
+            StreamFrame::AgentWatchOpened { cursor: 0 }
+        ));
+
+        let keepalive_one = client
+            .next()
+            .await
+            .expect("first keepalive")
+            .expect("first keepalive io");
+        let keepalive_one: StreamFrame =
+            serde_json::from_str(&keepalive_one).expect("parse first keepalive");
+        assert!(matches!(
+            keepalive_one,
+            StreamFrame::KeepAlive { cursor: 0 }
+        ));
+
+        let keepalive_two = client
+            .next()
+            .await
+            .expect("second keepalive")
+            .expect("second keepalive io");
+        let keepalive_two: StreamFrame =
+            serde_json::from_str(&keepalive_two).expect("parse second keepalive");
+        assert!(matches!(
+            keepalive_two,
+            StreamFrame::KeepAlive { cursor: 0 }
+        ));
+
+        let closed = client
+            .next()
+            .await
+            .expect("closed frame")
+            .expect("closed frame io");
+        let closed: StreamFrame = serde_json::from_str(&closed).expect("parse closed frame");
+        let resume_cursor = match closed {
+            StreamFrame::StreamClosed { cursor, reason } => {
+                assert!(reason.contains("idle_timeout_after_2_keepalives"));
+                cursor
+            }
+            other => panic!("expected stream-closed frame, got {other:?}"),
+        };
+
+        drop(client);
+        server
+            .await
+            .expect("server task join")
+            .expect("server task");
+
+        let (resume_client_stream, resume_server_stream) = duplex(8 * 1024);
+        let resume_state = Arc::clone(&state);
+        let resume_server =
+            tokio::spawn(
+                async move { handle_connection(resume_server_stream, resume_state).await },
+            );
+        let mut resume_client = Framed::new(resume_client_stream, LinesCodec::new());
+
+        resume_client
+            .send(
+                serde_json::to_string(&ControlRequest {
+                    capability_token: developer_token.clone(),
+                    command: ControlCommand::OpenAgentWatchStream {
+                        query: AgentQuery::default(),
+                        cursor: Some(resume_cursor),
+                        max_events: 10,
+                        wait_timeout_ms: 2_000,
+                    },
+                })
+                .expect("serialize resumed stream-open request"),
+            )
+            .await
+            .expect("send resumed stream-open request");
+
+        let resumed_open = resume_client
+            .next()
+            .await
+            .expect("resumed opening frame")
+            .expect("resumed opening frame io");
+        let resumed_open: StreamFrame =
+            serde_json::from_str(&resumed_open).expect("parse resumed opening frame");
+        assert!(matches!(
+            resumed_open,
+            StreamFrame::AgentWatchOpened { cursor } if cursor == resume_cursor
+        ));
+
+        let register = process_request(
+            state.as_ref(),
+            ControlRequest {
+                capability_token: developer_token,
+                command: ControlCommand::RegisterAgent {
+                    registration: AgentRegistration {
+                        agent_id: "resumed-watch-agent".to_owned(),
+                        display_name: "Resumed Watch Agent".to_owned(),
+                        version: "1.0.0".to_owned(),
+                        summary: "Arrives after reconnect".to_owned(),
+                        skills: vec!["watch".to_owned()],
+                        subscriptions: vec!["topic:tasks".to_owned()],
+                        publications: vec!["topic:results".to_owned()],
+                        schemas: Vec::new(),
+                        endpoint: AgentEndpoint {
+                            transport: "control_tcp".to_owned(),
+                            address: "127.0.0.1:8857".to_owned(),
+                        },
+                        classification: Classification::Internal,
+                        retention_class: RetentionClass::Operational,
+                        ttl_seconds: None,
+                    },
+                },
+            },
+        )
+        .await;
+        assert!(matches!(register, ControlResponse::AgentRegistered { .. }));
+
+        let resumed_event = resume_client
+            .next()
+            .await
+            .expect("resumed event frame")
+            .expect("resumed event frame io");
+        let resumed_event: StreamFrame =
+            serde_json::from_str(&resumed_event).expect("parse resumed event frame");
+        match resumed_event {
+            StreamFrame::RegistryEvents { events, cursor } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].card.agent_id, "resumed-watch-agent");
+                assert!(cursor >= events[0].sequence);
+            }
+            other => panic!("expected resumed registry-events frame, got {other:?}"),
+        }
+
+        drop(resume_client);
+        resume_server
+            .await
+            .expect("resumed server task join")
+            .expect("resumed server task");
+    }
+
+    #[tokio::test]
+    async fn open_agent_watch_stream_drops_slow_consumers_and_records_metrics() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.registry.stream_send_timeout_ms = 10;
+        config.registry.stream_idle_keepalive_limit = 100;
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let (client_stream, server_stream) = duplex(128);
+        let server_state = Arc::clone(&state);
+        let server =
+            tokio::spawn(async move { handle_connection(server_stream, server_state).await });
+        let mut client = Framed::new(client_stream, LinesCodec::new());
+
+        client
+            .send(
+                serde_json::to_string(&ControlRequest {
+                    capability_token: developer_token.clone(),
+                    command: ControlCommand::OpenAgentWatchStream {
+                        query: AgentQuery::default(),
+                        cursor: None,
+                        max_events: 10,
+                        wait_timeout_ms: 2_000,
+                    },
+                })
+                .expect("serialize stream-open request"),
+            )
+            .await
+            .expect("send stream-open request");
+
+        let opened = client
+            .next()
+            .await
+            .expect("opening frame")
+            .expect("opening frame io");
+        let opened: StreamFrame = serde_json::from_str(&opened).expect("parse opening frame");
+        assert!(matches!(opened, StreamFrame::AgentWatchOpened { .. }));
+
+        let register = process_request(
+            state.as_ref(),
+            ControlRequest {
+                capability_token: developer_token,
+                command: ControlCommand::RegisterAgent {
+                    registration: AgentRegistration {
+                        agent_id: "slow-consumer-agent".to_owned(),
+                        display_name: "Slow Consumer Agent".to_owned(),
+                        version: "1.0.0".to_owned(),
+                        summary: "x".repeat(8 * 1024),
+                        skills: vec!["watch".to_owned()],
+                        subscriptions: vec!["topic:tasks".to_owned()],
+                        publications: vec!["topic:results".to_owned()],
+                        schemas: Vec::new(),
+                        endpoint: AgentEndpoint {
+                            transport: "control_tcp".to_owned(),
+                            address: "127.0.0.1:8858".to_owned(),
+                        },
+                        classification: Classification::Internal,
+                        retention_class: RetentionClass::Operational,
+                        ttl_seconds: None,
+                    },
+                },
+            },
+        )
+        .await;
+        assert!(matches!(register, ControlResponse::AgentRegistered { .. }));
+
+        server
+            .await
+            .expect("server task join")
+            .expect("server task");
+
+        let storage_stats = {
+            let storage = state.storage.lock().await;
+            storage.stats().expect("storage stats")
+        };
+        let audit_summary = state.audit.lock().await.summary();
+        let metrics = state.metrics.snapshot(storage_stats, audit_summary);
+        assert_eq!(metrics.streams.slow_consumer_drops, 1);
+        assert_eq!(metrics.streams.delivery_failures, 1);
+        assert_eq!(metrics.streams.closed_streams, 1);
+        assert_eq!(metrics.streams.open_streams, 0);
     }
 
     #[tokio::test]

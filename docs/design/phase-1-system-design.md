@@ -46,7 +46,7 @@ flowchart LR
 
 ### Protocol Layer
 
-Provides strongly typed control-plane requests and responses. Phase 1 uses a simple JSON protocol over local TCP by default, with Unix sockets available as an optional transport on Unix platforms. The protocol includes admin commands for auth-state inspection, revocation changes, metrics export, and discovery-registry operations including heartbeats, stale-entry cleanup, long-poll watch requests, and a dedicated multi-frame watch stream so operators can manage identity state and inspect runtime health without editing runtime files by hand.
+Provides strongly typed control-plane requests and responses. Phase 1 uses a simple JSON protocol over local TCP by default, with Unix sockets available as an optional transport on Unix platforms. The protocol includes admin commands for auth-state inspection, revocation changes, metrics export, and discovery-registry operations including heartbeats, stale-entry cleanup, long-poll watch requests, and a dedicated multi-frame watch stream with cursor resume so operators can manage identity state and inspect runtime health without editing runtime files by hand.
 
 ### AuthN and AuthZ Gate
 
@@ -62,7 +62,7 @@ Coordinates request handling, topic resolution, storage operations, and audit em
 
 ### Discovery Registry
 
-Stores agent cards behind a backend seam that currently uses a local JSON file. Registry lookups support exact-match filters on skill, topic, and principal rather than semantic ranking. Ownership is derived from the authenticated principal, not caller-supplied metadata, so the registry does not become a side channel for identity spoofing. Cards also carry TTL-based liveness metadata so stale discovery entries do not linger in normal query results forever. A bounded in-memory event journal supports both long-poll watch subscriptions and a dedicated multi-frame watch stream for orchestrators that need change notifications.
+Stores agent cards behind a backend seam that currently uses a local JSON file. Registry lookups support exact-match filters on skill, topic, and principal rather than semantic ranking. Ownership is derived from the authenticated principal, not caller-supplied metadata, so the registry does not become a side channel for identity spoofing. Cards also carry TTL-based liveness metadata so stale discovery entries do not linger in normal query results forever. A bounded in-memory event journal supports both long-poll watch subscriptions and a dedicated multi-frame watch stream for orchestrators that need change notifications, while explicit send timeouts and idle keepalive limits bound the server cost of stalled watchers.
 
 ### Segmented Storage
 
@@ -74,7 +74,7 @@ Persists append-only audit events with hash chaining so tampering can be detecte
 
 ### Metrics Snapshot
 
-Collects broker counters, publish and consume latency summaries, storage maintenance statistics, and audit log totals so operators can explain current behavior without reading raw files by hand.
+Collects broker counters, publish and consume latency summaries, storage maintenance statistics, audit log totals, and registry-stream lifecycle counters so operators can explain current behavior without reading raw files by hand.
 
 ### Metadata Catalog
 

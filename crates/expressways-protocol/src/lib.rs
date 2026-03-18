@@ -298,6 +298,20 @@ pub struct AuditMetricsView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamMetricsView {
+    pub open_streams: u64,
+    pub opened_streams: u64,
+    pub closed_streams: u64,
+    pub keepalives_sent: u64,
+    pub event_frames_sent: u64,
+    pub events_delivered: u64,
+    pub delivery_failures: u64,
+    pub slow_consumer_drops: u64,
+    pub idle_timeouts: u64,
+    pub watch_stream: OperationMetricsView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrokerMetricsView {
     pub uptime_seconds: u64,
     pub total_requests: u64,
@@ -312,6 +326,7 @@ pub struct BrokerMetricsView {
     pub consume: OperationMetricsView,
     pub storage: StorageMetricsView,
     pub audit: AuditMetricsView,
+    pub streams: StreamMetricsView,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

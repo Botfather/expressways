@@ -24,6 +24,8 @@ backend = "file"
 path = "./var/registry/agents.json"
 default_ttl_seconds = 300
 event_history_limit = 1024
+stream_send_timeout_ms = 1000
+stream_idle_keepalive_limit = 12
 
 [auth]
 audience = "expressways"

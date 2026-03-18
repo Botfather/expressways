@@ -51,7 +51,7 @@ Each registry entry stores:
 
 The first backend is `file`, which persists registry state to a local JSON document. The backend seam exists so later work can add a stronger metadata store without changing the control-plane contract.
 
-Registry change subscriptions use an in-memory bounded event journal. That keeps the first watch implementations simple and fast, but it also means watch cursors are runtime-local rather than durable across broker restarts.
+Registry change subscriptions use an in-memory bounded event journal. That keeps the first watch implementations simple and fast, but it also means watch cursors are runtime-local rather than durable across broker restarts. Stream delivery also has explicit send timeouts and idle keepalive limits so orphaned or stalled watchers do not pin server tasks forever.
 
 ## Query Model
 
@@ -80,9 +80,12 @@ Stale cards are hidden by default. Operators can include them explicitly when di
 - `watch_agents` uses a long-poll request with a cursor, query filters, maximum batch size, and wait timeout.
 - `open_agent_watch_stream` upgrades a connection into a dedicated multi-frame JSON-line stream with the same cursor, query, and batch semantics.
 - Both watch modes use the same bounded event journal and the same cursor validation rules.
+- Stream clients should persist the last observed cursor and reconnect with it when the transport closes or the broker sends `stream_closed`.
 - If matching events already exist after the provided cursor, they are returned immediately.
 - If no matching events exist yet, the broker waits until a matching mutation arrives or the timeout expires.
 - The streamed watch transport emits an `agent_watch_opened` frame once, `registry_events` frames for matching mutations, and `keep_alive` frames when the wait interval expires without a matching change.
+- If a stream remains idle for too many keepalive intervals, the broker closes it with a resumable close reason instead of keeping the task open indefinitely.
+- If a client stops draining frames and a send exceeds the configured timeout, the broker drops the stream and records a slow-consumer metric.
 - The event stream includes `registered`, `heartbeated`, `removed`, and `cleaned_up` mutations.
 - Event history is bounded by configuration. If a watcher falls too far behind, the broker returns a cursor-expired error and the client must resync with `list_agents`.
 

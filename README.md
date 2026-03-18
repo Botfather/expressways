@@ -10,10 +10,10 @@ The original concept in [docs/main.md](/Users/tusharmohan/Documents/@labs/expres
 - Control-plane-first design with signed capability tokens, multi-issuer principal verification, policy checks, and audit events on every operation.
 - Per-principal quota profiles with explicit backpressure behavior on publish and consume paths.
 - Admin control-plane commands for auth-state inspection and token, principal, or issuer-key revocation.
-- Runtime metrics export for broker, storage, and audit state.
+- Runtime metrics export for broker, storage, audit state, and registry-watch streams.
 - Retention limits, disk-pressure reclamation, and segment recovery for local workstation safety.
 - Audit verification and export tooling for operators.
-- File-backed local discovery registry with exact-match filtering, TTL-based freshness, owner heartbeats, stale-entry cleanup, long-poll watch subscriptions, and a dedicated multi-frame watch stream.
+- File-backed local discovery registry with exact-match filtering, TTL-based freshness, owner heartbeats, stale-entry cleanup, long-poll watch subscriptions, and a dedicated multi-frame watch stream with cursor resume and slow-consumer protection.
 - Explicit compliance metadata and retention classes from day one.
 
 ## Workspace Layout
@@ -87,7 +87,7 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 
 ```bash
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 watch-agents --token-file ./var/auth/developer.token --wait-timeout-ms 30000 --follow
-cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 watch-agents-stream --token-file ./var/auth/developer.token --wait-timeout-ms 30000
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 watch-agents-stream --token-file ./var/auth/developer.token --wait-timeout-ms 30000 --resume true
 ```
 
 11. Verify or export the audit trail locally:
