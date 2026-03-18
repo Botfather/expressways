@@ -1,0 +1,82 @@
+[server]
+node_name = "dev-node"
+transport = "tcp"
+listen_addr = "127.0.0.1:7766"
+socket_path = "./tmp/aetherbus.sock"
+data_dir = "./var/data"
+log_level = "info"
+
+[storage]
+segment_max_bytes = 1048576
+retention_class = "operational"
+default_classification = "internal"
+
+[audit]
+path = "./var/audit/audit.jsonl"
+
+[auth]
+audience = "aetherbus"
+revocation_path = "./var/auth/revocations.json"
+
+[[auth.issuers]]
+key_id = "dev"
+public_key_path = "./var/auth/issuer.public"
+status = "active"
+
+[[auth.principals]]
+id = "local:developer"
+kind = "developer"
+display_name = "Local Developer"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "operator"
+
+[[auth.principals]]
+id = "local:agent-orchestrator"
+kind = "agent"
+display_name = "Local Agent Orchestrator"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "agent"
+
+[quotas]
+
+[[quotas.profiles]]
+name = "operator"
+publish_payload_max_bytes = 16384
+publish_requests_per_window = 20
+publish_window_seconds = 1
+consume_max_limit = 100
+consume_requests_per_window = 20
+consume_window_seconds = 1
+backpressure_mode = "reject"
+backpressure_delay_ms = 0
+
+[[quotas.profiles]]
+name = "agent"
+publish_payload_max_bytes = 4096
+publish_requests_per_window = 10
+publish_window_seconds = 1
+consume_max_limit = 25
+consume_requests_per_window = 10
+consume_window_seconds = 1
+backpressure_mode = "delay"
+backpressure_delay_ms = 150
+
+[policy]
+default_decision = "deny"
+
+[[policy.rules]]
+principal = "local:developer"
+resource = "system:broker"
+actions = ["health", "admin"]
+
+[[policy.rules]]
+principal = "local:developer"
+resource = "topic:*"
+actions = ["publish", "consume", "admin"]
+
+[[policy.rules]]
+principal = "local:agent-orchestrator"
+resource = "topic:tasks"
+actions = ["publish", "consume"]
