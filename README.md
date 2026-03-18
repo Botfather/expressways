@@ -13,6 +13,7 @@ The original concept in [docs/main.md](/Users/tusharmohan/Documents/@labs/expres
 - Runtime metrics export for broker, storage, and audit state.
 - Retention limits, disk-pressure reclamation, and segment recovery for local workstation safety.
 - Audit verification and export tooling for operators.
+- File-backed local discovery registry with exact-match filtering, TTL-based freshness, owner heartbeats, stale-entry cleanup, long-poll watch subscriptions, and a dedicated multi-frame watch stream.
 - Explicit compliance metadata and retention classes from day one.
 
 ## Workspace Layout
@@ -42,7 +43,7 @@ cargo run -p expressways-client --bin expresswaysctl -- generate-keypair --key-i
 4. Issue a capability token for a local developer principal:
 
 ```bash
-cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:developer --audience expressways --scope system:broker:health --scope 'system:broker:admin' --scope 'topic:*:admin,publish,consume' --output ./var/auth/developer.token
+cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:developer --audience expressways --scope system:broker:health --scope 'system:broker:admin' --scope 'topic:*:admin,publish,consume' --scope 'registry:agents*:admin' --output ./var/auth/developer.token
 ```
 
 5. Start the daemon with:
@@ -73,14 +74,30 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 revoke-token --token-file ./var/auth/developer.token --token-id <token-id>
 ```
 
-9. Verify or export the audit trail locally:
+9. Register an agent card, heartbeat it, and query the discovery registry:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 register-agent --token-file ./var/auth/developer.token --agent-id summarizer --display-name "Summarizer" --version 1.0.0 --summary "Local document summarizer" --skill summarize --skill pdf --subscribe topic:tasks --publish-topic topic:results --endpoint-address 127.0.0.1:8811 --ttl-seconds 300
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 heartbeat-agent --token-file ./var/auth/developer.token --agent-id summarizer
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 list-agents --token-file ./var/auth/developer.token --skill summarize
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 cleanup-stale-agents --token-file ./var/auth/developer.token
+```
+
+10. Watch registry changes with long-poll or with a dedicated stream:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 watch-agents --token-file ./var/auth/developer.token --wait-timeout-ms 30000 --follow
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 watch-agents-stream --token-file ./var/auth/developer.token --wait-timeout-ms 30000
+```
+
+11. Verify or export the audit trail locally:
 
 ```bash
 cargo run -p expressways-client --bin expresswaysctl -- verify-audit --path ./var/audit/audit.jsonl
 cargo run -p expressways-client --bin expresswaysctl -- export-audit --path ./var/audit/audit.jsonl --output ./var/audit/export.json
 ```
 
-10. Capture a benchmark suite with TCP, Unix sockets on Unix hosts, and direct storage throughput:
+12. Capture a benchmark suite with TCP, Unix sockets on Unix hosts, and direct storage throughput:
 
 ```bash
 cargo run -p expressways-bench -- suite --spawn-server --broker-iterations 100 --warmup-iterations 20 --payload-bytes 512 --message-count 2000 --read-batch 250 --output ./var/benchmarks/latest.json

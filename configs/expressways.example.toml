@@ -19,6 +19,12 @@ reclaim_target_bytes = 117440512
 [audit]
 path = "./var/audit/audit.jsonl"
 
+[registry]
+backend = "file"
+path = "./var/registry/agents.json"
+default_ttl_seconds = 300
+event_history_limit = 1024
+
 [auth]
 audience = "expressways"
 revocation_path = "./var/auth/revocations.json"
@@ -82,6 +88,16 @@ resource = "topic:*"
 actions = ["publish", "consume", "admin"]
 
 [[policy.rules]]
+principal = "local:developer"
+resource = "registry:agents*"
+actions = ["admin"]
+
+[[policy.rules]]
 principal = "local:agent-orchestrator"
 resource = "topic:tasks"
 actions = ["publish", "consume"]
+
+[[policy.rules]]
+principal = "local:agent-orchestrator"
+resource = "registry:agents*"
+actions = ["admin"]

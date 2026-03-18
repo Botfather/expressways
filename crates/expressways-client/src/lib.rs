@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use expressways_protocol::{ControlRequest, ControlResponse};
+use expressways_protocol::{ControlRequest, ControlResponse, StreamFrame};
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -18,6 +18,11 @@ pub enum Endpoint {
 
 #[derive(Debug)]
 pub struct Client {
+    transport: Transport,
+}
+
+#[derive(Debug)]
+pub struct StreamClient {
     transport: Transport,
 }
 
@@ -71,6 +76,30 @@ impl Client {
             Transport::Unix(transport) => send_request(transport, request).await,
         }
     }
+
+    pub fn into_stream(self) -> StreamClient {
+        StreamClient {
+            transport: self.transport,
+        }
+    }
+}
+
+impl StreamClient {
+    pub async fn open(&mut self, request: ControlRequest) -> Result<StreamFrame, ClientError> {
+        match &mut self.transport {
+            Transport::Tcp(transport) => send_stream_open(transport, request).await,
+            #[cfg(unix)]
+            Transport::Unix(transport) => send_stream_open(transport, request).await,
+        }
+    }
+
+    pub async fn next_frame(&mut self) -> Result<Option<StreamFrame>, ClientError> {
+        match &mut self.transport {
+            Transport::Tcp(transport) => read_stream_frame(transport).await,
+            #[cfg(unix)]
+            Transport::Unix(transport) => read_stream_frame(transport).await,
+        }
+    }
 }
 
 async fn send_request<T>(
@@ -89,4 +118,34 @@ where
         .ok_or(ClientError::ConnectionClosed)??;
 
     Ok(serde_json::from_str(&line)?)
+}
+
+async fn send_stream_open<T>(
+    transport: &mut Framed<T, LinesCodec>,
+    request: ControlRequest,
+) -> Result<StreamFrame, ClientError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let payload = serde_json::to_string(&request)?;
+    transport.send(payload).await?;
+
+    let line = transport
+        .next()
+        .await
+        .ok_or(ClientError::ConnectionClosed)??;
+
+    Ok(serde_json::from_str(&line)?)
+}
+
+async fn read_stream_frame<T>(
+    transport: &mut Framed<T, LinesCodec>,
+) -> Result<Option<StreamFrame>, ClientError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match transport.next().await {
+        Some(line) => Ok(Some(serde_json::from_str(&line?)?)),
+        None => Ok(None),
+    }
 }

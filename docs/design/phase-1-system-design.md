@@ -2,7 +2,7 @@
 
 ## Overview
 
-Phase 1 is a single-node, control-plane-first broker for local agent orchestration. It prioritizes correctness, auditability, and operational clarity over peak throughput. The system is intentionally small enough to run and evolve on a developer workstation, but it now uses a cross-platform local TCP baseline, signed capability tokens, a principal and issuer registry with revocation support, quota-aware request handling, runtime metrics, audit verification tooling, and a binary indexed storage path with retention and recovery controls so the first release is not stuck in “prototype-only” mode.
+Phase 1 is a single-node, control-plane-first broker for local agent orchestration. It prioritizes correctness, auditability, and operational clarity over peak throughput. The system is intentionally small enough to run and evolve on a developer workstation, but it now uses a cross-platform local TCP baseline, signed capability tokens, a principal and issuer registry with revocation support, quota-aware request handling, runtime metrics, audit verification tooling, a file-backed discovery registry for exact-match agent lookup with TTL-based freshness control, and a binary indexed storage path with retention and recovery controls so the first release is not stuck in “prototype-only” mode.
 
 ## Goals
 
@@ -23,7 +23,7 @@ Phase 1 is a single-node, control-plane-first broker for local agent orchestrati
 - Shared-memory zero-copy transport.
 - `io_uring` or kernel-specific fast paths.
 - In-broker transforms.
-- Semantic discovery registry.
+- Semantic or vector-backed discovery registry.
 - Priority reordering inside a strict ordered topic.
 
 ## Architecture
@@ -35,6 +35,7 @@ flowchart LR
     A --> Q["Quota + Backpressure Gate"]
     Q --> B["Broker Service"]
     B --> S["Binary Segmented Storage + Index"]
+    B --> R["Discovery Registry"]
     B --> U["Audit Sink"]
     B --> L["Structured Logs"]
     B --> O["Metrics Snapshot"]
@@ -45,7 +46,7 @@ flowchart LR
 
 ### Protocol Layer
 
-Provides strongly typed control-plane requests and responses. Phase 1 uses a simple JSON protocol over local TCP by default, with Unix sockets available as an optional transport on Unix platforms. The protocol includes admin commands for auth-state inspection, revocation changes, and metrics export so operators can manage identity state and inspect runtime health without editing runtime files by hand.
+Provides strongly typed control-plane requests and responses. Phase 1 uses a simple JSON protocol over local TCP by default, with Unix sockets available as an optional transport on Unix platforms. The protocol includes admin commands for auth-state inspection, revocation changes, metrics export, and discovery-registry operations including heartbeats, stale-entry cleanup, long-poll watch requests, and a dedicated multi-frame watch stream so operators can manage identity state and inspect runtime health without editing runtime files by hand.
 
 ### AuthN and AuthZ Gate
 
@@ -58,6 +59,10 @@ Applies the principal's configured quota profile before publish and consume work
 ### Broker Service
 
 Coordinates request handling, topic resolution, storage operations, and audit emission. This layer owns the request lifecycle.
+
+### Discovery Registry
+
+Stores agent cards behind a backend seam that currently uses a local JSON file. Registry lookups support exact-match filters on skill, topic, and principal rather than semantic ranking. Ownership is derived from the authenticated principal, not caller-supplied metadata, so the registry does not become a side channel for identity spoofing. Cards also carry TTL-based liveness metadata so stale discovery entries do not linger in normal query results forever. A bounded in-memory event journal supports both long-poll watch subscriptions and a dedicated multi-frame watch stream for orchestrators that need change notifications.
 
 ### Segmented Storage
 
@@ -73,7 +78,7 @@ Collects broker counters, publish and consume latency summaries, storage mainten
 
 ### Metadata Catalog
 
-Tracks topic definitions, retention classes, compliance defaults, and local operational metadata.
+Tracks topic definitions, retention classes, compliance defaults, discovery cards, and local operational metadata.
 
 ## Request Lifecycle
 
@@ -83,10 +88,11 @@ Tracks topic definitions, retention classes, compliance defaults, and local oper
 4. Server-side policy checks the verified principal against local policy.
 5. Quota and backpressure checks run for publish and consume operations.
 6. Broker service executes the action if allowed.
-7. Structured operational log is emitted.
-8. Audit event is appended with the decision and outcome.
-9. Metrics are updated for the request path and any resulting storage or audit side effects.
-10. Response is returned to the client.
+7. Registry ownership rules run for discovery-card mutations when applicable.
+8. Structured operational log is emitted.
+9. Audit event is appended with the decision and outcome.
+10. Metrics are updated for the request path and any resulting storage or audit side effects.
+11. Response is returned to the client.
 
 ## Data Model
 
@@ -105,6 +111,25 @@ Tracks topic definitions, retention classes, compliance defaults, and local oper
 - `producer`
 - `classification`
 - `payload`
+
+### Agent Card
+
+- `agent_id`
+- `principal`
+- `display_name`
+- `version`
+- `summary`
+- `skills`
+- `subscriptions`
+- `publications`
+- `schemas`
+- `endpoint`
+- `classification`
+- `retention_class`
+- `ttl_seconds`
+- `updated_at`
+- `last_seen_at`
+- `expires_at`
 
 ### Audit Event
 
@@ -157,6 +182,7 @@ Tracks topic definitions, retention classes, compliance defaults, and local oper
 - Capability verification is mandatory.
 - Policy evaluation is mandatory.
 - Quota evaluation is mandatory for publish and consume paths.
+- Discovery-card ownership is mandatory for registry mutation paths.
 - Storage retention and disk-pressure checks are mandatory for append paths.
 - All logs are structured and machine-readable.
 - Audit logs are locally verifiable after the fact.
@@ -169,4 +195,4 @@ If Phase 1 proves useful, the next optimizations should come in this order:
 1. richer storage indexing and batching,
 2. benchmark-driven transport improvements,
 3. Linux-specific fast path experiments,
-4. optional discovery and richer orchestration features.
+4. richer discovery query semantics and orchestration features.

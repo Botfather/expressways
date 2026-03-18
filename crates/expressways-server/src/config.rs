@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub audit: AuditSection,
     pub auth: AuthConfig,
     pub quotas: crate::quota::QuotaConfig,
+    #[serde(default)]
+    pub registry: RegistrySection,
     pub policy: PolicyConfig,
 }
 
@@ -49,6 +51,43 @@ pub struct StorageSection {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditSection {
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegistrySection {
+    #[serde(default)]
+    pub backend: RegistryBackend,
+    pub path: Option<PathBuf>,
+    #[serde(default = "default_registry_ttl_seconds")]
+    pub default_ttl_seconds: u64,
+    #[serde(default = "default_registry_event_history_limit")]
+    pub event_history_limit: usize,
+}
+
+impl Default for RegistrySection {
+    fn default() -> Self {
+        Self {
+            backend: RegistryBackend::File,
+            path: None,
+            default_ttl_seconds: default_registry_ttl_seconds(),
+            event_history_limit: default_registry_event_history_limit(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryBackend {
+    #[default]
+    File,
+}
+
+fn default_registry_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_registry_event_history_limit() -> usize {
+    1024
 }
 
 impl AppConfig {

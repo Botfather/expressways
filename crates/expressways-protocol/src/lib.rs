@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const BROKER_RESOURCE: &str = "system:broker";
+pub const REGISTRY_RESOURCE: &str = "registry:agents";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -149,6 +150,86 @@ pub struct TopicSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentSchemaRef {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEndpoint {
+    pub transport: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRegistration {
+    pub agent_id: String,
+    pub display_name: String,
+    pub version: String,
+    pub summary: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub subscriptions: Vec<String>,
+    #[serde(default)]
+    pub publications: Vec<String>,
+    #[serde(default)]
+    pub schemas: Vec<AgentSchemaRef>,
+    pub endpoint: AgentEndpoint,
+    #[serde(default)]
+    pub classification: Classification,
+    #[serde(default)]
+    pub retention_class: RetentionClass,
+    pub ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCard {
+    pub agent_id: String,
+    pub principal: String,
+    pub display_name: String,
+    pub version: String,
+    pub summary: String,
+    pub skills: Vec<String>,
+    pub subscriptions: Vec<String>,
+    pub publications: Vec<String>,
+    pub schemas: Vec<AgentSchemaRef>,
+    pub endpoint: AgentEndpoint,
+    pub classification: Classification,
+    pub retention_class: RetentionClass,
+    pub ttl_seconds: u64,
+    pub updated_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentQuery {
+    pub skill: Option<String>,
+    pub topic: Option<String>,
+    pub principal: Option<String>,
+    #[serde(default)]
+    pub include_stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryEventKind {
+    Registered,
+    Heartbeated,
+    Removed,
+    CleanedUp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistryEvent {
+    pub sequence: u64,
+    pub timestamp: DateTime<Utc>,
+    pub kind: RegistryEventKind,
+    pub card: AgentCard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredMessage {
     pub message_id: Uuid,
     pub topic: String,
@@ -239,6 +320,31 @@ pub enum ControlCommand {
     Health,
     GetAuthState,
     GetMetrics,
+    RegisterAgent {
+        registration: AgentRegistration,
+    },
+    HeartbeatAgent {
+        agent_id: String,
+    },
+    ListAgents {
+        query: AgentQuery,
+    },
+    WatchAgents {
+        query: AgentQuery,
+        cursor: Option<u64>,
+        max_events: usize,
+        wait_timeout_ms: u64,
+    },
+    OpenAgentWatchStream {
+        query: AgentQuery,
+        cursor: Option<u64>,
+        max_events: usize,
+        wait_timeout_ms: u64,
+    },
+    CleanupStaleAgents,
+    RemoveAgent {
+        agent_id: String,
+    },
     CreateTopic {
         topic: TopicSpec,
     },
@@ -271,6 +377,29 @@ pub struct ControlRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamFrame {
+    AgentWatchOpened {
+        cursor: u64,
+    },
+    RegistryEvents {
+        events: Vec<RegistryEvent>,
+        cursor: u64,
+    },
+    KeepAlive {
+        cursor: u64,
+    },
+    StreamError {
+        code: String,
+        message: String,
+    },
+    StreamClosed {
+        cursor: u64,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
     Health {
         node_name: String,
@@ -281,6 +410,27 @@ pub enum ControlResponse {
     },
     AuthState {
         state: AuthStateView,
+    },
+    AgentRegistered {
+        card: AgentCard,
+    },
+    AgentHeartbeat {
+        card: AgentCard,
+    },
+    Agents {
+        agents: Vec<AgentCard>,
+        cursor: u64,
+    },
+    RegistryEvents {
+        events: Vec<RegistryEvent>,
+        cursor: u64,
+        timed_out: bool,
+    },
+    AgentsCleanedUp {
+        removed_agent_ids: Vec<String>,
+    },
+    AgentRemoved {
+        agent_id: String,
     },
     TopicCreated {
         topic: TopicSpec,
@@ -315,6 +465,10 @@ impl ControlResponse {
 
 pub fn topic_resource(name: &str) -> String {
     format!("topic:{name}")
+}
+
+pub fn registry_entry_resource(agent_id: &str) -> String {
+    format!("registry:agents:{agent_id}")
 }
 
 fn default_audience() -> String {

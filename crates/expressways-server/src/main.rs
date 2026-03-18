@@ -1,6 +1,8 @@
 mod config;
 mod metrics;
 mod quota;
+mod registry;
+mod registry_events;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,8 +14,10 @@ use expressways_audit::{AuditDecision, AuditOutcome, AuditSink, DraftAuditEvent}
 use expressways_auth::{AuthSnapshot, CapabilityVerifier, RevocationList, VerifiedCapability};
 use expressways_policy::PolicyEngine;
 use expressways_protocol::{
-    Action, AuthIssuerView, AuthPrincipalView, AuthRevocationView, AuthStateView, BROKER_RESOURCE,
-    ControlCommand, ControlRequest, ControlResponse, TopicSpec, topic_resource,
+    Action, AgentQuery, AgentRegistration, AuthIssuerView, AuthPrincipalView, AuthRevocationView,
+    AuthStateView, BROKER_RESOURCE, ControlCommand, ControlRequest, ControlResponse,
+    REGISTRY_RESOURCE, RegistryEventKind, StreamFrame, TopicSpec, registry_entry_resource,
+    topic_resource,
 };
 use expressways_storage::{DiskPressurePolicy, RetentionPolicy, Storage, StorageConfig};
 use futures_util::{SinkExt, StreamExt};
@@ -26,9 +30,11 @@ use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{AppConfig, ServerConfig, TransportKind};
+use crate::config::{AppConfig, RegistryBackend, ServerConfig, TransportKind};
 use crate::metrics::MetricsCollector;
 use crate::quota::QuotaManager;
+use crate::registry::AgentRegistry;
+use crate::registry_events::{RegistryEventError, RegistryEventHub};
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -44,6 +50,8 @@ struct BrokerState {
     quotas: QuotaManager,
     metrics: MetricsCollector,
     storage: Mutex<Storage>,
+    registry: Mutex<AgentRegistry>,
+    registry_events: RegistryEventHub,
     audit: Mutex<AuditSink>,
 }
 
@@ -160,6 +168,8 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
     let audit = AuditSink::new(&config.audit.path)?;
     let verifier = CapabilityVerifier::from_config(&config.auth)?;
     let quotas = QuotaManager::new(config.quotas.clone())?;
+    let registry = build_registry(config);
+    let registry_events = RegistryEventHub::new(config.registry.event_history_limit);
     quotas.validate_principals(
         config
             .auth
@@ -175,8 +185,22 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
         quotas,
         metrics: MetricsCollector::new(),
         storage: Mutex::new(storage),
+        registry: Mutex::new(registry),
+        registry_events,
         audit: Mutex::new(audit),
     })
+}
+
+fn build_registry(config: &AppConfig) -> AgentRegistry {
+    let path = config
+        .registry
+        .path
+        .clone()
+        .unwrap_or_else(|| config.server.data_dir.join("registry").join("agents.json"));
+
+    match config.registry.backend {
+        RegistryBackend::File => AgentRegistry::file(path, config.registry.default_ttl_seconds),
+    }
 }
 
 fn bind_listener(config: &ServerConfig) -> anyhow::Result<ListenerHandle> {
@@ -316,19 +340,262 @@ where
             }
         };
 
-        let response = match serde_json::from_str::<ControlRequest>(&line) {
-            Ok(request) => process_request(&state, request).await,
+        let request = match serde_json::from_str::<ControlRequest>(&line) {
+            Ok(request) => request,
             Err(error) => {
                 warn!(error = %error, "failed to decode request");
-                ControlResponse::error("invalid_request", error.to_string())
+                let serialized = serde_json::to_string(&ControlResponse::error(
+                    "invalid_request",
+                    error.to_string(),
+                ))?;
+                framed.send(serialized).await?;
+                continue;
             }
         };
 
+        if matches!(request.command, ControlCommand::OpenAgentWatchStream { .. }) {
+            serve_streaming_request(&mut framed, &state, request).await?;
+            break;
+        }
+
+        let response = process_request(&state, request).await;
         let serialized = serde_json::to_string(&response)?;
         framed.send(serialized).await?;
     }
 
     Ok(())
+}
+
+async fn serve_streaming_request<T>(
+    framed: &mut Framed<T, LinesCodec>,
+    state: &Arc<BrokerState>,
+    request: ControlRequest,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let (capability_token, query, cursor, max_events, wait_timeout_ms) = match request.command {
+        ControlCommand::OpenAgentWatchStream {
+            query,
+            cursor,
+            max_events,
+            wait_timeout_ms,
+        } => (
+            request.capability_token,
+            query,
+            cursor,
+            max_events,
+            wait_timeout_ms,
+        ),
+        _ => {
+            send_stream_frame(
+                framed,
+                &StreamFrame::StreamError {
+                    code: "invalid_request".to_owned(),
+                    message: "streaming transport only supports open_agent_watch_stream".to_owned(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let resource = REGISTRY_RESOURCE.to_owned();
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => {
+            send_stream_frame(framed, &stream_error_from_response(response)).await?;
+            return Ok(());
+        }
+    };
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some(format!(
+            "open registry watch stream from cursor {:?}",
+            cursor
+        )),
+    )
+    .await
+    {
+        send_stream_frame(framed, &stream_error_from_response(response)).await?;
+        return Ok(());
+    }
+
+    let mut next_cursor = match state.registry_events.resolve_cursor(cursor).await {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            let code = match error {
+                RegistryEventError::CursorExpired { .. } => "watch_cursor_expired",
+            };
+            let message = error.to_string();
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            send_stream_frame(
+                framed,
+                &StreamFrame::StreamError {
+                    code: code.to_owned(),
+                    message,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if let Err(error) = send_stream_frame(
+        framed,
+        &StreamFrame::AgentWatchOpened {
+            cursor: next_cursor,
+        },
+    )
+    .await
+    {
+        let _ = finalize_failure(
+            state,
+            &identity,
+            Action::Admin,
+            &resource,
+            Some(format!("failed to open registry watch stream: {error}")),
+        )
+        .await;
+        return Ok(());
+    }
+
+    if let Err(error) = finalize_success(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some(format!(
+            "opened registry watch stream at cursor {next_cursor}"
+        )),
+    )
+    .await
+    {
+        send_stream_frame(
+            framed,
+            &StreamFrame::StreamError {
+                code: "audit_failure".to_owned(),
+                message: error.to_string(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    info!(
+        principal = %identity.principal,
+        principal_kind = %identity.principal_kind,
+        quota_profile = %identity.quota_profile,
+        token_id = %identity.token_id,
+        resource = %resource,
+        cursor = next_cursor,
+        max_events,
+        wait_timeout_ms,
+        "registry watch stream opened"
+    );
+
+    loop {
+        match state
+            .registry_events
+            .watch(&query, Some(next_cursor), max_events, wait_timeout_ms)
+            .await
+        {
+            Ok(batch) => {
+                let frame = if batch.timed_out {
+                    StreamFrame::KeepAlive {
+                        cursor: batch.cursor,
+                    }
+                } else {
+                    StreamFrame::RegistryEvents {
+                        events: batch.events,
+                        cursor: batch.cursor,
+                    }
+                };
+                next_cursor = batch.cursor;
+
+                if let Err(error) = send_stream_frame(framed, &frame).await {
+                    info!(
+                        principal = %identity.principal,
+                        principal_kind = %identity.principal_kind,
+                        quota_profile = %identity.quota_profile,
+                        token_id = %identity.token_id,
+                        resource = %resource,
+                        cursor = next_cursor,
+                        error = %error,
+                        "registry watch stream closed by client"
+                    );
+                    break;
+                }
+            }
+            Err(error) => {
+                let code = match error {
+                    RegistryEventError::CursorExpired { .. } => "watch_cursor_expired",
+                };
+                let message = error.to_string();
+                warn!(
+                    principal = %identity.principal,
+                    principal_kind = %identity.principal_kind,
+                    quota_profile = %identity.quota_profile,
+                    token_id = %identity.token_id,
+                    resource = %resource,
+                    cursor = next_cursor,
+                    error = %message,
+                    "registry watch stream failed"
+                );
+                let _ = send_stream_frame(
+                    framed,
+                    &StreamFrame::StreamError {
+                        code: code.to_owned(),
+                        message,
+                    },
+                )
+                .await;
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_stream_frame<T>(
+    framed: &mut Framed<T, LinesCodec>,
+    frame: &StreamFrame,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let serialized = serde_json::to_string(frame)?;
+    framed.send(serialized).await?;
+    Ok(())
+}
+
+fn stream_error_from_response(response: ControlResponse) -> StreamFrame {
+    match response {
+        ControlResponse::Error { code, message } => StreamFrame::StreamError { code, message },
+        other => StreamFrame::StreamError {
+            code: "unexpected_response".to_owned(),
+            message: format!("expected error response, got {other:?}"),
+        },
+    }
 }
 
 async fn process_request(state: &BrokerState, request: ControlRequest) -> ControlResponse {
@@ -338,6 +605,13 @@ async fn process_request(state: &BrokerState, request: ControlRequest) -> Contro
         ControlCommand::Consume { .. } => Action::Consume,
         ControlCommand::GetAuthState
         | ControlCommand::GetMetrics
+        | ControlCommand::RegisterAgent { .. }
+        | ControlCommand::HeartbeatAgent { .. }
+        | ControlCommand::ListAgents { .. }
+        | ControlCommand::WatchAgents { .. }
+        | ControlCommand::OpenAgentWatchStream { .. }
+        | ControlCommand::CleanupStaleAgents
+        | ControlCommand::RemoveAgent { .. }
         | ControlCommand::CreateTopic { .. }
         | ControlCommand::RevokeToken { .. }
         | ControlCommand::RevokePrincipal { .. }
@@ -350,6 +624,41 @@ async fn process_request(state: &BrokerState, request: ControlRequest) -> Contro
         ControlCommand::GetMetrics => handle_get_metrics(state, request.capability_token).await,
         ControlCommand::GetAuthState => {
             handle_get_auth_state(state, request.capability_token).await
+        }
+        ControlCommand::RegisterAgent { registration } => {
+            handle_register_agent(state, request.capability_token, registration).await
+        }
+        ControlCommand::HeartbeatAgent { agent_id } => {
+            handle_heartbeat_agent(state, request.capability_token, agent_id).await
+        }
+        ControlCommand::ListAgents { query } => {
+            handle_list_agents(state, request.capability_token, query).await
+        }
+        ControlCommand::WatchAgents {
+            query,
+            cursor,
+            max_events,
+            wait_timeout_ms,
+        } => {
+            handle_watch_agents(
+                state,
+                request.capability_token,
+                query,
+                cursor,
+                max_events,
+                wait_timeout_ms,
+            )
+            .await
+        }
+        ControlCommand::OpenAgentWatchStream { .. } => ControlResponse::error(
+            "invalid_request",
+            "streaming watch must use the streaming transport",
+        ),
+        ControlCommand::CleanupStaleAgents => {
+            handle_cleanup_stale_agents(state, request.capability_token).await
+        }
+        ControlCommand::RemoveAgent { agent_id } => {
+            handle_remove_agent(state, request.capability_token, agent_id).await
         }
         ControlCommand::CreateTopic { topic } => {
             handle_create_topic(state, request.capability_token, topic).await
@@ -545,6 +854,506 @@ async fn handle_get_auth_state(state: &BrokerState, capability_token: String) ->
 
     ControlResponse::AuthState {
         state: auth_state_view(snapshot),
+    }
+}
+
+async fn handle_register_agent(
+    state: &BrokerState,
+    capability_token: String,
+    registration: AgentRegistration,
+) -> ControlResponse {
+    let resource = registry_entry_resource(&registration.agent_id);
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some(format!("register agent {}", registration.agent_id)),
+    )
+    .await
+    {
+        return response;
+    }
+
+    let registered = {
+        let registry = state.registry.lock().await;
+        registry.register(&identity.principal, registration)
+    };
+
+    match registered {
+        Ok(card) => {
+            if let Err(error) = finalize_success(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(format!("registered agent {}", card.agent_id)),
+            )
+            .await
+            {
+                state.metrics.record_audit_failure();
+                return ControlResponse::error("audit_failure", error.to_string());
+            }
+            let _ = state
+                .registry_events
+                .record(RegistryEventKind::Registered, card.clone())
+                .await;
+
+            info!(
+                principal = %identity.principal,
+                principal_kind = %identity.principal_kind,
+                quota_profile = %identity.quota_profile,
+                token_id = %identity.token_id,
+                resource = %resource,
+                agent_id = %card.agent_id,
+                endpoint_transport = %card.endpoint.transport,
+                endpoint_address = %card.endpoint.address,
+                "agent registered"
+            );
+            ControlResponse::AgentRegistered { card }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            ControlResponse::error("registry_error", message)
+        }
+    }
+}
+
+async fn handle_list_agents(
+    state: &BrokerState,
+    capability_token: String,
+    query: AgentQuery,
+) -> ControlResponse {
+    let resource = REGISTRY_RESOURCE.to_owned();
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some("list discovery registry".to_owned()),
+    )
+    .await
+    {
+        return response;
+    }
+
+    let cursor = state.registry_events.current_cursor().await;
+    let listed = {
+        let registry = state.registry.lock().await;
+        registry.list(&query)
+    };
+
+    match listed {
+        Ok(agents) => {
+            if let Err(error) = finalize_success(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(format!("listed {} discovery agents", agents.len())),
+            )
+            .await
+            {
+                state.metrics.record_audit_failure();
+                return ControlResponse::error("audit_failure", error.to_string());
+            }
+
+            info!(
+                principal = %identity.principal,
+                principal_kind = %identity.principal_kind,
+                quota_profile = %identity.quota_profile,
+                token_id = %identity.token_id,
+                resource = %resource,
+                result_count = agents.len(),
+                cursor,
+                "discovery registry queried"
+            );
+            ControlResponse::Agents { agents, cursor }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            ControlResponse::error("registry_error", message)
+        }
+    }
+}
+
+async fn handle_watch_agents(
+    state: &BrokerState,
+    capability_token: String,
+    query: AgentQuery,
+    cursor: Option<u64>,
+    max_events: usize,
+    wait_timeout_ms: u64,
+) -> ControlResponse {
+    let resource = REGISTRY_RESOURCE.to_owned();
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some(format!("watch discovery registry from cursor {:?}", cursor)),
+    )
+    .await
+    {
+        return response;
+    }
+
+    match state
+        .registry_events
+        .watch(&query, cursor, max_events, wait_timeout_ms)
+        .await
+    {
+        Ok(batch) => {
+            if let Err(error) = finalize_success(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(format!(
+                    "returned {} registry events; timed_out={}",
+                    batch.events.len(),
+                    batch.timed_out
+                )),
+            )
+            .await
+            {
+                state.metrics.record_audit_failure();
+                return ControlResponse::error("audit_failure", error.to_string());
+            }
+
+            info!(
+                principal = %identity.principal,
+                principal_kind = %identity.principal_kind,
+                quota_profile = %identity.quota_profile,
+                token_id = %identity.token_id,
+                resource = %resource,
+                event_count = batch.events.len(),
+                cursor = batch.cursor,
+                timed_out = batch.timed_out,
+                "registry watch completed"
+            );
+            ControlResponse::RegistryEvents {
+                events: batch.events,
+                cursor: batch.cursor,
+                timed_out: batch.timed_out,
+            }
+        }
+        Err(error) => {
+            let code = match error {
+                RegistryEventError::CursorExpired { .. } => "watch_cursor_expired",
+            };
+            let message = error.to_string();
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            ControlResponse::error(code, message)
+        }
+    }
+}
+
+async fn handle_heartbeat_agent(
+    state: &BrokerState,
+    capability_token: String,
+    agent_id: String,
+) -> ControlResponse {
+    let resource = registry_entry_resource(&agent_id);
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some(format!("heartbeat agent {agent_id}")),
+    )
+    .await
+    {
+        return response;
+    }
+
+    let heartbeat = {
+        let registry = state.registry.lock().await;
+        registry.heartbeat(&identity.principal, &identity.principal_kind, &agent_id)
+    };
+
+    match heartbeat {
+        Ok(card) => {
+            if let Err(error) = finalize_success(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(format!("heartbeat recorded for agent {agent_id}")),
+            )
+            .await
+            {
+                state.metrics.record_audit_failure();
+                return ControlResponse::error("audit_failure", error.to_string());
+            }
+            let _ = state
+                .registry_events
+                .record(RegistryEventKind::Heartbeated, card.clone())
+                .await;
+
+            info!(
+                principal = %identity.principal,
+                principal_kind = %identity.principal_kind,
+                quota_profile = %identity.quota_profile,
+                token_id = %identity.token_id,
+                resource = %resource,
+                agent_id = %card.agent_id,
+                expires_at = %card.expires_at,
+                "agent heartbeat recorded"
+            );
+            ControlResponse::AgentHeartbeat { card }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            ControlResponse::error("registry_error", message)
+        }
+    }
+}
+
+async fn handle_cleanup_stale_agents(
+    state: &BrokerState,
+    capability_token: String,
+) -> ControlResponse {
+    let resource = REGISTRY_RESOURCE.to_owned();
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some("cleanup stale discovery agents".to_owned()),
+    )
+    .await
+    {
+        return response;
+    }
+
+    let cleanup = {
+        let registry = state.registry.lock().await;
+        registry.cleanup_stale()
+    };
+
+    match cleanup {
+        Ok(removed_cards) => {
+            let removed_agent_ids = removed_cards
+                .iter()
+                .map(|card| card.agent_id.clone())
+                .collect::<Vec<_>>();
+            if let Err(error) = finalize_success(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(format!(
+                    "cleaned up {} stale discovery agents",
+                    removed_agent_ids.len()
+                )),
+            )
+            .await
+            {
+                state.metrics.record_audit_failure();
+                return ControlResponse::error("audit_failure", error.to_string());
+            }
+            for card in removed_cards {
+                let _ = state
+                    .registry_events
+                    .record(RegistryEventKind::CleanedUp, card)
+                    .await;
+            }
+
+            info!(
+                principal = %identity.principal,
+                principal_kind = %identity.principal_kind,
+                quota_profile = %identity.quota_profile,
+                token_id = %identity.token_id,
+                resource = %resource,
+                removed_count = removed_agent_ids.len(),
+                "stale discovery agents cleaned up"
+            );
+            ControlResponse::AgentsCleanedUp { removed_agent_ids }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            ControlResponse::error("registry_error", message)
+        }
+    }
+}
+
+async fn handle_remove_agent(
+    state: &BrokerState,
+    capability_token: String,
+    agent_id: String,
+) -> ControlResponse {
+    let resource = registry_entry_resource(&agent_id);
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some(format!("remove agent {agent_id}")),
+    )
+    .await
+    {
+        return response;
+    }
+
+    let removed = {
+        let registry = state.registry.lock().await;
+        registry.remove(&identity.principal, &identity.principal_kind, &agent_id)
+    };
+
+    match removed {
+        Ok(card) => {
+            if let Err(error) = finalize_success(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(format!("removed agent {agent_id}")),
+            )
+            .await
+            {
+                state.metrics.record_audit_failure();
+                return ControlResponse::error("audit_failure", error.to_string());
+            }
+            let _ = state
+                .registry_events
+                .record(RegistryEventKind::Removed, card)
+                .await;
+
+            info!(
+                principal = %identity.principal,
+                principal_kind = %identity.principal_kind,
+                quota_profile = %identity.quota_profile,
+                token_id = %identity.token_id,
+                resource = %resource,
+                agent_id = %agent_id,
+                "agent removed from registry"
+            );
+            ControlResponse::AgentRemoved { agent_id }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Admin,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            ControlResponse::error("registry_error", message)
+        }
     }
 }
 
@@ -1379,13 +2188,17 @@ mod tests {
     };
     use expressways_policy::{DefaultDecision, PolicyConfig, Rule};
     use expressways_protocol::{
-        CapabilityClaims, CapabilityScope, Classification, ControlCommand, ControlResponse,
-        RetentionClass,
+        AgentEndpoint, AgentQuery, AgentRegistration, CapabilityClaims, CapabilityScope,
+        Classification, ControlCommand, ControlResponse, RegistryEventKind, RetentionClass,
+        StreamFrame,
     };
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::duplex;
+    use tokio_util::codec::{Framed, LinesCodec};
     use uuid::Uuid;
 
     use super::*;
-    use crate::config::{AuditSection, StorageSection};
+    use crate::config::{AuditSection, RegistrySection, StorageSection};
     use crate::quota::{BackpressureMode, QuotaConfig, QuotaProfile};
 
     fn test_root() -> PathBuf {
@@ -1465,6 +2278,12 @@ mod tests {
             quotas: QuotaConfig {
                 profiles: vec![quota_profile("operator", 1024), quota_profile("agent", 4)],
             },
+            registry: RegistrySection {
+                backend: crate::config::RegistryBackend::File,
+                path: Some(root.join("registry").join("agents.json")),
+                default_ttl_seconds: 300,
+                event_history_limit: 64,
+            },
             policy: PolicyConfig {
                 default_decision: DefaultDecision::Deny,
                 rules: vec![
@@ -1479,9 +2298,19 @@ mod tests {
                         actions: vec![Action::Admin, Action::Publish, Action::Consume],
                     },
                     Rule {
+                        principal: "local:developer".to_owned(),
+                        resource: "registry:agents*".to_owned(),
+                        actions: vec![Action::Admin],
+                    },
+                    Rule {
                         principal: "local:agent-alpha".to_owned(),
                         resource: "topic:*".to_owned(),
                         actions: vec![Action::Publish, Action::Consume],
+                    },
+                    Rule {
+                        principal: "local:agent-alpha".to_owned(),
+                        resource: "registry:agents*".to_owned(),
+                        actions: vec![Action::Admin],
                     },
                 ],
             },
@@ -1641,6 +2470,659 @@ mod tests {
             }
             other => panic!("expected revocation update, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_registry_commands_are_persisted_and_filtered() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, agent_token) = issue_token(
+            &issuer,
+            "local:agent-alpha",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let register = process_request(
+            &state,
+            ControlRequest {
+                capability_token: agent_token.clone(),
+                command: ControlCommand::RegisterAgent {
+                    registration: AgentRegistration {
+                        agent_id: "summarizer".to_owned(),
+                        display_name: "Summarizer".to_owned(),
+                        version: "1.2.3".to_owned(),
+                        summary: "Summarizes large documents".to_owned(),
+                        skills: vec!["pdf".to_owned(), "summarize".to_owned()],
+                        subscriptions: vec!["topic:tasks".to_owned()],
+                        publications: vec!["topic:results".to_owned()],
+                        schemas: Vec::new(),
+                        endpoint: AgentEndpoint {
+                            transport: "control_tcp".to_owned(),
+                            address: "127.0.0.1:8811".to_owned(),
+                        },
+                        classification: Classification::Internal,
+                        retention_class: RetentionClass::Operational,
+                        ttl_seconds: None,
+                    },
+                },
+            },
+        )
+        .await;
+
+        match register {
+            ControlResponse::AgentRegistered { card } => {
+                assert_eq!(card.agent_id, "summarizer");
+                assert_eq!(card.principal, "local:agent-alpha");
+            }
+            other => panic!("expected agent registered response, got {other:?}"),
+        }
+
+        let listed = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::ListAgents {
+                    query: AgentQuery {
+                        skill: Some("pdf".to_owned()),
+                        topic: None,
+                        principal: None,
+                        include_stale: false,
+                    },
+                },
+            },
+        )
+        .await;
+
+        match listed {
+            ControlResponse::Agents { agents, cursor } => {
+                assert_eq!(agents.len(), 1);
+                assert_eq!(agents[0].agent_id, "summarizer");
+                assert!(cursor >= 1);
+            }
+            other => panic!("expected agents response, got {other:?}"),
+        }
+
+        let remove = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token,
+                command: ControlCommand::RemoveAgent {
+                    agent_id: "summarizer".to_owned(),
+                },
+            },
+        )
+        .await;
+
+        match remove {
+            ControlResponse::AgentRemoved { agent_id } => {
+                assert_eq!(agent_id, "summarizer");
+            }
+            other => panic!("expected agent removed response, got {other:?}"),
+        }
+
+        let persisted = fs::read_to_string(root.join("registry").join("agents.json"))
+            .expect("read persisted registry");
+        assert!(persisted.contains("\"agents\": []"));
+    }
+
+    #[tokio::test]
+    async fn discovery_registry_prevents_cross_principal_takeover() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+        let (_, agent_token) = issue_token(
+            &issuer,
+            "local:agent-alpha",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let _ = process_request(
+            &state,
+            ControlRequest {
+                capability_token: agent_token,
+                command: ControlCommand::RegisterAgent {
+                    registration: AgentRegistration {
+                        agent_id: "summarizer".to_owned(),
+                        display_name: "Summarizer".to_owned(),
+                        version: "1.0.0".to_owned(),
+                        summary: "Summarizes large documents".to_owned(),
+                        skills: vec!["summarize".to_owned()],
+                        subscriptions: vec!["topic:tasks".to_owned()],
+                        publications: vec!["topic:results".to_owned()],
+                        schemas: Vec::new(),
+                        endpoint: AgentEndpoint {
+                            transport: "control_tcp".to_owned(),
+                            address: "127.0.0.1:8811".to_owned(),
+                        },
+                        classification: Classification::Internal,
+                        retention_class: RetentionClass::Operational,
+                        ttl_seconds: None,
+                    },
+                },
+            },
+        )
+        .await;
+
+        let response = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token,
+                command: ControlCommand::RegisterAgent {
+                    registration: AgentRegistration {
+                        agent_id: "summarizer".to_owned(),
+                        display_name: "Override".to_owned(),
+                        version: "2.0.0".to_owned(),
+                        summary: "Tries to take over the registration".to_owned(),
+                        skills: vec!["rewrite".to_owned()],
+                        subscriptions: vec!["topic:tasks".to_owned()],
+                        publications: vec!["topic:results".to_owned()],
+                        schemas: Vec::new(),
+                        endpoint: AgentEndpoint {
+                            transport: "control_tcp".to_owned(),
+                            address: "127.0.0.1:9911".to_owned(),
+                        },
+                        classification: Classification::Internal,
+                        retention_class: RetentionClass::Operational,
+                        ttl_seconds: None,
+                    },
+                },
+            },
+        )
+        .await;
+
+        match response {
+            ControlResponse::Error { code, message } => {
+                assert_eq!(code, "registry_error");
+                assert!(message.contains("owned by"));
+            }
+            other => panic!("expected registry error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_registry_heartbeat_and_cleanup_manage_stale_entries() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let register = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::RegisterAgent {
+                    registration: AgentRegistration {
+                        agent_id: "ephemeral-agent".to_owned(),
+                        display_name: "Ephemeral Agent".to_owned(),
+                        version: "0.1.0".to_owned(),
+                        summary: "Short-lived test agent".to_owned(),
+                        skills: vec!["cleanup".to_owned()],
+                        subscriptions: vec!["topic:tasks".to_owned()],
+                        publications: vec!["topic:results".to_owned()],
+                        schemas: Vec::new(),
+                        endpoint: AgentEndpoint {
+                            transport: "control_tcp".to_owned(),
+                            address: "127.0.0.1:8822".to_owned(),
+                        },
+                        classification: Classification::Internal,
+                        retention_class: RetentionClass::Ephemeral,
+                        ttl_seconds: Some(1),
+                    },
+                },
+            },
+        )
+        .await;
+
+        match register {
+            ControlResponse::AgentRegistered { .. } => {}
+            other => panic!("expected agent registered response, got {other:?}"),
+        };
+
+        let registry_path = root.join("registry").join("agents.json");
+        set_registry_expiry(
+            &registry_path,
+            "ephemeral-agent",
+            Utc::now() - Duration::seconds(5),
+        );
+
+        let hidden = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::ListAgents {
+                    query: AgentQuery {
+                        skill: None,
+                        topic: None,
+                        principal: None,
+                        include_stale: false,
+                    },
+                },
+            },
+        )
+        .await;
+        match hidden {
+            ControlResponse::Agents { agents, .. } => assert!(agents.is_empty()),
+            other => panic!("expected agent registered response, got {other:?}"),
+        }
+
+        let heartbeat = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::HeartbeatAgent {
+                    agent_id: "ephemeral-agent".to_owned(),
+                },
+            },
+        )
+        .await;
+        match heartbeat {
+            ControlResponse::AgentHeartbeat { card } => {
+                assert!(card.expires_at > Utc::now());
+            }
+            other => panic!("expected heartbeat response, got {other:?}"),
+        }
+
+        let now_visible = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::ListAgents {
+                    query: AgentQuery::default(),
+                },
+            },
+        )
+        .await;
+        match now_visible {
+            ControlResponse::Agents { agents, .. } => assert_eq!(agents.len(), 1),
+            other => panic!("expected agents response, got {other:?}"),
+        }
+
+        set_registry_expiry(
+            &registry_path,
+            "ephemeral-agent",
+            Utc::now() - Duration::seconds(5),
+        );
+
+        let cleanup = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::CleanupStaleAgents,
+            },
+        )
+        .await;
+        match cleanup {
+            ControlResponse::AgentsCleanedUp { removed_agent_ids } => {
+                assert_eq!(removed_agent_ids, vec!["ephemeral-agent".to_owned()]);
+            }
+            other => panic!("expected cleanup response, got {other:?}"),
+        }
+
+        let remaining = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token,
+                command: ControlCommand::ListAgents {
+                    query: AgentQuery {
+                        include_stale: true,
+                        ..AgentQuery::default()
+                    },
+                },
+            },
+        )
+        .await;
+        match remaining {
+            ControlResponse::Agents { agents, .. } => assert!(agents.is_empty()),
+            other => panic!("expected agents response, got {other:?}"),
+        }
+    }
+
+    fn set_registry_expiry(path: &Path, agent_id: &str, expires_at: chrono::DateTime<Utc>) {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).expect("read registry document"))
+                .expect("parse registry document");
+        let agents = document["agents"]
+            .as_array_mut()
+            .expect("registry agents array");
+        let agent = agents
+            .iter_mut()
+            .find(|entry| entry["agent_id"] == agent_id)
+            .expect("registry agent entry");
+        agent["expires_at"] = serde_json::Value::String(expires_at.to_rfc3339());
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&document).expect("serialize registry document"),
+        )
+        .expect("write registry document");
+    }
+
+    #[tokio::test]
+    async fn watch_agents_returns_registry_event_batches() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let listed = process_request(
+            state.as_ref(),
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::ListAgents {
+                    query: AgentQuery::default(),
+                },
+            },
+        )
+        .await;
+        let cursor = match listed {
+            ControlResponse::Agents { cursor, .. } => cursor,
+            other => panic!("expected agents response, got {other:?}"),
+        };
+
+        let watch_state = Arc::clone(&state);
+        let watch_token = developer_token.clone();
+        let watch = tokio::spawn(async move {
+            process_request(
+                watch_state.as_ref(),
+                ControlRequest {
+                    capability_token: watch_token,
+                    command: ControlCommand::WatchAgents {
+                        query: AgentQuery::default(),
+                        cursor: Some(cursor),
+                        max_events: 10,
+                        wait_timeout_ms: 2_000,
+                    },
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let register = process_request(
+            state.as_ref(),
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::RegisterAgent {
+                    registration: AgentRegistration {
+                        agent_id: "watch-agent".to_owned(),
+                        display_name: "Watch Agent".to_owned(),
+                        version: "1.0.0".to_owned(),
+                        summary: "Emits a watch event".to_owned(),
+                        skills: vec!["watch".to_owned()],
+                        subscriptions: vec!["topic:tasks".to_owned()],
+                        publications: vec!["topic:results".to_owned()],
+                        schemas: Vec::new(),
+                        endpoint: AgentEndpoint {
+                            transport: "control_tcp".to_owned(),
+                            address: "127.0.0.1:8855".to_owned(),
+                        },
+                        classification: Classification::Internal,
+                        retention_class: RetentionClass::Operational,
+                        ttl_seconds: None,
+                    },
+                },
+            },
+        )
+        .await;
+        assert!(matches!(register, ControlResponse::AgentRegistered { .. }));
+
+        let watched = watch.await.expect("watch join");
+        match watched {
+            ControlResponse::RegistryEvents {
+                events,
+                cursor,
+                timed_out,
+            } => {
+                assert!(!timed_out);
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].kind, RegistryEventKind::Registered);
+                assert_eq!(events[0].card.agent_id, "watch-agent");
+                assert!(cursor >= events[0].sequence);
+            }
+            other => panic!("expected registry events response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_agents_times_out_cleanly_without_changes() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let watched = process_request(
+            &state,
+            ControlRequest {
+                capability_token: developer_token,
+                command: ControlCommand::WatchAgents {
+                    query: AgentQuery::default(),
+                    cursor: None,
+                    max_events: 10,
+                    wait_timeout_ms: 1,
+                },
+            },
+        )
+        .await;
+
+        match watched {
+            ControlResponse::RegistryEvents {
+                events, timed_out, ..
+            } => {
+                assert!(events.is_empty());
+                assert!(timed_out);
+            }
+            other => panic!("expected registry events response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_agent_watch_stream_emits_open_and_event_frames() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let (client_stream, server_stream) = duplex(8 * 1024);
+        let server_state = Arc::clone(&state);
+        let server =
+            tokio::spawn(async move { handle_connection(server_stream, server_state).await });
+        let mut client = Framed::new(client_stream, LinesCodec::new());
+
+        client
+            .send(
+                serde_json::to_string(&ControlRequest {
+                    capability_token: developer_token.clone(),
+                    command: ControlCommand::OpenAgentWatchStream {
+                        query: AgentQuery::default(),
+                        cursor: None,
+                        max_events: 10,
+                        wait_timeout_ms: 2_000,
+                    },
+                })
+                .expect("serialize stream-open request"),
+            )
+            .await
+            .expect("send stream-open request");
+
+        let opened = client
+            .next()
+            .await
+            .expect("opening frame")
+            .expect("opening frame io");
+        let opened: StreamFrame = serde_json::from_str(&opened).expect("parse opening frame");
+        match opened {
+            StreamFrame::AgentWatchOpened { cursor } => assert_eq!(cursor, 0),
+            other => panic!("expected watch-opened frame, got {other:?}"),
+        }
+
+        let register = process_request(
+            state.as_ref(),
+            ControlRequest {
+                capability_token: developer_token,
+                command: ControlCommand::RegisterAgent {
+                    registration: AgentRegistration {
+                        agent_id: "stream-watch-agent".to_owned(),
+                        display_name: "Stream Watch Agent".to_owned(),
+                        version: "1.0.0".to_owned(),
+                        summary: "Emits streamed watch events".to_owned(),
+                        skills: vec!["watch".to_owned()],
+                        subscriptions: vec!["topic:tasks".to_owned()],
+                        publications: vec!["topic:results".to_owned()],
+                        schemas: Vec::new(),
+                        endpoint: AgentEndpoint {
+                            transport: "control_tcp".to_owned(),
+                            address: "127.0.0.1:8856".to_owned(),
+                        },
+                        classification: Classification::Internal,
+                        retention_class: RetentionClass::Operational,
+                        ttl_seconds: None,
+                    },
+                },
+            },
+        )
+        .await;
+        assert!(matches!(register, ControlResponse::AgentRegistered { .. }));
+
+        let event_frame = client
+            .next()
+            .await
+            .expect("event frame")
+            .expect("event frame io");
+        let event_frame: StreamFrame =
+            serde_json::from_str(&event_frame).expect("parse event frame");
+        match event_frame {
+            StreamFrame::RegistryEvents { events, cursor } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].kind, RegistryEventKind::Registered);
+                assert_eq!(events[0].card.agent_id, "stream-watch-agent");
+                assert!(cursor >= events[0].sequence);
+            }
+            other => panic!("expected registry-events frame, got {other:?}"),
+        }
+
+        drop(client);
+        server
+            .await
+            .expect("server task join")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn open_agent_watch_stream_emits_keepalive_when_idle() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let (client_stream, server_stream) = duplex(8 * 1024);
+        let server_state = Arc::clone(&state);
+        let server =
+            tokio::spawn(async move { handle_connection(server_stream, server_state).await });
+        let mut client = Framed::new(client_stream, LinesCodec::new());
+
+        client
+            .send(
+                serde_json::to_string(&ControlRequest {
+                    capability_token: developer_token,
+                    command: ControlCommand::OpenAgentWatchStream {
+                        query: AgentQuery::default(),
+                        cursor: None,
+                        max_events: 10,
+                        wait_timeout_ms: 1,
+                    },
+                })
+                .expect("serialize stream-open request"),
+            )
+            .await
+            .expect("send stream-open request");
+
+        let opened = client
+            .next()
+            .await
+            .expect("opening frame")
+            .expect("opening frame io");
+        let opened: StreamFrame = serde_json::from_str(&opened).expect("parse opening frame");
+        assert!(matches!(opened, StreamFrame::AgentWatchOpened { .. }));
+
+        let keepalive = client
+            .next()
+            .await
+            .expect("keepalive frame")
+            .expect("keepalive frame io");
+        let keepalive: StreamFrame =
+            serde_json::from_str(&keepalive).expect("parse keepalive frame");
+        assert!(matches!(keepalive, StreamFrame::KeepAlive { .. }));
+
+        drop(client);
+        server
+            .await
+            .expect("server task join")
+            .expect("server task");
     }
 
     #[tokio::test]

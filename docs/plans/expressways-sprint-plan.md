@@ -132,7 +132,11 @@ Add only the features that survive Phase 1 validation.
 - Pluggable discovery registry.
 - Experimental priority scheduling separated from strict log topics.
 
+### Current Execution Order
+
+- Start with the pluggable discovery registry because it is cross-platform, control-plane scoped, and does not add risk to the publish or consume hot path.
+- Defer `io_uring`, shared-memory, and priority scheduling until they have both a stronger threat model and a stronger benchmark case.
+
 ### Exit Criteria
 
 - Every advanced feature has a threat model, fallback path, and benchmark justification.
-
