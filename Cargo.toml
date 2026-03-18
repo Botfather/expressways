@@ -2,6 +2,7 @@
 members = [
   "crates/expressways-audit",
   "crates/expressways-auth",
+  "crates/expressways-bench",
   "crates/expressways-client",
   "crates/expressways-policy",
   "crates/expressways-protocol",

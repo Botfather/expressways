@@ -23,6 +23,7 @@ The original concept in [docs/main.md](/Users/tusharmohan/Documents/@labs/expres
 - `crates/expressways-audit`: tamper-evident audit logging primitives.
 - `crates/expressways-storage`: segmented append-only storage abstraction.
 - `crates/expressways-client`: client SDK for control-plane requests.
+- `crates/expressways-bench`: benchmark harness for transport and storage baselines.
 - `crates/expressways-server`: broker daemon and request handling.
 - `docs/reviews`: feasibility review and confidence assessment.
 - `docs/plans`: sprint plans and execution sequencing.
@@ -77,6 +78,12 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 ```bash
 cargo run -p expressways-client --bin expresswaysctl -- verify-audit --path ./var/audit/audit.jsonl
 cargo run -p expressways-client --bin expresswaysctl -- export-audit --path ./var/audit/audit.jsonl --output ./var/audit/export.json
+```
+
+10. Capture a benchmark suite with TCP, Unix sockets on Unix hosts, and direct storage throughput:
+
+```bash
+cargo run -p expressways-bench -- suite --spawn-server --broker-iterations 100 --warmup-iterations 20 --payload-bytes 512 --message-count 2000 --read-batch 250 --output ./var/benchmarks/latest.json
 ```
 
 ## Guardrails

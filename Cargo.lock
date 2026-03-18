@@ -356,6 +356,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "expressways-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "expressways-auth",
+ "expressways-client",
+ "expressways-protocol",
+ "expressways-storage",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "expressways-client"
 version = "0.1.0"
 dependencies = [
