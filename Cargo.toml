@@ -1,5 +1,9 @@
 [workspace]
 members = [
+  "crates/expressways-adopter-api",
+  "crates/expressways-adopter-audit-integrity",
+  "crates/expressways-adopter-registry-guard",
+  "crates/expressways-adopter-storage-guard",
   "crates/expressways-audit",
   "crates/expressways-auth",
   "crates/expressways-bench",

@@ -26,6 +26,23 @@ audit_retry_attempts = 3
 audit_retry_backoff_ms = 50
 listener_retry_delay_ms = 250
 
+[adopters]
+# These ids must match adopter packages compiled into the current server binary.
+# If you build the server with a subset of adopter features, update this list to match.
+enabled = ["audit_integrity", "storage_guard", "registry_guard"]
+probe_interval_seconds = 30
+require_installed = true
+
+[adopters.packages.audit_integrity]
+verify_chain = true
+precreate_file = true
+
+[adopters.packages.storage_guard]
+probe_filename = ".expressways-storage-guard"
+
+[adopters.packages.registry_guard]
+bootstrap_missing = true
+
 [registry]
 backend = "file"
 path = "./var/registry/agents.json"

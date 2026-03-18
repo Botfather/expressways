@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,8 @@ pub struct AppConfig {
     pub registry: RegistrySection,
     #[serde(default)]
     pub resilience: ResilienceSection,
+    #[serde(default)]
+    pub adopters: AdoptersSection,
     pub policy: PolicyConfig,
 }
 
@@ -77,6 +80,29 @@ impl Default for ResilienceSection {
             audit_retry_attempts: default_audit_retry_attempts(),
             audit_retry_backoff_ms: default_audit_retry_backoff_ms(),
             listener_retry_delay_ms: default_listener_retry_delay_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdoptersSection {
+    #[serde(default)]
+    pub enabled: Vec<String>,
+    #[serde(default = "default_adopter_probe_interval_seconds")]
+    pub probe_interval_seconds: u64,
+    #[serde(default = "default_adopter_require_installed")]
+    pub require_installed: bool,
+    #[serde(default)]
+    pub packages: BTreeMap<String, toml::Table>,
+}
+
+impl Default for AdoptersSection {
+    fn default() -> Self {
+        Self {
+            enabled: Vec::new(),
+            probe_interval_seconds: default_adopter_probe_interval_seconds(),
+            require_installed: default_adopter_require_installed(),
+            packages: BTreeMap::new(),
         }
     }
 }
@@ -150,6 +176,14 @@ fn default_audit_retry_backoff_ms() -> u64 {
 
 fn default_listener_retry_delay_ms() -> u64 {
     250
+}
+
+fn default_adopter_probe_interval_seconds() -> u64 {
+    30
+}
+
+fn default_adopter_require_installed() -> bool {
+    true
 }
 
 impl AppConfig {

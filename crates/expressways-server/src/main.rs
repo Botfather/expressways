@@ -1,3 +1,4 @@
+mod adopters;
 mod config;
 mod metrics;
 mod quota;
@@ -33,6 +34,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::adopters::AdopterManager;
 use crate::config::{AppConfig, RegistryBackend, ResilienceSection, ServerConfig, TransportKind};
 use crate::metrics::MetricsCollector;
 use crate::quota::QuotaManager;
@@ -57,6 +59,7 @@ struct BrokerState {
     storage: Mutex<Option<Storage>>,
     registry: Mutex<AgentRegistry>,
     registry_events: RegistryEventHub,
+    adopters: AdopterManager,
     stream_limits: StreamLimits,
     audit: Mutex<ManagedAuditSink>,
 }
@@ -83,24 +86,24 @@ struct ResilienceRuntime {
 
 #[derive(Debug, Default)]
 struct ServiceModeState {
-    degraded_components: BTreeMap<&'static str, String>,
+    degraded_components: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
-struct ServiceModeTracker {
+pub(crate) struct ServiceModeTracker {
     inner: StdMutex<ServiceModeState>,
 }
 
 impl ServiceModeTracker {
-    fn mark_degraded(&self, component: &'static str, detail: impl Into<String>) {
+    fn mark_degraded(&self, component: impl Into<String>, detail: impl Into<String>) {
         self.inner
             .lock()
             .expect("service mode lock")
             .degraded_components
-            .insert(component, detail.into());
+            .insert(component.into(), detail.into());
     }
 
-    fn clear_component(&self, component: &'static str) {
+    fn clear_component(&self, component: &str) {
         self.inner
             .lock()
             .expect("service mode lock")
@@ -233,6 +236,8 @@ async fn main() -> anyhow::Result<()> {
         build_state(&config)
             .with_context(|| format!("failed to build broker from {}", cli.config.display()))?,
     );
+    state.adopters.probe_now(&state.service_mode);
+    spawn_background_adopter_probes(Arc::clone(&state));
     let listener = bind_listener(&config.server)?;
 
     match &listener {
@@ -301,7 +306,9 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
     let service_mode = ServiceModeTracker::default();
     let resilience = ResilienceRuntime {
         allow_degraded_runtime: config.resilience.allow_degraded_runtime,
-        listener_retry_delay: Duration::from_millis(config.resilience.listener_retry_delay_ms.max(1)),
+        listener_retry_delay: Duration::from_millis(
+            config.resilience.listener_retry_delay_ms.max(1),
+        ),
     };
 
     let storage = match Storage::new(StorageConfig {
@@ -340,6 +347,7 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
     let quotas = QuotaManager::new(config.quotas.clone())?;
     let registry = build_registry(config);
     let registry_events = RegistryEventHub::new(config.registry.event_history_limit);
+    let adopters = AdopterManager::build(config)?;
     quotas.validate_principals(
         config
             .auth
@@ -359,6 +367,7 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
         storage: Mutex::new(storage),
         registry: Mutex::new(registry),
         registry_events,
+        adopters,
         stream_limits: StreamLimits {
             send_timeout: Duration::from_millis(config.registry.stream_send_timeout_ms.max(1)),
             idle_keepalive_limit: config.registry.stream_idle_keepalive_limit.max(1),
@@ -377,6 +386,20 @@ fn build_registry(config: &AppConfig) -> AgentRegistry {
     match config.registry.backend {
         RegistryBackend::File => AgentRegistry::file(path, config.registry.default_ttl_seconds),
     }
+}
+
+fn spawn_background_adopter_probes(state: Arc<BrokerState>) {
+    if !state.adopters.has_enabled() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let interval = state.adopters.probe_interval();
+        loop {
+            tokio::time::sleep(interval).await;
+            state.adopters.probe_now(&state.service_mode);
+        }
+    });
 }
 
 fn bind_listener(config: &ServerConfig) -> anyhow::Result<ListenerHandle> {
@@ -918,6 +941,7 @@ async fn process_request(state: &BrokerState, request: ControlRequest) -> Contro
         ControlCommand::Publish { .. } => Action::Publish,
         ControlCommand::Consume { .. } => Action::Consume,
         ControlCommand::GetAuthState
+        | ControlCommand::GetAdopters
         | ControlCommand::GetMetrics
         | ControlCommand::RegisterAgent { .. }
         | ControlCommand::HeartbeatAgent { .. }
@@ -936,6 +960,7 @@ async fn process_request(state: &BrokerState, request: ControlRequest) -> Contro
     match request.command {
         ControlCommand::Health => handle_health(state, request.capability_token).await,
         ControlCommand::GetMetrics => handle_get_metrics(state, request.capability_token).await,
+        ControlCommand::GetAdopters => handle_get_adopters(state, request.capability_token).await,
         ControlCommand::GetAuthState => {
             handle_get_auth_state(state, request.capability_token).await
         }
@@ -1096,6 +1121,7 @@ async fn handle_get_metrics(state: &BrokerState, capability_token: String) -> Co
         audit_summary,
         state.service_mode.status(),
         state.service_mode.degraded_components(),
+        state.adopters.snapshot(),
     );
 
     if let Err(error) = finalize_success(
@@ -1111,6 +1137,49 @@ async fn handle_get_metrics(state: &BrokerState, capability_token: String) -> Co
     }
 
     ControlResponse::Metrics { metrics }
+}
+
+async fn handle_get_adopters(state: &BrokerState, capability_token: String) -> ControlResponse {
+    let resource = BROKER_RESOURCE.to_owned();
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some("fetch adopter status".to_owned()),
+    )
+    .await
+    {
+        return response;
+    }
+
+    let adopters = state.adopters.snapshot();
+
+    if let Err(error) = finalize_success(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some(format!("fetched {} adopters", adopters.len())),
+    )
+    .await
+    {
+        return ControlResponse::error("audit_failure", error.to_string());
+    }
+
+    ControlResponse::Adopters { adopters }
 }
 
 async fn handle_get_auth_state(state: &BrokerState, capability_token: String) -> ControlResponse {
@@ -2156,8 +2225,9 @@ async fn with_storage<T>(
     let storage = match storage.as_ref() {
         Some(storage) => storage,
         None => {
-            return Err("storage subsystem unavailable; broker is running in degraded mode"
-                .to_owned())
+            return Err(
+                "storage subsystem unavailable; broker is running in degraded mode".to_owned(),
+            );
         }
     };
 
@@ -2168,7 +2238,7 @@ async fn with_storage<T>(
         }
         Err(error) => {
             let message = error.to_string();
-            state.service_mode.mark_degraded("storage", &message);
+            state.service_mode.mark_degraded("storage", message.clone());
             Err(message)
         }
     }
@@ -2462,7 +2532,7 @@ fn handle_audit_failure(state: &BrokerState, error: anyhow::Error) -> anyhow::Re
     state.metrics.record_audit_failure();
     if state.resilience.allow_degraded_runtime {
         let detail = error.to_string();
-        state.service_mode.mark_degraded("audit", &detail);
+        state.service_mode.mark_degraded("audit", detail.clone());
         warn!(error = %detail, "audit subsystem degraded; continuing to serve requests");
         Ok(())
     } else {
@@ -2533,13 +2603,13 @@ async fn record_internal_event(
     let mut audit = state.audit.lock().await;
     let event = audit
         .append(DraftAuditEvent {
-        principal: principal.to_owned(),
-        action,
-        resource: resource.to_owned(),
-        decision,
-        outcome,
-        detail,
-    })
+            principal: principal.to_owned(),
+            action,
+            resource: resource.to_owned(),
+            decision,
+            outcome,
+            detail,
+        })
         .await?;
     state.service_mode.clear_component("audit");
 
@@ -2577,7 +2647,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::config::{AuditSection, RegistrySection, ResilienceSection, StorageSection};
+    use crate::config::{
+        AdoptersSection, AuditSection, RegistrySection, ResilienceSection, StorageSection,
+    };
     use crate::quota::{BackpressureMode, QuotaConfig, QuotaProfile};
 
     fn test_root() -> PathBuf {
@@ -2666,6 +2738,7 @@ mod tests {
                 stream_idle_keepalive_limit: 12,
             },
             resilience: ResilienceSection::default(),
+            adopters: AdoptersSection::default(),
             policy: PolicyConfig {
                 default_decision: DefaultDecision::Deny,
                 rules: vec![
@@ -2968,6 +3041,116 @@ mod tests {
                         .iter()
                         .any(|component| component.starts_with("storage:"))
                 );
+            }
+            other => panic!("expected metrics response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adopters_command_reports_enabled_and_available_packages() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.adopters.enabled = vec!["storage_guard".to_owned()];
+
+        let state = build_state(&config).expect("build broker state");
+        state.adopters.probe_now(&state.service_mode);
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: BROKER_RESOURCE.to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let response = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::GetAdopters,
+            },
+        )
+        .await;
+
+        match response {
+            ControlResponse::Adopters { adopters } => {
+                assert!(adopters.iter().any(|adopter| {
+                    adopter.id == "storage_guard" && adopter.enabled && adopter.status == "healthy"
+                }));
+                assert!(adopters.iter().any(|adopter| {
+                    adopter.id == "audit_integrity"
+                        && !adopter.enabled
+                        && adopter.status == "inactive"
+                }));
+            }
+            other => panic!("expected adopters response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_adopter_package_can_degrade_without_blocking_service() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.adopters.enabled = vec!["not_installed".to_owned()];
+        config.adopters.require_installed = false;
+
+        let state = build_state(&config).expect("build broker state");
+        state.adopters.probe_now(&state.service_mode);
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: BROKER_RESOURCE.to_owned(),
+                actions: vec![Action::Admin, Action::Health],
+            }],
+        );
+
+        let health = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::Health,
+            },
+        )
+        .await;
+        match health {
+            ControlResponse::Health { status, .. } => assert_eq!(status, "degraded"),
+            other => panic!("expected health response, got {other:?}"),
+        }
+
+        let adopters = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::GetAdopters,
+            },
+        )
+        .await;
+        match adopters {
+            ControlResponse::Adopters { adopters } => {
+                assert!(adopters.iter().any(|adopter| {
+                    adopter.id == "not_installed" && adopter.enabled && adopter.status == "failed"
+                }));
+            }
+            other => panic!("expected adopters response, got {other:?}"),
+        }
+
+        let metrics = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::GetMetrics,
+            },
+        )
+        .await;
+        match metrics {
+            ControlResponse::Metrics { metrics } => {
+                assert_eq!(metrics.resilience.service_mode, "degraded");
+                assert!(metrics.adopters.iter().any(|adopter| {
+                    adopter.id == "not_installed" && adopter.status == "failed"
+                }));
             }
             other => panic!("expected metrics response, got {other:?}"),
         }
@@ -3900,6 +4083,7 @@ mod tests {
             audit_summary,
             state.service_mode.status(),
             state.service_mode.degraded_components(),
+            state.adopters.snapshot(),
         );
         assert_eq!(metrics.streams.slow_consumer_drops, 1);
         assert_eq!(metrics.streams.delivery_failures, 1);

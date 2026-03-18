@@ -312,6 +312,18 @@ pub struct StreamMetricsView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdopterStatusView {
+    pub id: String,
+    pub package: String,
+    pub description: String,
+    pub enabled: bool,
+    pub status: String,
+    pub detail: String,
+    pub capabilities: Vec<String>,
+    pub last_run_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResilienceMetricsView {
     pub service_mode: String,
     pub degraded_components: Vec<String>,
@@ -334,6 +346,7 @@ pub struct BrokerMetricsView {
     pub audit: AuditMetricsView,
     pub streams: StreamMetricsView,
     pub resilience: ResilienceMetricsView,
+    pub adopters: Vec<AdopterStatusView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,6 +355,7 @@ pub enum ControlCommand {
     Health,
     GetAuthState,
     GetMetrics,
+    GetAdopters,
     RegisterAgent {
         registration: AgentRegistration,
     },
@@ -429,6 +443,9 @@ pub enum ControlResponse {
     },
     Metrics {
         metrics: BrokerMetricsView,
+    },
+    Adopters {
+        adopters: Vec<AdopterStatusView>,
     },
     AuthState {
         state: AuthStateView,

@@ -1,3 +1,13 @@
+[features]
+default = [
+  "adopter-audit-integrity",
+  "adopter-storage-guard",
+  "adopter-registry-guard",
+]
+adopter-audit-integrity = ["dep:expressways-adopter-audit-integrity"]
+adopter-storage-guard = ["dep:expressways-adopter-storage-guard"]
+adopter-registry-guard = ["dep:expressways-adopter-registry-guard"]
+
 [package]
 name = "expressways-server"
 edition.workspace = true
@@ -6,6 +16,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+expressways-adopter-api = { path = "../expressways-adopter-api" }
+expressways-adopter-audit-integrity = { path = "../expressways-adopter-audit-integrity", optional = true }
+expressways-adopter-registry-guard = { path = "../expressways-adopter-registry-guard", optional = true }
+expressways-adopter-storage-guard = { path = "../expressways-adopter-storage-guard", optional = true }
 expressways-audit = { path = "../expressways-audit" }
 expressways-auth = { path = "../expressways-auth" }
 expressways-policy = { path = "../expressways-policy" }

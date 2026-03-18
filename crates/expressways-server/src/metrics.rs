@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use expressways_audit::AuditLogSummary;
 use expressways_protocol::{
-    Action, AuditMetricsView, BrokerMetricsView, OperationMetricsView, ResilienceMetricsView,
-    StorageMetricsView, StreamMetricsView,
+    Action, AdopterStatusView, AuditMetricsView, BrokerMetricsView, OperationMetricsView,
+    ResilienceMetricsView, StorageMetricsView, StreamMetricsView,
 };
 use expressways_storage::StorageStats;
 
@@ -140,6 +140,7 @@ impl MetricsCollector {
         audit: AuditLogSummary,
         service_mode: String,
         degraded_components: Vec<String>,
+        adopters: Vec<AdopterStatusView>,
     ) -> BrokerMetricsView {
         let state = self.state.lock().expect("metrics lock");
         BrokerMetricsView {
@@ -183,6 +184,7 @@ impl MetricsCollector {
                 service_mode,
                 degraded_components,
             },
+            adopters,
         }
     }
 }
@@ -244,6 +246,7 @@ mod tests {
             },
             "ok".to_owned(),
             Vec::new(),
+            Vec::new(),
         );
 
         assert_eq!(snapshot.total_requests, 1);
@@ -259,5 +262,6 @@ mod tests {
         assert_eq!(snapshot.streams.watch_stream.requests, 1);
         assert_eq!(snapshot.streams.watch_stream.successes, 1);
         assert_eq!(snapshot.resilience.service_mode, "ok");
+        assert!(snapshot.adopters.is_empty());
     }
 }

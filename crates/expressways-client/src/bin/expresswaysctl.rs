@@ -70,6 +70,10 @@ enum Command {
         #[command(flatten)]
         token: TokenArgs,
     },
+    Adopters {
+        #[command(flatten)]
+        token: TokenArgs,
+    },
     Metrics {
         #[command(flatten)]
         token: TokenArgs,
@@ -514,6 +518,10 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
         Command::AuthState { token } => Ok(ControlRequest {
             capability_token: resolve_token(token)?,
             command: ControlCommand::GetAuthState,
+        }),
+        Command::Adopters { token } => Ok(ControlRequest {
+            capability_token: resolve_token(token)?,
+            command: ControlCommand::GetAdopters,
         }),
         Command::Metrics { token } => Ok(ControlRequest {
             capability_token: resolve_token(token)?,

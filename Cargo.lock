@@ -325,6 +325,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "expressways-adopter-api"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "expressways-adopter-audit-integrity"
+version = "0.1.0"
+dependencies = [
+ "expressways-adopter-api",
+ "expressways-audit",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "expressways-adopter-registry-guard"
+version = "0.1.0"
+dependencies = [
+ "expressways-adopter-api",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "expressways-adopter-storage-guard"
+version = "0.1.0"
+dependencies = [
+ "expressways-adopter-api",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "expressways-audit"
 version = "0.1.0"
 dependencies = [
@@ -435,6 +474,10 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "expressways-adopter-api",
+ "expressways-adopter-audit-integrity",
+ "expressways-adopter-registry-guard",
+ "expressways-adopter-storage-guard",
  "expressways-audit",
  "expressways-auth",
  "expressways-policy",
