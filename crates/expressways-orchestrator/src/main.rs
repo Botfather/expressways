@@ -2628,6 +2628,7 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
                 <th>Status</th>
                 <th>Priority</th>
                 <th>Attempts</th>
+                <th>Payload</th>
                 <th>Agent</th>
                 <th>Reason</th>
               </tr>
@@ -2755,6 +2756,10 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
           <td><span class="status-badge ${{getStatusClass(task.status)}}">${{escapeHtml(task.status)}}</span></td>
           <td>${{task.priority}}</td>
           <td>${{task.attempts}} / ${{task.max_attempts}}</td>
+          <td>
+            <span style="font-family: var(--font-mono); font-size: 13px;">${{escapeHtml(task.payload_kind)}}</span><br>
+            <span style="color: var(--muted); font-size: 12px;">${{escapeHtml(task.payload_content_type || "-")}}</span>
+          </td>
           <td><span style="font-family: var(--font-mono); font-size: 13px;">${{escapeHtml(task.active_agent_id || "-")}}</span></td>
           <td style="color: var(--muted); font-size: 13px;">${{escapeHtml(task.last_assignment_reason || "-")}}</td>
         </tr>
@@ -2787,6 +2792,10 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
           <div class="detail-item">
             <strong>Task Context</strong>
             <span>${{escapeHtml(task.task_type)}}</span>
+          </div>
+          <div class="detail-item">
+            <strong>Payload Format</strong>
+            <span>${{escapeHtml(task.payload_kind)}}${{task.payload_content_type ? ` · ${{escapeHtml(task.payload_content_type)}}` : ""}}</span>
           </div>
           <div class="detail-item">
             <strong>Lease Agent</strong>
@@ -2969,19 +2978,20 @@ fn render_task_table(tasks: &[TaskSummaryView]) -> String {
     let mut rendered = String::new();
     writeln!(
         &mut rendered,
-        "{:<18} {:<12} {:>4} {:>5} {:<14} {:<12} {}",
-        "TASK_ID", "STATUS", "PRI", "TRY", "AGENT", "SKILL", "REASON"
+        "{:<18} {:<12} {:>4} {:>5} {:<12} {:<14} {:<12} {}",
+        "TASK_ID", "STATUS", "PRI", "TRY", "PAYLOAD", "AGENT", "SKILL", "REASON"
     )
     .expect("write header");
 
     for task in tasks {
         writeln!(
             &mut rendered,
-            "{:<18} {:<12} {:>4} {:>5} {:<14} {:<12} {}",
+            "{:<18} {:<12} {:>4} {:>5} {:<12} {:<14} {:<12} {}",
             truncate_cell(&task.task_id, 18),
             task.status,
             task.priority,
             format!("{}/{}", task.attempts, task.max_attempts),
+            truncate_cell(task_table_payload_label(task), 12),
             truncate_cell(task.active_agent_id.as_deref().unwrap_or("-"), 14),
             truncate_cell(task.skill.as_deref().unwrap_or("-"), 12),
             task.last_assignment_reason.as_deref().unwrap_or("-"),
@@ -2990,6 +3000,16 @@ fn render_task_table(tasks: &[TaskSummaryView]) -> String {
     }
 
     rendered
+}
+
+fn task_table_payload_label(task: &TaskSummaryView) -> &str {
+    match task.payload_kind.as_str() {
+        "json" => "json",
+        _ => task
+            .payload_content_type
+            .as_deref()
+            .unwrap_or(task.payload_kind.as_str()),
+    }
 }
 
 fn render_task_event_table_row(
@@ -3194,6 +3214,8 @@ mod tests {
         let tasks = vec![TaskSummaryView {
             task_id: "task-1".to_owned(),
             task_type: "summarize_document".to_owned(),
+            payload_kind: "json".to_owned(),
+            payload_content_type: Some("application/json".to_owned()),
             task_offset: 4,
             priority: 50,
             status: TaskStatus::Assigned,
@@ -3216,6 +3238,7 @@ mod tests {
         let table = render_task_list(&tasks, TaskListOutputKind::Table).expect("table");
         assert!(table.contains("TASK_ID"));
         assert!(table.contains("task-1"));
+        assert!(table.contains("json"));
         assert!(table.contains("scheduler picked alpha"));
     }
 
@@ -3224,6 +3247,8 @@ mod tests {
         let tasks = vec![TaskSummaryView {
             task_id: "task-1".to_owned(),
             task_type: "summarize_document".to_owned(),
+            payload_kind: "json".to_owned(),
+            payload_content_type: Some("application/json".to_owned()),
             task_offset: 4,
             priority: 50,
             status: TaskStatus::Assigned,
@@ -3263,6 +3288,7 @@ mod tests {
         assert!(frame.contains("sort_by=Priority"));
         assert!(frame.contains("TASK_ID"));
         assert!(frame.contains("task-1"));
+        assert!(frame.contains("json"));
     }
 
     #[test]

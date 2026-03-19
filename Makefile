@@ -53,3 +53,7 @@ benchmark: prepare-local-dirs
 		--message-count 20000 \
 		--read-batch 250 \
 		--output ./var/benchmarks/latest.json
+
+generate-token:
+	@echo "Generating a new token..."
+	cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:developer --audience expressways --scope system:broker:health --scope 'system:broker:admin' --scope 'topic:*:admin,publish,consume' --scope 'registry:agents*:admin' --output ./var/auth/developer.token

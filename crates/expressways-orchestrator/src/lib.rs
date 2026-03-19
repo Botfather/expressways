@@ -101,6 +101,8 @@ pub struct TaskListQuery {
 pub struct TaskSummaryView {
     pub task_id: String,
     pub task_type: String,
+    pub payload_kind: String,
+    pub payload_content_type: Option<String>,
     pub task_offset: u64,
     pub priority: i32,
     pub status: TaskStatus,
@@ -120,6 +122,8 @@ pub struct TaskSummaryView {
 pub struct TaskDetailView {
     pub task_id: String,
     pub task_type: String,
+    pub payload_kind: String,
+    pub payload_content_type: Option<String>,
     pub task_offset: u64,
     pub priority: i32,
     pub status: TaskStatus,
@@ -908,6 +912,8 @@ fn task_summary_view(task: &TaskRecord) -> TaskSummaryView {
     TaskSummaryView {
         task_id: task.work_item.task_id.clone(),
         task_type: task.work_item.task_type.clone(),
+        payload_kind: task.work_item.payload.kind().to_owned(),
+        payload_content_type: task.work_item.payload.content_type().map(ToOwned::to_owned),
         task_offset: task.task_offset,
         priority: task.work_item.priority,
         status: task.status,
@@ -964,6 +970,8 @@ fn task_detail_view(task: &TaskRecord, now: DateTime<Utc>) -> TaskDetailView {
     TaskDetailView {
         task_id: task.work_item.task_id.clone(),
         task_type: task.work_item.task_type.clone(),
+        payload_kind: task.work_item.payload.kind().to_owned(),
+        payload_content_type: task.work_item.payload.content_type().map(ToOwned::to_owned),
         task_offset: task.task_offset,
         priority: task.work_item.priority,
         status: task.status,
@@ -1629,6 +1637,11 @@ mod tests {
         assert_eq!(assigned_only.len(), 1);
         assert_eq!(assigned_only[0].task_id, "task-2");
         assert_eq!(assigned_only[0].active_agent_id.as_deref(), Some("alpha"));
+        assert_eq!(assigned_only[0].payload_kind, "json");
+        assert_eq!(
+            assigned_only[0].payload_content_type.as_deref(),
+            Some("application/json")
+        );
         assert_eq!(
             assigned_only[0].last_assignment_reason.as_deref(),
             Some("scheduler selected agent `alpha` with priority=0")
@@ -1769,6 +1782,11 @@ mod tests {
         assert_eq!(detail.max_attempts, 4);
         assert_eq!(detail.retry_count, 0);
         assert_eq!(detail.requirements.skill.as_deref(), Some("summarize"));
+        assert_eq!(detail.payload_kind, "json");
+        assert_eq!(
+            detail.payload_content_type.as_deref(),
+            Some("application/json")
+        );
         assert_eq!(
             detail.payload,
             TaskPayload::json(json!({ "path": "notes.md" }))
