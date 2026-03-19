@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -245,7 +246,228 @@ impl Default for TaskRetryPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskPayload {
+    Json(serde_json::Value),
+    Text {
+        text: String,
+        content_type: String,
+    },
+    Bytes {
+        data_base64: String,
+        content_type: String,
+        byte_length: Option<usize>,
+    },
+    FileRef {
+        path: String,
+        content_type: Option<String>,
+        byte_length: Option<u64>,
+        sha256: Option<String>,
+    },
+}
+
+impl Default for TaskPayload {
+    fn default() -> Self {
+        Self::Json(serde_json::Value::Null)
+    }
+}
+
+impl TaskPayload {
+    pub fn json(value: serde_json::Value) -> Self {
+        Self::Json(value)
+    }
+
+    pub fn text(text: impl Into<String>, content_type: impl Into<String>) -> Self {
+        Self::Text {
+            text: text.into(),
+            content_type: content_type.into(),
+        }
+    }
+
+    pub fn bytes_base64(
+        data_base64: impl Into<String>,
+        content_type: impl Into<String>,
+        byte_length: Option<usize>,
+    ) -> Self {
+        Self::Bytes {
+            data_base64: data_base64.into(),
+            content_type: content_type.into(),
+            byte_length,
+        }
+    }
+
+    pub fn bytes(bytes: &[u8], content_type: impl Into<String>) -> Self {
+        Self::Bytes {
+            data_base64: BASE64_STANDARD.encode(bytes),
+            content_type: content_type.into(),
+            byte_length: Some(bytes.len()),
+        }
+    }
+
+    pub fn file_ref(
+        path: impl Into<String>,
+        content_type: Option<String>,
+        byte_length: Option<u64>,
+        sha256: Option<String>,
+    ) -> Self {
+        Self::FileRef {
+            path: path.into(),
+            content_type,
+            byte_length,
+            sha256,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Json(_) => "json",
+            Self::Text { .. } => "text",
+            Self::Bytes { .. } => "bytes",
+            Self::FileRef { .. } => "file_ref",
+        }
+    }
+
+    pub fn content_type(&self) -> Option<&str> {
+        match self {
+            Self::Json(_) => Some("application/json"),
+            Self::Text { content_type, .. } | Self::Bytes { content_type, .. } => {
+                Some(content_type.as_str())
+            }
+            Self::FileRef { content_type, .. } => content_type.as_deref(),
+        }
+    }
+
+    pub fn json_value(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Json(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn into_json_value(self) -> Option<serde_json::Value> {
+        match self {
+            Self::Json(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn decode_inline_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Self::Bytes { data_base64, .. } => BASE64_STANDARD
+                .decode(data_base64)
+                .map(Some)
+                .map_err(|error| format!("invalid base64 task payload: {error}")),
+            _ => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "_expressways_payload_kind", rename_all = "snake_case")]
+enum TaskPayloadEnvelope {
+    Text {
+        text: String,
+        #[serde(default = "default_text_content_type")]
+        content_type: String,
+    },
+    Bytes {
+        data_base64: String,
+        #[serde(default = "default_binary_content_type")]
+        content_type: String,
+        byte_length: Option<usize>,
+    },
+    FileRef {
+        path: String,
+        content_type: Option<String>,
+        byte_length: Option<u64>,
+        sha256: Option<String>,
+    },
+}
+
+impl Serialize for TaskPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Json(value) => value.serialize(serializer),
+            Self::Text { text, content_type } => TaskPayloadEnvelope::Text {
+                text: text.clone(),
+                content_type: content_type.clone(),
+            }
+            .serialize(serializer),
+            Self::Bytes {
+                data_base64,
+                content_type,
+                byte_length,
+            } => TaskPayloadEnvelope::Bytes {
+                data_base64: data_base64.clone(),
+                content_type: content_type.clone(),
+                byte_length: *byte_length,
+            }
+            .serialize(serializer),
+            Self::FileRef {
+                path,
+                content_type,
+                byte_length,
+                sha256,
+            } => TaskPayloadEnvelope::FileRef {
+                path: path.clone(),
+                content_type: content_type.clone(),
+                byte_length: *byte_length,
+                sha256: sha256.clone(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value
+            .as_object()
+            .and_then(|object| object.get("_expressways_payload_kind"))
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        {
+            let envelope = serde_json::from_value::<TaskPayloadEnvelope>(value)
+                .map_err(serde::de::Error::custom)?;
+            return Ok(match envelope {
+                TaskPayloadEnvelope::Text { text, content_type } => {
+                    Self::Text { text, content_type }
+                }
+                TaskPayloadEnvelope::Bytes {
+                    data_base64,
+                    content_type,
+                    byte_length,
+                } => Self::Bytes {
+                    data_base64,
+                    content_type,
+                    byte_length,
+                },
+                TaskPayloadEnvelope::FileRef {
+                    path,
+                    content_type,
+                    byte_length,
+                    sha256,
+                } => Self::FileRef {
+                    path,
+                    content_type,
+                    byte_length,
+                    sha256,
+                },
+            });
+        }
+
+        Ok(Self::Json(value))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskWorkItem {
     pub task_id: String,
     pub task_type: String,
@@ -254,7 +476,7 @@ pub struct TaskWorkItem {
     #[serde(default)]
     pub requirements: TaskRequirements,
     #[serde(default)]
-    pub payload: serde_json::Value,
+    pub payload: TaskPayload,
     #[serde(default)]
     pub retry_policy: TaskRetryPolicy,
     #[serde(default = "default_timestamp")]
@@ -645,6 +867,14 @@ fn default_task_priority() -> i32 {
     0
 }
 
+fn default_text_content_type() -> String {
+    "text/plain; charset=utf-8".to_owned()
+}
+
+fn default_binary_content_type() -> String {
+    "application/octet-stream".to_owned()
+}
+
 fn default_timestamp() -> DateTime<Utc> {
     Utc::now()
 }
@@ -682,5 +912,48 @@ mod tests {
         assert_eq!(task.priority, 0);
         assert!(task.requirements.preferred_agents.is_empty());
         assert!(task.requirements.avoid_agents.is_empty());
+        assert_eq!(task.payload, TaskPayload::Json(serde_json::Value::Null));
+    }
+
+    #[test]
+    fn task_payload_keeps_legacy_json_shape() {
+        let task: TaskWorkItem = serde_json::from_value(serde_json::json!({
+            "task_id": "task-1",
+            "task_type": "summarize_document",
+            "payload": { "path": "notes.md" }
+        }))
+        .expect("deserialize task work item");
+
+        assert_eq!(
+            task.payload,
+            TaskPayload::Json(serde_json::json!({ "path": "notes.md" }))
+        );
+
+        let rendered = serde_json::to_value(&task).expect("serialize task work item");
+        assert_eq!(
+            rendered["payload"],
+            serde_json::json!({ "path": "notes.md" })
+        );
+    }
+
+    #[test]
+    fn task_payload_supports_inline_bytes_and_file_refs() {
+        let bytes = TaskPayload::bytes(b"PDF", "application/pdf");
+        let bytes_json = serde_json::to_value(&bytes).expect("serialize bytes payload");
+        assert_eq!(bytes_json["_expressways_payload_kind"], "bytes");
+        assert_eq!(
+            bytes.decode_inline_bytes().expect("decode bytes"),
+            Some(b"PDF".to_vec())
+        );
+
+        let file_ref = TaskPayload::file_ref(
+            "./var/agent/incoming/doc.pdf",
+            Some("application/pdf".to_owned()),
+            Some(1024),
+            Some("abc123".to_owned()),
+        );
+        let file_ref_json = serde_json::to_value(&file_ref).expect("serialize file ref payload");
+        assert_eq!(file_ref_json["_expressways_payload_kind"], "file_ref");
+        assert_eq!(file_ref_json["path"], "./var/agent/incoming/doc.pdf");
     }
 }

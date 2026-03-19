@@ -4,8 +4,8 @@ use std::path::Path;
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
 use expressways_protocol::{
-    AgentCard, AgentQuery, RegistryEvent, RegistryEventKind, TaskEvent, TaskRequirements,
-    TaskStatus, TaskWorkItem,
+    AgentCard, AgentQuery, RegistryEvent, RegistryEventKind, TaskEvent, TaskPayload,
+    TaskRequirements, TaskStatus, TaskWorkItem,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -129,7 +129,7 @@ pub struct TaskDetailView {
     pub submitted_at: DateTime<Utc>,
     pub last_event_at: DateTime<Utc>,
     pub requirements: TaskRequirements,
-    pub payload: serde_json::Value,
+    pub payload: TaskPayload,
     pub active_assignment: Option<TaskLease>,
     pub active_assignment_age_seconds: Option<u64>,
     pub last_assignment_reason: Option<String>,
@@ -1077,7 +1077,7 @@ mod tests {
                 preferred_agents: preferred_agents.into_iter().map(str::to_owned).collect(),
                 avoid_agents: avoid_agents.into_iter().map(str::to_owned).collect(),
             },
-            payload: json!({ "path": "notes.md" }),
+            payload: TaskPayload::json(json!({ "path": "notes.md" })),
             retry_policy: TaskRetryPolicy {
                 max_attempts,
                 timeout_seconds: 60,
@@ -1769,7 +1769,10 @@ mod tests {
         assert_eq!(detail.max_attempts, 4);
         assert_eq!(detail.retry_count, 0);
         assert_eq!(detail.requirements.skill.as_deref(), Some("summarize"));
-        assert_eq!(detail.payload, json!({ "path": "notes.md" }));
+        assert_eq!(
+            detail.payload,
+            TaskPayload::json(json!({ "path": "notes.md" }))
+        );
         assert_eq!(
             detail
                 .active_assignment

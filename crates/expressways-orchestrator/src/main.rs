@@ -2087,304 +2087,498 @@ fn render_task_list(
 fn render_dashboard_html(state_path: &std::path::Path) -> String {
     let state_path = state_path.display();
     format!(
-        r#"<!DOCTYPE html>
+        r##"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Expressways Dashboard</title>
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    
     :root {{
-      --bg: #f3efe4;
-      --panel: rgba(255, 252, 245, 0.92);
-      --ink: #1d2935;
-      --muted: #6f7f8e;
-      --line: rgba(29, 41, 53, 0.12);
-      --accent: #ca7b2b;
-      --accent-deep: #8c4b10;
-      --ok: #2c6a4c;
-      --warn: #9a5b17;
-      --shadow: 0 20px 45px rgba(39, 35, 26, 0.12);
-      font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --ink: #0f172a;
+      --muted: #64748b;
+      --border: #e2e8f0;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+      --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+      --font-sans: 'Inter', system-ui, sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
     }}
-    * {{ box-sizing: border-box; }}
+    
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    
     body {{
-      margin: 0;
       min-height: 100vh;
-      background:
-        radial-gradient(circle at top left, rgba(202, 123, 43, 0.16), transparent 30rem),
-        radial-gradient(circle at bottom right, rgba(44, 106, 76, 0.12), transparent 28rem),
-        var(--bg);
+      background-color: var(--bg);
       color: var(--ink);
+      font-family: var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+      line-height: 1.5;
+      padding-bottom: 40px;
     }}
-    .shell {{
-      max-width: 1380px;
+
+    .container {{
+      max-width: 1400px;
       margin: 0 auto;
-      padding: 24px;
+      padding: 0 24px;
     }}
-    .hero {{
-      display: grid;
-      gap: 18px;
-      grid-template-columns: minmax(0, 1.7fr) minmax(280px, 0.9fr);
-      margin-bottom: 20px;
+
+    /* Top Navigation */
+    .header {{
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 0;
+      margin-bottom: 32px;
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      box-shadow: var(--shadow-sm);
     }}
+    
+    .header-content {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }}
+    
+    .brand {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }}
+    
+    .brand-icon {{
+      width: 32px;
+      height: 32px;
+      background: var(--ink);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: 700;
+      font-size: 18px;
+    }}
+
+    .brand h1 {{
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--ink);
+      margin: 0;
+    }}
+
+    .header-meta {{
+      display: flex;
+      gap: 24px;
+      font-size: 13px;
+    }}
+    
+    .meta-item {{
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+    }}
+    
+    .meta-label {{ color: var(--muted); }}
+    .meta-value {{ font-family: var(--font-mono); font-weight: 500; }}
+
+    /* Cards */
     .panel {{
       background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(12px);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: var(--shadow-sm);
     }}
-    .hero-copy {{
-      padding: 28px;
-    }}
-    .eyebrow {{
-      margin: 0 0 10px;
-      font-size: 12px;
-      letter-spacing: 0.18em;
-      text-transform: uppercase;
-      color: var(--accent-deep);
-    }}
-    h1 {{
-      margin: 0;
-      font-size: clamp(2rem, 4vw, 3.5rem);
-      line-height: 0.95;
-    }}
-    .lede {{
-      margin: 14px 0 0;
-      max-width: 60ch;
-      color: var(--muted);
-      font-size: 1rem;
-      line-height: 1.6;
-    }}
-    .hero-meta {{
-      padding: 24px;
+
+    /* Metrics Grid */
+    .metrics-grid {{
       display: grid;
-      gap: 14px;
-      align-content: start;
-    }}
-    .hero-meta strong {{
-      display: block;
-      font-size: 0.78rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 6px;
-    }}
-    .hero-meta code {{
-      display: block;
-      word-break: break-all;
-      font-size: 0.86rem;
-      color: var(--ink);
-    }}
-    .controls, .metrics, .content {{
-      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
       gap: 16px;
-      margin-bottom: 18px;
+      margin-bottom: 32px;
     }}
-    .controls {{
-      grid-template-columns: repeat(4, minmax(0, 1fr)) auto;
-      align-items: end;
-      padding: 18px;
+
+    .metric-card {{
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
     }}
-    label {{
-      display: grid;
-      gap: 8px;
-      font-size: 0.84rem;
+
+    .metric-label {{
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }}
+
+    .metric-value {{
+      font-size: 32px;
+      font-weight: 700;
+      color: var(--ink);
+      margin: 8px 0 4px 0;
+      line-height: 1;
+    }}
+
+    .metric-hint {{
+      font-size: 13px;
       color: var(--muted);
     }}
-    select, input, button {{
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px 14px;
-      background: rgba(255, 255, 255, 0.72);
-      color: var(--ink);
-      font: inherit;
+
+    /* Filters Bar */
+    .filters {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 16px;
+      margin-bottom: 24px;
+      align-items: flex-end;
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: var(--shadow-sm);
     }}
-    button {{
-      width: auto;
-      min-width: 140px;
-      background: linear-gradient(135deg, var(--accent), #d79756);
+
+    .filter-group {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex: 1;
+      min-width: 160px;
+    }}
+    
+    .filter-group.small {{
+      min-width: 100px;
+      flex: 0 1 auto;
+    }}
+
+    .filter-group label {{
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--ink);
+    }}
+
+    .filter-control {{
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-family: inherit;
+      font-size: 14px;
+      background: #fafafa;
+      color: var(--ink);
+      transition: all 0.2s;
+      outline: none;
+      height: 38px;
+    }}
+    
+    .filter-control:focus {{
+      border-color: var(--accent);
+      background: #fff;
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+    }}
+
+    .btn-primary {{
+      background: var(--ink);
       color: white;
       border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-weight: 500;
       cursor: pointer;
-      font-weight: 700;
+      font-family: inherit;
+      font-size: 14px;
+      height: 38px;
+      transition: background 0.2s;
+      white-space: nowrap;
     }}
-    .metrics {{
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-    }}
-    .metric-card {{
-      padding: 18px;
-    }}
-    .metric-card .label {{
-      font-size: 0.78rem;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.09em;
-    }}
-    .metric-card .value {{
-      margin-top: 10px;
-      font-size: 2rem;
-      font-weight: 700;
-    }}
-    .metric-card .hint {{
-      margin-top: 8px;
-      color: var(--muted);
-      font-size: 0.9rem;
-    }}
-    .content {{
-      grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.95fr);
+    
+    .btn-primary:hover {{ background: #334155; }}
+
+    /* Main Content Layout */
+    .content-grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(360px, 1fr);
+      gap: 24px;
       align-items: start;
     }}
-    .panel-head {{
+
+    /* Typography in panels */
+    .panel-header {{
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
       display: flex;
       justify-content: space-between;
-      gap: 12px;
-      align-items: baseline;
-      padding: 20px 22px 0;
+      align-items: center;
     }}
-    .panel-head h2 {{
+    
+    .panel-header h2 {{
+      font-size: 16px;
+      font-weight: 600;
       margin: 0;
-      font-size: 1.1rem;
     }}
-    .panel-head span {{
+    
+    .panel-header .badge {{
+      background: var(--bg);
+      padding: 4px 10px;
+      border-radius: 99px;
+      font-size: 12px;
+      font-weight: 500;
       color: var(--muted);
-      font-size: 0.9rem;
+      border: 1px solid var(--border);
     }}
+
+    /* Table Styles */
+    .table-container {{
+      overflow-x: auto;
+    }}
+    
     table {{
       width: 100%;
-      border-collapse: collapse;
-    }}
-    thead th {{
-      font-size: 0.76rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--muted);
+      border-collapse: separate;
+      border-spacing: 0;
       text-align: left;
-      padding: 16px 22px 12px;
-      border-bottom: 1px solid var(--line);
     }}
-    tbody td {{
-      padding: 14px 22px;
-      border-bottom: 1px solid var(--line);
+    
+    th {{
+      padding: 12px 20px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border);
+      background: #fafafa;
+    }}
+    
+    td {{
+      padding: 14px 20px;
+      font-size: 14px;
+      border-bottom: 1px solid var(--border);
       vertical-align: top;
     }}
+
     tbody tr {{
+      transition: background 0.15s;
       cursor: pointer;
-      transition: background 120ms ease, transform 120ms ease;
     }}
-    tbody tr:hover {{
-      background: rgba(202, 123, 43, 0.08);
+    
+    tbody tr:hover {{ background: #f8fafc; }}
+    tbody tr.active {{ 
+      background: #eff6ff; 
+      position: relative;
     }}
-    tbody tr.active {{
-      background: rgba(202, 123, 43, 0.14);
+    
+    tbody tr.active td:first-child::before {{
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background: var(--accent);
     }}
-    .status {{
+
+    .task-id-cell strong {{
+      display: block;
+      font-family: var(--font-mono);
+      font-weight: 500;
+      margin-bottom: 4px;
+    }}
+    
+    .task-id-cell span {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+
+    /* Status Badges */
+    .status-badge {{
       display: inline-flex;
-      padding: 5px 10px;
-      border-radius: 999px;
-      font-size: 0.77rem;
-      font-weight: 700;
-      background: rgba(29, 41, 53, 0.08);
+      align-items: center;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 1;
+      text-transform: capitalize;
     }}
-    .detail, .history {{
-      padding: 0 22px 22px;
+    
+    .status-completed {{ background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }}
+    .status-failed, .status-exhausted, .status-canceled {{ background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }}
+    .status-pending {{ background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }}
+    .status-assigned {{ background: #dbeafe; color: #1e40af; border: 1px solid #bfdbfe; }}
+    .status-retry_scheduled, .status-timed_out {{ background: #fef3c7; color: #9a3412; border: 1px solid #fde68a; }}
+
+    /* Detail View */
+    .detail-section {{
+      padding: 20px;
     }}
+
     .detail-grid {{
       display: grid;
-      gap: 12px;
-      margin-top: 16px;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 20px;
     }}
+    
     .detail-item {{
-      padding: 14px 16px;
-      border-radius: 16px;
-      background: rgba(255, 255, 255, 0.64);
-      border: 1px solid var(--line);
+      background: #fafafa;
+      padding: 12px 16px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
     }}
+    
     .detail-item strong {{
       display: block;
-      margin-bottom: 6px;
-      font-size: 0.76rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
+      font-size: 12px;
       color: var(--muted);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
     }}
-    .detail-pre {{
-      margin: 16px 0 0;
-      max-height: 240px;
-      overflow: auto;
-      border-radius: 18px;
-      border: 1px solid var(--line);
-      background: #f9f5ed;
+    
+    .detail-item span {{
+      font-size: 14px;
+      font-family: var(--font-mono);
+    }}
+
+    .payload-block {{
+      background: #1e293b;
+      color: #e2e8f0;
       padding: 16px;
-      font-size: 0.86rem;
-      line-height: 1.45;
+      border-radius: 8px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      overflow-x: auto;
+      line-height: 1.5;
     }}
+
+    /* History Timeline */
+    .history-section {{
+      padding: 20px;
+      border-top: 1px solid var(--border);
+    }}
+    
     .history-list {{
-      display: grid;
-      gap: 12px;
-      margin-top: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      position: relative;
     }}
-    .history-card {{
-      padding: 14px 16px;
-      border-radius: 16px;
-      border: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.68);
+    
+    .history-list::before {{
+      content: '';
+      position: absolute;
+      left: 11px;
+      top: 8px;
+      bottom: 8px;
+      width: 2px;
+      background: var(--border);
+      z-index: 1;
     }}
-    .history-card header {{
+
+    .history-item {{
+      display: flex;
+      gap: 16px;
+      position: relative;
+      z-index: 2;
+    }}
+    
+    .history-marker {{
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: var(--panel);
+      border: 2px solid var(--border);
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    
+    .history-item.status-assigned .history-marker {{ border-color: #3b82f6; background: #eff6ff; }}
+    .history-item.status-completed .history-marker {{ border-color: #22c55e; background: #f0fdf4; }}
+    .history-item.status-failed .history-marker {{ border-color: #ef4444; background: #fef2f2; }}
+    
+    .history-content {{
+      background: #fafafa;
+      border: 1px solid var(--border);
+      padding: 12px 16px;
+      border-radius: 8px;
+      flex: 1;
+    }}
+    
+    .history-header {{
       display: flex;
       justify-content: space-between;
-      gap: 12px;
+      align-items: center;
       margin-bottom: 8px;
-      font-size: 0.82rem;
-      color: var(--muted);
     }}
-    .history-card strong {{
+    
+    .history-header strong {{ font-size: 14px; text-transform: capitalize; padding:0; background:transparent; border:none; }}
+    .history-time {{ font-size: 12px; color: var(--muted); }}
+    
+    .history-meta {{
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }}
+    
+    .history-reason {{
+      font-size: 13px;
       color: var(--ink);
-      font-size: 0.92rem;
+      font-style: italic;
     }}
-    .empty {{
+
+    .empty-state {{
+      padding: 40px 20px;
+      text-align: center;
       color: var(--muted);
-      padding: 18px 22px 24px;
+      font-size: 14px;
     }}
+
     @media (max-width: 1024px) {{
-      .hero, .content, .metrics, .controls {{
-        grid-template-columns: 1fr;
-      }}
-      .shell {{
-        padding: 16px;
-      }}
+      .content-grid {{ grid-template-columns: 1fr; }}
+      .detail-grid {{ grid-template-columns: 1fr; }}
+      .header-meta {{ display: none; }}
     }}
   </style>
 </head>
 <body>
-  <div class="shell">
-    <section class="hero">
-      <div class="panel hero-copy">
-        <p class="eyebrow">Expressways</p>
-        <h1>Local orchestration dashboard</h1>
-        <p class="lede">A small browser surface for queue health, scheduler rationale, and task lifecycle history, backed by the persisted orchestrator state and broker event log.</p>
+  
+  <header class="header">
+    <div class="container header-content">
+      <div class="brand">
+        <div class="brand-icon">E</div>
+        <h1>Expressways</h1>
       </div>
-      <aside class="panel hero-meta">
-        <div>
-          <strong>State path</strong>
-          <code>{state_path}</code>
+      <div class="header-meta">
+        <div class="meta-item">
+          <span class="meta-label">State path</span>
+          <span class="meta-value" title="{state_path}">{state_path}</span>
         </div>
-        <div>
-          <strong>Refresh</strong>
-          <span id="last-updated">waiting for first poll</span>
+        <div class="meta-item">
+          <span class="meta-label">Refresh</span>
+          <span class="meta-value" id="last-updated">waiting...</span>
         </div>
-        <div>
-          <strong>Selected task</strong>
-          <span id="selected-task-label">none</span>
-        </div>
-      </aside>
-    </section>
+      </div>
+    </div>
+  </header>
 
-    <section class="panel controls">
-      <label>Status
-        <select id="status-filter">
+  <main class="container">
+    
+    <div class="metrics-grid" id="metrics">
+      <!-- Metics inject here -->
+    </div>
+
+    <div class="filters">
+      <div class="filter-group">
+        <label>Status</label>
+        <select id="status-filter" class="filter-control">
           <option value="">Any</option>
           <option value="pending">Pending</option>
           <option value="assigned">Assigned</option>
@@ -2395,40 +2589,42 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
           <option value="exhausted">Exhausted</option>
           <option value="canceled">Canceled</option>
         </select>
-      </label>
-      <label>Skill
-        <input id="skill-filter" placeholder="summarize">
-      </label>
-      <label>Agent
-        <input id="agent-filter" placeholder="agent id">
-      </label>
-      <label>Sort
-        <select id="sort-filter">
+      </div>
+      <div class="filter-group">
+        <label>Skill</label>
+        <input id="skill-filter" class="filter-control" placeholder="e.g. summarize">
+      </div>
+      <div class="filter-group">
+        <label>Agent</label>
+        <input id="agent-filter" class="filter-control" placeholder="agent id">
+      </div>
+      <div class="filter-group small">
+        <label>Sort</label>
+        <select id="sort-filter" class="filter-control">
           <option value="priority">Priority</option>
           <option value="offset">Offset</option>
           <option value="age">Age</option>
           <option value="retries">Retries</option>
         </select>
-      </label>
-      <label>Limit
-        <input id="limit-filter" type="number" min="1" value="25">
-      </label>
-      <button id="refresh-button" type="button">Refresh now</button>
-    </section>
+      </div>
+      <div class="filter-group small">
+        <label>Limit</label>
+        <input id="limit-filter" class="filter-control" type="number" min="1" value="25">
+      </div>
+      <button id="refresh-button" class="btn-primary" type="button">Refresh Data</button>
+    </div>
 
-    <section class="metrics" id="metrics"></section>
-
-    <section class="content">
+    <div class="content-grid">
       <div class="panel">
-        <div class="panel-head">
-          <h2>Queue</h2>
-          <span id="queue-summary">0 tasks</span>
+        <div class="panel-header">
+          <h2>Task Queue</h2>
+          <span class="badge" id="queue-summary">0 tasks</span>
         </div>
-        <div style="overflow:auto;">
+        <div class="table-container">
           <table>
             <thead>
               <tr>
-                <th>Task</th>
+                <th>Task ID</th>
                 <th>Status</th>
                 <th>Priority</th>
                 <th>Attempts</th>
@@ -2439,23 +2635,25 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
             <tbody id="tasks-body"></tbody>
           </table>
         </div>
-        <div class="empty" id="tasks-empty" hidden>No tasks match the current filter.</div>
+        <div class="empty-state" id="tasks-empty" hidden>
+          No tasks match the current active filters.
+        </div>
       </div>
 
       <div class="panel">
-        <div class="panel-head">
-          <h2>Task detail</h2>
-          <span id="detail-summary">select a task</span>
+        <div class="panel-header">
+          <h2>Task Detail</h2>
+          <span class="badge" id="detail-summary">Select a task</span>
         </div>
-        <div class="detail" id="detail"></div>
-        <div class="panel-head">
-          <h2>History</h2>
-          <span>Latest lifecycle events</span>
+        <div id="detail" class="detail-section"></div>
+        
+        <div class="panel-header" style="border-top: 1px solid var(--border);">
+          <h2>Lifecycle History</h2>
         </div>
-        <div class="history" id="history"></div>
+        <div id="history" class="history-section"></div>
       </div>
-    </section>
-  </div>
+    </div>
+  </main>
 
   <script>
     const state = {{
@@ -2480,13 +2678,13 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
     }}
 
     async function fetchJson(path) {{
-      const response = await fetch(path, {{ cache: "no-store" }});
+      const response = await fetch(path, {{ cache: "no-store", headers: {{ "Accept": "application/json" }} }});
       if (!response.ok) {{
         let message = `request failed (${{response.status}})`;
         try {{
           const payload = await response.json();
           message = payload.error || message;
-        }} catch (_error) {{}}
+        }} catch (_e) {{}}
         throw new Error(message);
       }}
       return response.json();
@@ -2496,6 +2694,11 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
       if (!value) return "n/a";
       return new Date(value).toLocaleString();
     }}
+    
+    function formatTime(value) {{
+      if (!value) return "";
+      return new Date(value).toLocaleTimeString();
+    }}
 
     function escapeHtml(value) {{
       return String(value ?? "")
@@ -2504,97 +2707,137 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;");
     }}
+    
+    function getStatusClass(status) {{
+      const s = String(status || "").toLowerCase();
+      if (['completed'].includes(s)) return 'status-completed';
+      if (['failed', 'exhausted', 'canceled'].includes(s)) return 'status-failed';
+      if (['pending'].includes(s)) return 'status-pending';
+      if (['assigned'].includes(s)) return 'status-assigned';
+      if (['retry_scheduled', 'timed_out'].includes(s)) return 'status-retry_scheduled';
+      return 'status-pending';
+    }}
 
     function renderMetrics(metrics) {{
       const cards = [
-        ["Agents", metrics.agent_count, `${{metrics.pending_task_event_acks}} pending event acks`],
-        ["Tasks", metrics.task_count, `cursor ${{metrics.task_offset}} / events ${{metrics.task_event_offset}}`],
-        ["Assigned", metrics.tasks.assigned, metrics.tasks.oldest_in_flight_age_seconds == null ? "no in-flight lease" : `oldest lease ${{metrics.tasks.oldest_in_flight_age_seconds}}s`],
-        ["Completed", metrics.tasks.completed, `${{metrics.tasks.retry_count}} retries observed`],
-        ["Pressure", metrics.tasks.retry_scheduled + metrics.tasks.timed_out + metrics.tasks.exhausted, `${{metrics.tasks.retry_scheduled}} retrying / ${{metrics.tasks.exhausted}} exhausted`],
+        ["Agents Connected", metrics.agent_count, `${{metrics.pending_task_event_acks}} pending acks`],
+        ["Tasks Evaluated", metrics.task_count, `Offset ${{metrics.task_offset}}`],
+        ["In-flight Assigned", metrics.tasks.assigned, metrics.tasks.oldest_in_flight_age_seconds == null ? "None" : `Oldest: ${{metrics.tasks.oldest_in_flight_age_seconds}}s`],
+        ["Completed", metrics.tasks.completed, `${{metrics.tasks.retry_count}} total retries`],
+        ["Pressure", metrics.tasks.retry_scheduled + metrics.tasks.timed_out + metrics.tasks.exhausted, `Retrying: ${{metrics.tasks.retry_scheduled}}`],
       ];
+      
       document.getElementById("metrics").innerHTML = cards.map(([label, value, hint]) => `
-        <article class="panel metric-card">
-          <div class="label">${{label}}</div>
-          <div class="value">${{value}}</div>
-          <div class="hint">${{hint}}</div>
-        </article>
+        <div class="panel metric-card">
+          <div class="metric-label">${{escapeHtml(label)}}</div>
+          <div class="metric-value">${{value}}</div>
+          <div class="metric-hint">${{escapeHtml(hint)}}</div>
+        </div>
       `).join("");
     }}
 
     function renderTasks(tasks) {{
       const tbody = document.getElementById("tasks-body");
       const empty = document.getElementById("tasks-empty");
-      document.getElementById("queue-summary").textContent = `${{tasks.length}} task${{tasks.length === 1 ? "" : "s"}}`;
+      document.getElementById("queue-summary").textContent = `${{tasks.length}} / ${{limitFilter.value}}`;
       empty.hidden = tasks.length !== 0;
 
       if (!state.selectedTaskId || !tasks.some((task) => task.task_id === state.selectedTaskId)) {{
         state.selectedTaskId = tasks[0]?.task_id || null;
       }}
-      document.getElementById("selected-task-label").textContent = state.selectedTaskId || "none";
 
       tbody.innerHTML = tasks.map((task) => `
         <tr data-task-id="${{escapeHtml(task.task_id)}}" class="${{task.task_id === state.selectedTaskId ? "active" : ""}}">
-          <td><strong>${{escapeHtml(task.task_id)}}</strong><br><span style="color:var(--muted)">${{escapeHtml(task.task_type)}}</span></td>
-          <td><span class="status">${{escapeHtml(task.status)}}</span></td>
+          <td class="task-id-cell">
+            <strong>${{escapeHtml(task.task_id)}}</strong>
+            <span>${{escapeHtml(task.task_type)}}</span>
+          </td>
+          <td><span class="status-badge ${{getStatusClass(task.status)}}">${{escapeHtml(task.status)}}</span></td>
           <td>${{task.priority}}</td>
           <td>${{task.attempts}} / ${{task.max_attempts}}</td>
-          <td>${{escapeHtml(task.active_agent_id || "-")}}</td>
-          <td>${{escapeHtml(task.last_assignment_reason || "-")}}</td>
+          <td><span style="font-family: var(--font-mono); font-size: 13px;">${{escapeHtml(task.active_agent_id || "-")}}</span></td>
+          <td style="color: var(--muted); font-size: 13px;">${{escapeHtml(task.last_assignment_reason || "-")}}</td>
         </tr>
       `).join("");
 
       for (const row of tbody.querySelectorAll("tr")) {{
         row.addEventListener("click", () => {{
+          document.querySelectorAll("#tasks-body tr").forEach(r => r.classList.remove("active"));
+          row.classList.add("active");
           state.selectedTaskId = row.dataset.taskId;
           refreshDetail().catch(renderError);
-          renderTasks(tasks);
         }});
       }}
     }}
 
     function renderDetail(task) {{
-      document.getElementById("detail-summary").textContent = task ? `${{task.status}} · priority ${{task.priority}}` : "select a task";
+      const summary = document.getElementById("detail-summary");
+      const host = document.getElementById("detail");
+      
       if (!task) {{
-        document.getElementById("detail").innerHTML = '<div class="empty">Pick a task from the queue to inspect its payload, current lease, and retry state.</div>';
+        summary.textContent = "No Selection";
+        host.innerHTML = '<div class="empty-state">Select a task from the queue to view its payload and status.</div>';
         return;
       }}
 
-      document.getElementById("detail").innerHTML = `
+      summary.textContent = `Priority ${{task.priority}}`;
+      
+      host.innerHTML = `
         <div class="detail-grid">
-          <div class="detail-item"><strong>Task</strong>${{escapeHtml(task.task_id)}} · ${{escapeHtml(task.task_type)}}</div>
-          <div class="detail-item"><strong>Lease</strong>${{escapeHtml(task.active_assignment?.agent_id || "-")}}${{task.active_assignment_age_seconds == null ? "" : ` · ${{task.active_assignment_age_seconds}}s old`}}</div>
-          <div class="detail-item"><strong>Scheduler reason</strong>${{escapeHtml(task.last_assignment_reason || "-")}}</div>
-          <div class="detail-item"><strong>Failure state</strong>${{escapeHtml(task.last_error || "-")}}</div>
+          <div class="detail-item">
+            <strong>Task Context</strong>
+            <span>${{escapeHtml(task.task_type)}}</span>
+          </div>
+          <div class="detail-item">
+            <strong>Lease Agent</strong>
+            <span>${{escapeHtml(task.active_assignment?.agent_id || "None")}}</span>
+          </div>
+          <div class="detail-item">
+            <strong>Assignment Reason</strong>
+            <span>${{escapeHtml(task.last_assignment_reason || "None")}}</span>
+          </div>
+          <div class="detail-item">
+            <strong>Failure State</strong>
+            <span style="color: ${{task.last_error ? 'var(--error)' : 'inherit'}}">${{escapeHtml(task.last_error || "Clean")}}</span>
+          </div>
         </div>
-        <pre class="detail-pre">${{escapeHtml(JSON.stringify(task.payload, null, 2))}}</pre>
+        <strong>Payload</strong>
+        <div class="payload-block" style="margin-top: 8px;">${{escapeHtml(JSON.stringify(task.payload, null, 2))}}</div>
       `;
     }}
 
     function renderHistory(history) {{
       const host = document.getElementById("history");
       if (!history || !history.events || history.events.length === 0) {{
-        host.innerHTML = '<div class="empty">No lifecycle events yet for the selected task.</div>';
+        host.innerHTML = '<div class="empty-state">No lifecycle events recorded for this task yet.</div>';
         return;
       }}
 
       host.innerHTML = `<div class="history-list">${{history.events.map((entry) => `
-        <article class="history-card">
-          <header>
-            <span>#${{entry.offset}} · ${{formatDate(entry.timestamp)}}</span>
-            <span>${{escapeHtml(entry.producer)}}</span>
-          </header>
-          <strong>${{escapeHtml(entry.event.status)}}</strong>
-          <div style="margin-top:8px;color:var(--muted);font-size:0.9rem;">
-            agent=${{escapeHtml(entry.event.agent_id || "-")}} · attempt=${{entry.event.attempt}} · assignment=${{escapeHtml(entry.event.assignment_id || "-")}}
+        <div class="history-item ${{getStatusClass(entry.event.status)}}">
+          <div class="history-marker"></div>
+          <div class="history-content">
+            <div class="history-header">
+              <strong class="${{getStatusClass(entry.event.status)}}">${{escapeHtml(entry.event.status)}}</strong>
+              <span class="history-time">${{formatDate(entry.timestamp)}}</span>
+            </div>
+            <div class="history-meta">
+              Agent: ${{(escapeHtml(entry.event.agent_id) || "<em>none</em>")}} | 
+              Attempt: ${{entry.event.attempt}} | 
+              Offset: ${{entry.offset}}
+            </div>
+            ${{entry.event.reason ? `<div class="history-reason">${{escapeHtml(entry.event.reason)}}</div>` : ''}}
           </div>
-          <div style="margin-top:10px;">${{escapeHtml(entry.event.reason || "-")}}</div>
-        </article>
+        </div>
       `).join("")}}</div>`;
     }}
 
     function renderError(error) {{
-      document.getElementById("detail").innerHTML = `<div class="empty">${{escapeHtml(error.message || String(error))}}</div>`;
+      console.error(error);
+      const detail = document.getElementById("detail");
+      if (detail) {{
+         detail.innerHTML = `<div class="empty-state" style="color:var(--error);">Failed to load data: ${{escapeHtml(error.message)}}</div>`;
+      }}
     }}
 
     async function refreshDetail() {{
@@ -2605,7 +2848,7 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
       }}
       const [detail, history] = await Promise.all([
         fetchJson(`/api/tasks/${{encodeURIComponent(state.selectedTaskId)}}`),
-        fetchJson(`/api/tasks/${{encodeURIComponent(state.selectedTaskId)}}/history?limit=8`)
+        fetchJson(`/api/tasks/${{encodeURIComponent(state.selectedTaskId)}}/history?limit=10`)
       ]);
       renderDetail(detail);
       renderHistory(history);
@@ -2620,7 +2863,7 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
       renderMetrics(metrics);
       renderTasks(tasks);
       await refreshDetail();
-      document.getElementById("last-updated").textContent = new Date().toLocaleTimeString();
+      document.getElementById("last-updated").textContent = formatTime(new Date());
     }}
 
     document.getElementById("refresh-button").addEventListener("click", () => {{
@@ -2638,7 +2881,7 @@ fn render_dashboard_html(state_path: &std::path::Path) -> String {
   </script>
 </body>
 </html>
-"#
+"##
     )
 }
 
@@ -3102,11 +3345,13 @@ mod tests {
     #[test]
     fn render_dashboard_html_mentions_api_surfaces() {
         let html = render_dashboard_html(Path::new("./var/orchestrator/state.json"));
-        assert!(html.contains("Local orchestration dashboard"));
+        assert!(html.contains("Expressways Dashboard"));
         assert!(html.contains("/api/metrics"));
         assert!(html.contains("/api/tasks"));
         assert!(
-            html.contains("/api/tasks/${encodeURIComponent(state.selectedTaskId)}/history?limit=8")
+            html.contains(
+                "/api/tasks/${encodeURIComponent(state.selectedTaskId)}/history?limit=10"
+            )
         );
     }
 

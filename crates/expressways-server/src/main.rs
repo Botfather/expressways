@@ -2645,7 +2645,7 @@ mod tests {
         Action, AgentEndpoint, AgentQuery, AgentRegistration, CapabilityClaims, CapabilityScope,
         Classification, ControlCommand, ControlRequest, ControlResponse, RegistryEventKind,
         RetentionClass, StoredMessage, StreamFrame, TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent,
-        TaskRequirements, TaskRetryPolicy, TaskStatus, TaskWorkItem, TopicSpec,
+        TaskPayload, TaskRequirements, TaskRetryPolicy, TaskStatus, TaskWorkItem, TopicSpec,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
@@ -2964,11 +2964,11 @@ mod tests {
                 preferred_agents: Vec::new(),
                 avoid_agents: Vec::new(),
             },
-            payload: json!({
+            payload: TaskPayload::json(json!({
                 "path": path,
                 "max_summary_lines": max_summary_lines,
                 "simulate_delay_ms": simulate_delay_ms,
-            }),
+            })),
             retry_policy,
             submitted_at: Utc::now(),
         }

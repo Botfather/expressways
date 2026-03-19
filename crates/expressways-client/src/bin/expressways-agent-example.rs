@@ -266,7 +266,8 @@ async fn handle_summarize_document(
     output_dir: PathBuf,
     context: TaskExecutionContext,
 ) -> Result<(), String> {
-    let payload: SummarizeDocumentPayload = serde_json::from_value(assignment.task.payload.clone())
+    let payload: SummarizeDocumentPayload = assignment
+        .decode_payload_json()
         .map_err(|error| format!("invalid summarize_document payload: {error}"))?;
     abort_if_cancelled(&context)?;
 

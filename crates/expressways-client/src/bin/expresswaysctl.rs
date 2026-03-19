@@ -10,8 +10,8 @@ use expressways_client::{Client, Endpoint};
 use expressways_protocol::{
     Action, AgentEndpoint, AgentQuery, AgentRegistration, AgentSchemaRef, CapabilityClaims,
     CapabilityScope, Classification, ControlCommand, ControlRequest, ControlResponse,
-    RetentionClass, StreamFrame, TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent, TaskRequirements,
-    TaskRetryPolicy, TaskStatus, TaskWorkItem, TopicSpec,
+    RetentionClass, StreamFrame, TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent, TaskPayload,
+    TaskRequirements, TaskRetryPolicy, TaskStatus, TaskWorkItem, TopicSpec,
 };
 use uuid::Uuid;
 
@@ -242,8 +242,20 @@ enum Command {
         avoid_agents: Vec<String>,
         #[arg(long, default_value_t = 0)]
         priority: i32,
-        #[arg(long, default_value = "null")]
-        payload_json: String,
+        #[arg(long)]
+        payload_json: Option<String>,
+        #[arg(long)]
+        payload_text: Option<String>,
+        #[arg(long)]
+        payload_file: Option<PathBuf>,
+        #[arg(long)]
+        payload_base64: Option<String>,
+        #[arg(long)]
+        payload_inline: bool,
+        #[arg(long)]
+        payload_content_type: Option<String>,
+        #[arg(long)]
+        payload_sha256: Option<String>,
         #[arg(long, default_value_t = 3)]
         max_attempts: u32,
         #[arg(long, default_value_t = 300)]
@@ -710,6 +722,12 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
             avoid_agents,
             priority,
             payload_json,
+            payload_text,
+            payload_file,
+            payload_base64,
+            payload_inline,
+            payload_content_type,
+            payload_sha256,
             max_attempts,
             timeout_seconds,
             retry_delay_seconds,
@@ -730,8 +748,15 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
                         preferred_agents,
                         avoid_agents,
                     },
-                    payload: serde_json::from_str(&payload_json)
-                        .context("failed to parse --payload-json as JSON")?,
+                    payload: build_submit_task_payload(
+                        payload_json,
+                        payload_text,
+                        payload_file,
+                        payload_base64,
+                        payload_inline,
+                        payload_content_type,
+                        payload_sha256,
+                    )?,
                     retry_policy: TaskRetryPolicy {
                         max_attempts,
                         timeout_seconds,
@@ -845,6 +870,82 @@ fn parse_schema(value: &str) -> Result<AgentSchemaRef, String> {
     })
 }
 
+fn build_submit_task_payload(
+    payload_json: Option<String>,
+    payload_text: Option<String>,
+    payload_file: Option<PathBuf>,
+    payload_base64: Option<String>,
+    payload_inline: bool,
+    payload_content_type: Option<String>,
+    payload_sha256: Option<String>,
+) -> anyhow::Result<TaskPayload> {
+    let supplied_sources = [
+        payload_json.is_some(),
+        payload_text.is_some(),
+        payload_file.is_some(),
+        payload_base64.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+
+    if supplied_sources > 1 {
+        bail!(
+            "submit-task accepts only one payload source: choose one of --payload-json, --payload-text, --payload-file, or --payload-base64"
+        );
+    }
+    if payload_inline && payload_file.is_none() {
+        bail!("--payload-inline can only be used together with --payload-file");
+    }
+    if payload_sha256.is_some() && payload_file.is_none() {
+        bail!("--payload-sha256 can only be used together with --payload-file");
+    }
+
+    if let Some(payload_json) = payload_json {
+        return Ok(TaskPayload::json(
+            serde_json::from_str(&payload_json)
+                .context("failed to parse --payload-json as JSON")?,
+        ));
+    }
+    if let Some(payload_text) = payload_text {
+        return Ok(TaskPayload::text(
+            payload_text,
+            payload_content_type.unwrap_or_else(|| "text/plain; charset=utf-8".to_owned()),
+        ));
+    }
+    if let Some(payload_base64) = payload_base64 {
+        return Ok(TaskPayload::bytes_base64(
+            payload_base64,
+            payload_content_type.unwrap_or_else(|| "application/octet-stream".to_owned()),
+            None,
+        ));
+    }
+    if let Some(payload_file) = payload_file {
+        let metadata = fs::metadata(&payload_file).with_context(|| {
+            format!("failed to inspect payload file {}", payload_file.display())
+        })?;
+
+        if payload_inline {
+            let bytes = fs::read(&payload_file).with_context(|| {
+                format!("failed to read payload file {}", payload_file.display())
+            })?;
+            return Ok(TaskPayload::bytes(
+                &bytes,
+                payload_content_type.unwrap_or_else(|| "application/octet-stream".to_owned()),
+            ));
+        }
+
+        return Ok(TaskPayload::file_ref(
+            payload_file.display().to_string(),
+            payload_content_type,
+            Some(metadata.len()),
+            payload_sha256,
+        ));
+    }
+
+    Ok(TaskPayload::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,7 +966,13 @@ mod tests {
             preferred_agents: vec!["alpha".to_owned(), "beta".to_owned()],
             avoid_agents: vec!["gamma".to_owned()],
             priority: 25,
-            payload_json: "{\"path\":\"notes.md\"}".to_owned(),
+            payload_json: Some("{\"path\":\"notes.md\"}".to_owned()),
+            payload_text: None,
+            payload_file: None,
+            payload_base64: None,
+            payload_inline: false,
+            payload_content_type: None,
+            payload_sha256: None,
             max_attempts: 4,
             timeout_seconds: 90,
             retry_delay_seconds: 12,
@@ -896,9 +1003,61 @@ mod tests {
                 assert_eq!(task.retry_policy.max_attempts, 4);
                 assert_eq!(task.retry_policy.timeout_seconds, 90);
                 assert_eq!(task.retry_policy.retry_delay_seconds, 12);
+                assert_eq!(
+                    task.payload,
+                    TaskPayload::json(serde_json::json!({ "path": "notes.md" }))
+                );
             }
             other => panic!("expected publish request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn submit_task_builds_inline_binary_payloads() {
+        let path = std::env::temp_dir().join(format!("expressways-task-{}.bin", Uuid::now_v7()));
+        fs::write(&path, b"PNG").expect("write payload file");
+
+        let request = request_from_command(Command::SubmitTask {
+            token: TokenArgs {
+                token: Some("signed-token".to_owned()),
+                token_file: None,
+            },
+            topic: TASKS_TOPIC.to_owned(),
+            task_id: Some("task-image".to_owned()),
+            task_type: "classify_image".to_owned(),
+            skill: Some("vision".to_owned()),
+            requires_topic: None,
+            principal: None,
+            preferred_agents: Vec::new(),
+            avoid_agents: Vec::new(),
+            priority: 0,
+            payload_json: None,
+            payload_text: None,
+            payload_file: Some(path.clone()),
+            payload_base64: None,
+            payload_inline: true,
+            payload_content_type: Some("image/png".to_owned()),
+            payload_sha256: None,
+            max_attempts: 3,
+            timeout_seconds: 300,
+            retry_delay_seconds: 5,
+            classification: None,
+        })
+        .expect("request");
+
+        match request.command {
+            ControlCommand::Publish { payload, .. } => {
+                let task: TaskWorkItem = serde_json::from_str(&payload).expect("parse task");
+                assert_eq!(
+                    task.payload.decode_inline_bytes().expect("decode bytes"),
+                    Some(b"PNG".to_vec())
+                );
+                assert_eq!(task.payload.content_type(), Some("image/png"));
+            }
+            other => panic!("expected publish request, got {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

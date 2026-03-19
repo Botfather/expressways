@@ -9,10 +9,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use expressways_protocol::{
     Classification, ControlCommand, ControlRequest, ControlResponse, StoredMessage, StreamFrame,
-    TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent, TaskStatus, TaskWorkItem,
+    TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent, TaskPayload, TaskStatus, TaskWorkItem,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -103,6 +103,105 @@ pub struct AssignedTask {
     pub task: TaskWorkItem,
 }
 
+impl AssignedTask {
+    pub fn payload_kind(&self) -> &'static str {
+        self.task.payload.kind()
+    }
+
+    pub fn payload_content_type(&self) -> Option<&str> {
+        self.task.payload.content_type()
+    }
+
+    pub fn payload_json_value(&self) -> Option<&serde_json::Value> {
+        self.task.payload.json_value()
+    }
+
+    pub fn decode_payload_json<T>(&self) -> Result<T, PayloadAccessError>
+    where
+        T: DeserializeOwned,
+    {
+        let value = self
+            .task
+            .payload
+            .json_value()
+            .cloned()
+            .ok_or_else(|| self.unexpected_payload_kind("json"))?;
+        serde_json::from_value(value).map_err(|source| PayloadAccessError::InvalidJson {
+            task_id: self.task.task_id.clone(),
+            source,
+        })
+    }
+
+    pub fn payload_text(&self) -> Option<&str> {
+        match &self.task.payload {
+            TaskPayload::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn payload_file_ref(&self) -> Option<TaskFileRef> {
+        match &self.task.payload {
+            TaskPayload::FileRef {
+                path,
+                content_type,
+                byte_length,
+                sha256,
+            } => Some(TaskFileRef {
+                path: PathBuf::from(path),
+                content_type: content_type.clone(),
+                byte_length: *byte_length,
+                sha256: sha256.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn decode_inline_bytes(&self) -> Result<Option<Vec<u8>>, PayloadAccessError> {
+        self.task.payload.decode_inline_bytes().map_err(|detail| {
+            PayloadAccessError::InvalidInlineBytes {
+                task_id: self.task.task_id.clone(),
+                detail,
+            }
+        })
+    }
+
+    pub async fn read_payload_bytes(&self) -> Result<Vec<u8>, PayloadAccessError> {
+        if let Some(bytes) = self.decode_inline_bytes()? {
+            return Ok(bytes);
+        }
+        if let Some(file_ref) = self.payload_file_ref() {
+            return tokio::fs::read(&file_ref.path).await.map_err(|source| {
+                PayloadAccessError::Io {
+                    task_id: self.task.task_id.clone(),
+                    path: file_ref.path,
+                    source,
+                }
+            });
+        }
+        if let Some(text) = self.payload_text() {
+            return Ok(text.as_bytes().to_vec());
+        }
+
+        Err(self.unexpected_payload_kind("text, bytes, or file_ref"))
+    }
+
+    fn unexpected_payload_kind(&self, expected: &'static str) -> PayloadAccessError {
+        PayloadAccessError::UnexpectedKind {
+            task_id: self.task.task_id.clone(),
+            expected,
+            actual: self.task.payload.kind(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskFileRef {
+    pub path: PathBuf,
+    pub content_type: Option<String>,
+    pub byte_length: Option<u64>,
+    pub sha256: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskExecutionContext {
     cancellation: CancellationToken,
@@ -135,6 +234,31 @@ pub enum WorkerRunOutcome {
         assignment_id: Option<Uuid>,
         status: TaskStatus,
         reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum PayloadAccessError {
+    #[error("task `{task_id}` expected a {expected} payload, got `{actual}`")]
+    UnexpectedKind {
+        task_id: String,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    #[error("task `{task_id}` has invalid inline bytes payload: {detail}")]
+    InvalidInlineBytes { task_id: String, detail: String },
+    #[error("failed to decode JSON payload for task `{task_id}`: {source}")]
+    InvalidJson {
+        task_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to read file-backed payload for task `{task_id}` from {path}: {source}")]
+    Io {
+        task_id: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -975,7 +1099,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use expressways_protocol::TaskRequirements;
+    use expressways_protocol::{TaskPayload, TaskRequirements};
 
     #[tokio::test]
     async fn agent_worker_runs_assignment_and_publishes_completion() {
@@ -1357,6 +1481,70 @@ mod tests {
         assert!(worker.state().pending_report.is_none());
     }
 
+    #[test]
+    fn assigned_task_helpers_decode_json_and_metadata() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct DemoPayload {
+            path: String,
+        }
+
+        let mut task = task_work_item("task-1");
+        task.payload = TaskPayload::json(serde_json::json!({ "path": "notes.md" }));
+        let assigned = assigned_task(task);
+
+        assert_eq!(assigned.payload_kind(), "json");
+        assert_eq!(assigned.payload_content_type(), Some("application/json"));
+        assert_eq!(
+            assigned
+                .decode_payload_json::<DemoPayload>()
+                .expect("json payload"),
+            DemoPayload {
+                path: "notes.md".to_owned()
+            }
+        );
+        assert!(assigned.payload_text().is_none());
+        assert!(assigned.payload_file_ref().is_none());
+    }
+
+    #[tokio::test]
+    async fn assigned_task_helpers_read_inline_and_file_payload_bytes() {
+        let mut inline_task = task_work_item("task-inline");
+        inline_task.payload = TaskPayload::bytes(b"PNG", "image/png");
+        let inline_assigned = assigned_task(inline_task);
+        assert_eq!(
+            inline_assigned.decode_inline_bytes().expect("inline bytes"),
+            Some(b"PNG".to_vec())
+        );
+        assert_eq!(
+            inline_assigned
+                .read_payload_bytes()
+                .await
+                .expect("read inline"),
+            b"PNG".to_vec()
+        );
+
+        let path = std::env::temp_dir().join(format!("expressways-payload-{}.bin", Uuid::now_v7()));
+        std::fs::write(&path, b"PDF").expect("write payload file");
+        let mut file_task = task_work_item("task-file");
+        file_task.payload = TaskPayload::file_ref(
+            path.display().to_string(),
+            Some("application/pdf".to_owned()),
+            Some(3),
+            Some("abc123".to_owned()),
+        );
+        let file_assigned = assigned_task(file_task);
+
+        let file_ref = file_assigned.payload_file_ref().expect("file ref");
+        assert_eq!(file_ref.path, path);
+        assert_eq!(file_ref.content_type.as_deref(), Some("application/pdf"));
+        assert_eq!(
+            file_assigned.read_payload_bytes().await.expect("read file"),
+            b"PDF".to_vec()
+        );
+
+        let _ = std::fs::remove_file(file_ref.path);
+    }
+
     fn expect_consume(
         topic: &str,
         offset: u64,
@@ -1445,9 +1633,31 @@ mod tests {
                 preferred_agents: Vec::new(),
                 avoid_agents: Vec::new(),
             },
-            payload: serde_json::json!({ "path": "notes.md" }),
+            payload: TaskPayload::json(serde_json::json!({ "path": "notes.md" })),
             retry_policy: Default::default(),
             submitted_at: Utc::now(),
+        }
+    }
+
+    fn assigned_task(task: TaskWorkItem) -> AssignedTask {
+        AssignedTask {
+            assignment: TaskEvent {
+                event_id: Uuid::now_v7(),
+                task_id: task.task_id.clone(),
+                task_offset: Some(4),
+                assignment_id: Some(Uuid::now_v7()),
+                agent_id: Some("alpha".to_owned()),
+                status: TaskStatus::Assigned,
+                attempt: 1,
+                reason: None,
+                emitted_at: Utc::now(),
+            },
+            task_message: stored_message(
+                TASKS_TOPIC,
+                4,
+                serde_json::to_string(&task).expect("serialize task"),
+            ),
+            task,
         }
     }
 
