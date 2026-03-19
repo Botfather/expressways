@@ -550,11 +550,11 @@ That means if you build with a subset of adopter features, you should update `ad
 - `crates/expressways-audit`: audit sink, hash chaining, verification, and export helpers.
 - `crates/expressways-storage`: segmented storage, indexes, retention enforcement, disk-pressure controls, and recovery.
 - `crates/expressways-server`: broker runtime, request handling, registry, resilience, adopters, and stream handling.
-- `crates/expressways-client`: SDK plus `expresswaysctl` CLI.
+- `crates/expressways-client`: SDK, `expresswaysctl` CLI, and an `AgentWorker` helper for task-executing agents.
 
 ### Optional operational crates
 
-- `crates/expressways-orchestrator`: event-driven supervisor and assignment tooling built on top of the broker.
+- `crates/expressways-orchestrator`: task-driven supervisor and lifecycle tooling built on top of the broker.
 - `crates/expressways-bench`: benchmark harness for transport, storage, and watch paths.
 
 ### Adopter crates
@@ -703,9 +703,30 @@ cargo run -p expressways-client --bin expresswaysctl -- export-audit --path ./va
 ### Example: Run the orchestrator
 
 ```bash
-cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 supervise --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json
-cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 assign --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --skill summarize
+cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 supervise --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --tasks-topic tasks --task-events-topic task_events
+cargo run -p expressways-orchestrator -- show-metrics --state-path ./var/orchestrator/state.json
+cargo run -p expressways-orchestrator -- list-tasks --state-path ./var/orchestrator/state.json --status assigned
+cargo run -p expressways-orchestrator -- show-task --state-path ./var/orchestrator/state.json --task-id task-1
+cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 show-task-history --token-file ./var/auth/developer.token --task-id task-1 --limit 10
+cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 tail-task-events --token-file ./var/auth/developer.token --task-id task-1 --offset 0 --limit 5
+cargo run -p expressways-orchestrator -- requeue-task --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --task-id task-1 --reason "operator requested reroute"
+cargo run -p expressways-orchestrator -- cancel-task --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --task-id task-1 --reason "operator canceled obsolete work"
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 submit-task --token-file ./var/auth/developer.token --task-id task-1 --task-type summarize_document --skill summarize --priority 50 --preferred-agent summarizer --avoid-agent fallback --payload-json '{"path":"notes.md"}'
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 consume --token-file ./var/auth/developer.token --topic task_events --offset 0 --limit 20
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 report-task --token-file ./var/auth/developer.token --task-id task-1 --assignment-id <assignment-id> --agent-id summarizer --status completed --attempt 1
 ```
+
+This loop lets the supervisor consume `tasks`, emit audited `assigned` records to `task_events`, and then close the task when an agent reports `completed` or `failed`. The same topic also carries orchestrator-published `timed_out`, `retry_scheduled`, `exhausted`, and `canceled` lifecycle events. `show-metrics` summarizes the persisted orchestrator state with per-status counts, total retries, and oldest in-flight assignment age, while `list-tasks` and `show-task` let operators inspect which specific task is active, retrying, or stuck. Both `list-tasks` and `show-task` now include the latest assignment rationale from the scheduler, and `show-task-history` reads the broker-backed `task_events` timeline for one task if you want the raw lifecycle log. `tail-task-events` streams line-delimited JSON events for live debugging. `submit-task` now accepts scheduler hints such as `--priority`, repeated `--preferred-agent`, and repeated `--avoid-agent`, and the orchestrator uses those hints alongside current in-flight load to choose the best eligible agent. Each orchestrator-generated `assigned` event now also includes a human-readable scheduler reason so operators can see why that agent won. `requeue-task` and `cancel-task` publish audited control events instead of mutating local state silently, and cancellation-aware workers can observe those events before they emit a stale completion.
+
+### Example: Run the sample task agent
+
+```bash
+cargo run -p expressways-client --bin expressways-agent-example -- --transport tcp --address 127.0.0.1:7766 --token-file ./var/auth/developer.token --agent-id summarizer --display-name "Summarizer" --summary "Example document summarizer" --state-path ./var/agent/summarizer.state.json --output-dir ./var/agent/results
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 submit-task --token-file ./var/auth/developer.token --task-id task-2 --task-type summarize_document --skill summarize --payload-json '{"path":"README.md","max_summary_lines":4}'
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 consume --token-file ./var/auth/developer.token --topic task_events --offset 0 --limit 20
+```
+
+The sample agent uses `AgentWorker`, registers itself in the discovery registry, keeps a heartbeat running, and writes summary artifacts to `./var/agent/results/<task-id>.summary.json`. Its local checkpoint file lives at `./var/agent/summarizer.state.json`, so pending completion or failure reports are retried after restart. While a task is in flight it also watches `task_events` for `canceled`, `timed_out`, requeue, or superseding assignment events and stops cooperatively instead of writing a stale artifact.
 
 ### Example: Benchmark the broker
 
@@ -974,7 +995,7 @@ Expressways is not only a broker crate.
 
 ### Orchestrator
 
-The orchestrator crate demonstrates an event-driven service built on top of the broker’s registry and audited assignment path.
+The orchestrator crate now demonstrates a task-driven local control loop built on top of the broker’s registry, topic storage, and audited publish/consume paths.
 
 ### Bench
 

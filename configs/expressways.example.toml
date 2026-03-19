@@ -120,8 +120,8 @@ actions = ["admin"]
 
 [[policy.rules]]
 principal = "local:agent-orchestrator"
-resource = "topic:tasks"
-actions = ["publish", "consume"]
+resource = "topic:task*"
+actions = ["publish", "consume", "admin"]
 
 [[policy.rules]]
 principal = "local:agent-orchestrator"

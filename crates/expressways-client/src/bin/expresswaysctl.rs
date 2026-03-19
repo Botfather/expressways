@@ -10,7 +10,8 @@ use expressways_client::{Client, Endpoint};
 use expressways_protocol::{
     Action, AgentEndpoint, AgentQuery, AgentRegistration, AgentSchemaRef, CapabilityClaims,
     CapabilityScope, Classification, ControlCommand, ControlRequest, ControlResponse,
-    RetentionClass, StreamFrame, TopicSpec,
+    RetentionClass, StreamFrame, TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent, TaskRequirements,
+    TaskRetryPolicy, TaskStatus, TaskWorkItem, TopicSpec,
 };
 use uuid::Uuid;
 
@@ -217,6 +218,60 @@ enum Command {
         topic: String,
         #[arg(long)]
         payload: String,
+        #[arg(long)]
+        classification: Option<Classification>,
+    },
+    SubmitTask {
+        #[command(flatten)]
+        token: TokenArgs,
+        #[arg(long, default_value = TASKS_TOPIC)]
+        topic: String,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        task_type: String,
+        #[arg(long)]
+        skill: Option<String>,
+        #[arg(long)]
+        requires_topic: Option<String>,
+        #[arg(long)]
+        principal: Option<String>,
+        #[arg(long = "preferred-agent")]
+        preferred_agents: Vec<String>,
+        #[arg(long = "avoid-agent")]
+        avoid_agents: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        #[arg(long, default_value = "null")]
+        payload_json: String,
+        #[arg(long, default_value_t = 3)]
+        max_attempts: u32,
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(long, default_value_t = 5)]
+        retry_delay_seconds: u64,
+        #[arg(long)]
+        classification: Option<Classification>,
+    },
+    ReportTask {
+        #[command(flatten)]
+        token: TokenArgs,
+        #[arg(long, default_value = TASK_EVENTS_TOPIC)]
+        topic: String,
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        task_offset: Option<u64>,
+        #[arg(long)]
+        assignment_id: Uuid,
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        status: TaskStatus,
+        #[arg(long, default_value_t = 1)]
+        attempt: u32,
+        #[arg(long)]
+        reason: Option<String>,
         #[arg(long)]
         classification: Option<Classification>,
     },
@@ -643,6 +698,84 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
                 payload,
             },
         }),
+        Command::SubmitTask {
+            token,
+            topic,
+            task_id,
+            task_type,
+            skill,
+            requires_topic,
+            principal,
+            preferred_agents,
+            avoid_agents,
+            priority,
+            payload_json,
+            max_attempts,
+            timeout_seconds,
+            retry_delay_seconds,
+            classification,
+        } => Ok(ControlRequest {
+            capability_token: resolve_token(token)?,
+            command: ControlCommand::Publish {
+                topic,
+                classification,
+                payload: serde_json::to_string(&TaskWorkItem {
+                    task_id: task_id.unwrap_or_else(|| Uuid::now_v7().to_string()),
+                    task_type,
+                    priority,
+                    requirements: TaskRequirements {
+                        skill,
+                        topic: requires_topic,
+                        principal,
+                        preferred_agents,
+                        avoid_agents,
+                    },
+                    payload: serde_json::from_str(&payload_json)
+                        .context("failed to parse --payload-json as JSON")?,
+                    retry_policy: TaskRetryPolicy {
+                        max_attempts,
+                        timeout_seconds,
+                        retry_delay_seconds,
+                    },
+                    submitted_at: Utc::now(),
+                })?,
+            },
+        }),
+        Command::ReportTask {
+            token,
+            topic,
+            task_id,
+            task_offset,
+            assignment_id,
+            agent_id,
+            status,
+            attempt,
+            reason,
+            classification,
+        } => {
+            if !matches!(status, TaskStatus::Completed | TaskStatus::Failed) {
+                bail!("report-task status must be either completed or failed");
+            }
+
+            Ok(ControlRequest {
+                capability_token: resolve_token(token)?,
+                command: ControlCommand::Publish {
+                    topic,
+                    classification,
+                    payload: serde_json::to_string(&TaskEvent {
+                        event_id: Uuid::now_v7(),
+                        task_id,
+                        task_offset,
+                        assignment_id: Some(assignment_id),
+                        agent_id: Some(agent_id),
+                        status,
+                        attempt,
+                        reason,
+                        emitted_at: Utc::now(),
+                    })?,
+                },
+            })
+        }
         Command::Consume {
             token,
             topic,
@@ -710,4 +843,83 @@ fn parse_schema(value: &str) -> Result<AgentSchemaRef, String> {
         name: name.trim().to_owned(),
         version: version.trim().to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_task_builds_a_publish_request() {
+        let request = request_from_command(Command::SubmitTask {
+            token: TokenArgs {
+                token: Some("signed-token".to_owned()),
+                token_file: None,
+            },
+            topic: TASKS_TOPIC.to_owned(),
+            task_id: Some("task-1".to_owned()),
+            task_type: "summarize_document".to_owned(),
+            skill: Some("summarize".to_owned()),
+            requires_topic: Some("topic:results".to_owned()),
+            principal: Some("local:agent-alpha".to_owned()),
+            preferred_agents: vec!["alpha".to_owned(), "beta".to_owned()],
+            avoid_agents: vec!["gamma".to_owned()],
+            priority: 25,
+            payload_json: "{\"path\":\"notes.md\"}".to_owned(),
+            max_attempts: 4,
+            timeout_seconds: 90,
+            retry_delay_seconds: 12,
+            classification: Some(Classification::Internal),
+        })
+        .expect("request");
+
+        match request.command {
+            ControlCommand::Publish {
+                topic,
+                classification,
+                payload,
+            } => {
+                assert_eq!(topic, TASKS_TOPIC);
+                assert_eq!(classification, Some(Classification::Internal));
+                let task: TaskWorkItem = serde_json::from_str(&payload).expect("parse task");
+                assert_eq!(task.task_id, "task-1");
+                assert_eq!(task.task_type, "summarize_document");
+                assert_eq!(task.priority, 25);
+                assert_eq!(task.requirements.skill.as_deref(), Some("summarize"));
+                assert_eq!(task.requirements.topic.as_deref(), Some("topic:results"));
+                assert_eq!(
+                    task.requirements.principal.as_deref(),
+                    Some("local:agent-alpha")
+                );
+                assert_eq!(task.requirements.preferred_agents, vec!["alpha", "beta"]);
+                assert_eq!(task.requirements.avoid_agents, vec!["gamma"]);
+                assert_eq!(task.retry_policy.max_attempts, 4);
+                assert_eq!(task.retry_policy.timeout_seconds, 90);
+                assert_eq!(task.retry_policy.retry_delay_seconds, 12);
+            }
+            other => panic!("expected publish request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_task_rejects_non_terminal_statuses() {
+        let error = request_from_command(Command::ReportTask {
+            token: TokenArgs {
+                token: Some("signed-token".to_owned()),
+                token_file: None,
+            },
+            topic: TASK_EVENTS_TOPIC.to_owned(),
+            task_id: "task-1".to_owned(),
+            task_offset: Some(0),
+            assignment_id: Uuid::nil(),
+            agent_id: "alpha".to_owned(),
+            status: TaskStatus::Assigned,
+            attempt: 1,
+            reason: None,
+            classification: None,
+        })
+        .expect_err("invalid status");
+
+        assert!(error.to_string().contains("completed or failed"));
+    }
 }

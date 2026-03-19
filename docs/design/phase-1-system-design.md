@@ -66,7 +66,7 @@ Stores agent cards behind a backend seam that currently uses a local JSON file. 
 
 ### Event-Driven Orchestrator
 
-Consumes the discovery-registry stream to maintain a local, event-driven view of eligible agents. The first orchestrator loop is intentionally small: it bootstraps from `list_agents`, tails the stream with cursor resume, and publishes audited assignment decisions back through the broker so orchestration starts using the same compliance and access-control path as every other action.
+Consumes the discovery-registry stream to maintain a local, event-driven view of eligible agents and pairs that view with topic-driven work intake. The orchestrator bootstraps from `list_agents`, tails the stream with cursor resume, consumes `tasks`, publishes audited `task_events` assignment records, and closes the loop when agents publish `completed` or `failed` lifecycle events. Explicit timeout and retry policies keep reassignment rules deterministic and auditable.
 
 ### Segmented Storage
 

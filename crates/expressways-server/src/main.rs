@@ -2629,21 +2629,30 @@ async fn record_internal_event(
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration as StdDuration;
 
     use chrono::{Duration, Utc};
     use expressways_auth::{
         AuthConfig, CapabilityIssuer, IssuerStatus, PrincipalKind, PrincipalRecord,
         PrincipalStatus, TrustedIssuerConfig,
     };
+    use expressways_client::{
+        AgentWorker, BoxedClientIo, CustomEndpoint, Endpoint, WorkerRunOutcome,
+    };
     use expressways_policy::{DefaultDecision, PolicyConfig, Rule};
     use expressways_protocol::{
-        AgentEndpoint, AgentQuery, AgentRegistration, CapabilityClaims, CapabilityScope,
-        Classification, ControlCommand, ControlResponse, RegistryEventKind, RetentionClass,
-        StreamFrame,
+        Action, AgentEndpoint, AgentQuery, AgentRegistration, CapabilityClaims, CapabilityScope,
+        Classification, ControlCommand, ControlRequest, ControlResponse, RegistryEventKind,
+        RetentionClass, StoredMessage, StreamFrame, TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent,
+        TaskRequirements, TaskRetryPolicy, TaskStatus, TaskWorkItem, TopicSpec,
     };
     use futures_util::{SinkExt, StreamExt};
+    use serde_json::json;
     use tokio::io::duplex;
+    use tokio::time::{Instant, sleep};
     use tokio_util::codec::{Framed, LinesCodec};
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use super::*;
@@ -2651,6 +2660,22 @@ mod tests {
         AdoptersSection, AuditSection, RegistrySection, ResilienceSection, StorageSection,
     };
     use crate::quota::{BackpressureMode, QuotaConfig, QuotaProfile};
+
+    #[allow(dead_code)]
+    mod orchestrator_bin {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../expressways-orchestrator/src/main.rs"
+        ));
+    }
+
+    #[allow(dead_code)]
+    mod sample_agent_bin {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../expressways-client/src/bin/expressways-agent-example.rs"
+        ));
+    }
 
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!("expressways-server-{}", Uuid::now_v7()))
@@ -2791,6 +2816,202 @@ mod tests {
         (token_id, token)
     }
 
+    fn broker_endpoint(state: Arc<BrokerState>) -> Endpoint {
+        Endpoint::Custom(CustomEndpoint::new("test-broker", move || {
+            let state = Arc::clone(&state);
+            async move {
+                let (client_stream, server_stream) = duplex(64 * 1024);
+                tokio::spawn(async move {
+                    let _ = handle_connection(server_stream, state).await;
+                });
+                Ok(Box::new(client_stream) as BoxedClientIo)
+            }
+        }))
+    }
+
+    async fn create_topic(state: &BrokerState, token: &str, topic: &str) {
+        let response = process_request(
+            state,
+            ControlRequest {
+                capability_token: token.to_owned(),
+                command: ControlCommand::CreateTopic {
+                    topic: TopicSpec {
+                        name: topic.to_owned(),
+                        retention_class: RetentionClass::Operational,
+                        default_classification: Classification::Internal,
+                    },
+                },
+            },
+        )
+        .await;
+
+        match response {
+            ControlResponse::TopicCreated { topic: created } => assert_eq!(created.name, topic),
+            other => panic!("expected topic created response, got {other:?}"),
+        }
+    }
+
+    async fn publish_task(state: &BrokerState, token: &str, task: &TaskWorkItem) {
+        let response = process_request(
+            state,
+            ControlRequest {
+                capability_token: token.to_owned(),
+                command: ControlCommand::Publish {
+                    topic: TASKS_TOPIC.to_owned(),
+                    classification: Some(Classification::Internal),
+                    payload: serde_json::to_string(task).expect("serialize task"),
+                },
+            },
+        )
+        .await;
+
+        match response {
+            ControlResponse::PublishAccepted { .. } => {}
+            other => panic!("expected publish accepted response, got {other:?}"),
+        }
+    }
+
+    async fn publish_task_event(state: &BrokerState, token: &str, event: &TaskEvent) {
+        let response = process_request(
+            state,
+            ControlRequest {
+                capability_token: token.to_owned(),
+                command: ControlCommand::Publish {
+                    topic: TASK_EVENTS_TOPIC.to_owned(),
+                    classification: Some(Classification::Internal),
+                    payload: serde_json::to_string(event).expect("serialize task event"),
+                },
+            },
+        )
+        .await;
+
+        match response {
+            ControlResponse::PublishAccepted { .. } => {}
+            other => panic!("expected publish accepted response, got {other:?}"),
+        }
+    }
+
+    async fn consume_messages_from_topic(
+        state: &BrokerState,
+        token: &str,
+        topic: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Vec<StoredMessage> {
+        let response = process_request(
+            state,
+            ControlRequest {
+                capability_token: token.to_owned(),
+                command: ControlCommand::Consume {
+                    topic: topic.to_owned(),
+                    offset,
+                    limit,
+                },
+            },
+        )
+        .await;
+
+        match response {
+            ControlResponse::Messages { messages, .. } => messages,
+            other => panic!("expected messages response, got {other:?}"),
+        }
+    }
+
+    fn example_agent_registration(agent_id: &str) -> AgentRegistration {
+        AgentRegistration {
+            agent_id: agent_id.to_owned(),
+            display_name: "Summarizer".to_owned(),
+            version: "1.0.0".to_owned(),
+            summary: "Example document summarizer".to_owned(),
+            skills: vec!["summarize".to_owned()],
+            subscriptions: vec![format!("topic:{TASKS_TOPIC}")],
+            publications: vec![format!("topic:{TASK_EVENTS_TOPIC}")],
+            schemas: Vec::new(),
+            endpoint: AgentEndpoint {
+                transport: "local_task_worker".to_owned(),
+                address: agent_id.to_owned(),
+            },
+            classification: Classification::Internal,
+            retention_class: RetentionClass::Operational,
+            ttl_seconds: Some(60),
+        }
+    }
+
+    fn summarize_task(
+        task_id: &str,
+        path: &Path,
+        max_summary_lines: usize,
+        retry_policy: TaskRetryPolicy,
+    ) -> TaskWorkItem {
+        summarize_task_with_delay(task_id, path, max_summary_lines, retry_policy, 0)
+    }
+
+    fn summarize_task_with_delay(
+        task_id: &str,
+        path: &Path,
+        max_summary_lines: usize,
+        retry_policy: TaskRetryPolicy,
+        simulate_delay_ms: u64,
+    ) -> TaskWorkItem {
+        TaskWorkItem {
+            task_id: task_id.to_owned(),
+            task_type: "summarize_document".to_owned(),
+            priority: 0,
+            requirements: TaskRequirements {
+                skill: Some("summarize".to_owned()),
+                topic: None,
+                principal: None,
+                preferred_agents: Vec::new(),
+                avoid_agents: Vec::new(),
+            },
+            payload: json!({
+                "path": path,
+                "max_summary_lines": max_summary_lines,
+                "simulate_delay_ms": simulate_delay_ms,
+            }),
+            retry_policy,
+            submitted_at: Utc::now(),
+        }
+    }
+
+    async fn run_example_agent_loop(
+        endpoint: Endpoint,
+        capability_token: String,
+        agent_id: String,
+        output_dir: PathBuf,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let mut worker = AgentWorker::new(endpoint, capability_token, agent_id);
+
+        loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            let outcome = worker
+                .run_once_with_context(|assignment, context| {
+                    sample_agent_bin::handle_assignment(assignment, output_dir.clone(), context)
+                })
+                .await;
+
+            match outcome {
+                Ok(WorkerRunOutcome::Idle) | Err(_) => {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = sleep(StdDuration::from_millis(25)) => {}
+                    }
+                }
+                Ok(
+                    WorkerRunOutcome::Completed { .. }
+                    | WorkerRunOutcome::Failed { .. }
+                    | WorkerRunOutcome::Canceled { .. },
+                ) => {}
+            }
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn revoked_token_requests_are_denied_and_audited() {
         let root = test_root();
@@ -2828,6 +3049,517 @@ mod tests {
         let audit = fs::read_to_string(&config.audit.path).expect("read audit");
         assert!(audit.contains("\"decision\":\"deny\""));
         assert!(audit.contains(&token_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn orchestration_loop_completes_and_retries_with_sample_agent() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.quotas.profiles = vec![
+            QuotaProfile {
+                name: "operator".to_owned(),
+                publish_payload_max_bytes: 64 * 1024,
+                publish_requests_per_window: 200,
+                publish_window_seconds: 1,
+                consume_max_limit: 200,
+                consume_requests_per_window: 200,
+                consume_window_seconds: 1,
+                backpressure_mode: BackpressureMode::Reject,
+                backpressure_delay_ms: 0,
+            },
+            QuotaProfile {
+                name: "agent".to_owned(),
+                publish_payload_max_bytes: 64 * 1024,
+                publish_requests_per_window: 200,
+                publish_window_seconds: 1,
+                consume_max_limit: 200,
+                consume_requests_per_window: 200,
+                consume_window_seconds: 1,
+                backpressure_mode: BackpressureMode::Reject,
+                backpressure_delay_ms: 0,
+            },
+        ];
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![
+                CapabilityScope {
+                    resource: "topic:*".to_owned(),
+                    actions: vec![Action::Admin, Action::Publish, Action::Consume],
+                },
+                CapabilityScope {
+                    resource: "registry:agents*".to_owned(),
+                    actions: vec![Action::Admin],
+                },
+            ],
+        );
+        let (_, agent_token) = issue_token(
+            &issuer,
+            "local:agent-alpha",
+            vec![
+                CapabilityScope {
+                    resource: "topic:*".to_owned(),
+                    actions: vec![Action::Publish, Action::Consume],
+                },
+                CapabilityScope {
+                    resource: "registry:agents*".to_owned(),
+                    actions: vec![Action::Admin],
+                },
+            ],
+        );
+
+        let endpoint = broker_endpoint(Arc::clone(&state));
+
+        create_topic(state.as_ref(), &developer_token, TASKS_TOPIC).await;
+        create_topic(state.as_ref(), &developer_token, TASK_EVENTS_TOPIC).await;
+
+        let agent_id = "summarizer";
+        sample_agent_bin::register_agent(
+            &endpoint,
+            &agent_token,
+            example_agent_registration(agent_id),
+        )
+        .await
+        .expect("register sample agent");
+
+        let output_dir = root.join("var/agent/results");
+        let agent_shutdown = CancellationToken::new();
+        let agent_handle = tokio::spawn(run_example_agent_loop(
+            endpoint.clone(),
+            agent_token.clone(),
+            agent_id.to_owned(),
+            output_dir.clone(),
+            agent_shutdown.clone(),
+        ));
+
+        let supervisor_state_path = root.join("var/orchestrator/state.json");
+        let supervisor_handle = tokio::spawn(orchestrator_bin::supervise(
+            endpoint.clone(),
+            developer_token.clone(),
+            supervisor_state_path.clone(),
+            25,
+            TASKS_TOPIC.to_owned(),
+            TASK_EVENTS_TOPIC.to_owned(),
+            50,
+            25,
+        ));
+
+        let success_source = root.join("inputs/success.md");
+        let retry_source = root.join("inputs/retry.md");
+        fs::create_dir_all(success_source.parent().expect("inputs dir"))
+            .expect("create inputs dir");
+        fs::write(&success_source, "Alpha\n\nBeta\nGamma\n").expect("write success source");
+
+        publish_task(
+            state.as_ref(),
+            &developer_token,
+            &summarize_task(
+                "task-success",
+                &success_source,
+                3,
+                TaskRetryPolicy {
+                    max_attempts: 1,
+                    timeout_seconds: 10,
+                    retry_delay_seconds: 1,
+                },
+            ),
+        )
+        .await;
+        publish_task(
+            state.as_ref(),
+            &developer_token,
+            &summarize_task(
+                "task-retry",
+                &retry_source,
+                2,
+                TaskRetryPolicy {
+                    max_attempts: 2,
+                    timeout_seconds: 10,
+                    retry_delay_seconds: 2,
+                },
+            ),
+        )
+        .await;
+
+        let mut next_offset = 0;
+        let mut events = Vec::<TaskEvent>::new();
+        let mut retry_source_created = false;
+        let deadline = Instant::now() + StdDuration::from_secs(20);
+        loop {
+            let messages = consume_messages_from_topic(
+                state.as_ref(),
+                &developer_token,
+                TASK_EVENTS_TOPIC,
+                next_offset,
+                20,
+            )
+            .await;
+            for message in messages {
+                next_offset = message.offset.saturating_add(1);
+                let event =
+                    serde_json::from_str::<TaskEvent>(&message.payload).expect("parse task event");
+                events.push(event);
+            }
+
+            if !retry_source_created
+                && events.iter().any(|event| {
+                    event.task_id == "task-retry"
+                        && event.status == TaskStatus::Failed
+                        && event.attempt == 1
+                })
+            {
+                fs::write(&retry_source, "Recovered\nDocument\n")
+                    .expect("write retry source after first failure");
+                retry_source_created = true;
+            }
+
+            let success_assigned = events.iter().any(|event| {
+                event.task_id == "task-success"
+                    && event.status == TaskStatus::Assigned
+                    && event.attempt == 1
+            });
+            let success_completed = events.iter().any(|event| {
+                event.task_id == "task-success"
+                    && event.status == TaskStatus::Completed
+                    && event.attempt == 1
+            });
+            let retry_assigned_once = events.iter().any(|event| {
+                event.task_id == "task-retry"
+                    && event.status == TaskStatus::Assigned
+                    && event.attempt == 1
+            });
+            let retry_failed_once = events.iter().any(|event| {
+                event.task_id == "task-retry"
+                    && event.status == TaskStatus::Failed
+                    && event.attempt == 1
+            });
+            let retry_scheduled = events.iter().any(|event| {
+                event.task_id == "task-retry"
+                    && event.status == TaskStatus::RetryScheduled
+                    && event.attempt == 1
+            });
+            let retry_assigned_twice = events.iter().any(|event| {
+                event.task_id == "task-retry"
+                    && event.status == TaskStatus::Assigned
+                    && event.attempt == 2
+            });
+            let retry_completed = events.iter().any(|event| {
+                event.task_id == "task-retry"
+                    && event.status == TaskStatus::Completed
+                    && event.attempt == 2
+            });
+            let success_artifact_path = output_dir.join("task-success.summary.json");
+            let retry_artifact_path = output_dir.join("task-retry.summary.json");
+
+            if success_assigned
+                && success_completed
+                && retry_assigned_once
+                && retry_failed_once
+                && retry_scheduled
+                && retry_assigned_twice
+                && retry_completed
+                && success_artifact_path.exists()
+                && retry_artifact_path.exists()
+            {
+                break;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for orchestration flow; events: {events:?}"
+            );
+            sleep(StdDuration::from_millis(50)).await;
+        }
+
+        let success_artifact: sample_agent_bin::SummaryArtifact = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("task-success.summary.json"))
+                .expect("read success artifact"),
+        )
+        .expect("parse success artifact");
+        assert_eq!(success_artifact.task_id, "task-success");
+        assert_eq!(success_artifact.summary, "Alpha Beta Gamma");
+        assert_eq!(
+            success_artifact.source_path,
+            success_source.display().to_string()
+        );
+
+        let retry_artifact: sample_agent_bin::SummaryArtifact = serde_json::from_str(
+            &fs::read_to_string(output_dir.join("task-retry.summary.json"))
+                .expect("read retry artifact"),
+        )
+        .expect("parse retry artifact");
+        assert_eq!(retry_artifact.task_id, "task-retry");
+        assert_eq!(retry_artifact.summary, "Recovered Document");
+        assert_eq!(
+            retry_artifact.source_path,
+            retry_source.display().to_string()
+        );
+
+        sleep(StdDuration::from_millis(100)).await;
+        let orchestrator_state = expressways_orchestrator::load_state(&supervisor_state_path)
+            .expect("load supervisor state");
+        assert_eq!(
+            orchestrator_state
+                .tasks
+                .get("task-success")
+                .expect("tracked success task")
+                .status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            orchestrator_state
+                .tasks
+                .get("task-retry")
+                .expect("tracked retry task")
+                .status,
+            TaskStatus::Completed
+        );
+
+        agent_shutdown.cancel();
+        agent_handle
+            .await
+            .expect("agent task join")
+            .expect("agent task");
+        sample_agent_bin::remove_agent(&endpoint, &agent_token, agent_id)
+            .await
+            .expect("remove sample agent");
+
+        supervisor_handle.abort();
+        let _ = supervisor_handle.await;
+    }
+
+    #[tokio::test]
+    async fn canceled_assignment_stops_sample_agent_before_completion() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.quotas.profiles = vec![
+            QuotaProfile {
+                name: "operator".to_owned(),
+                publish_payload_max_bytes: 64 * 1024,
+                publish_requests_per_window: 200,
+                publish_window_seconds: 1,
+                consume_max_limit: 200,
+                consume_requests_per_window: 200,
+                consume_window_seconds: 1,
+                backpressure_mode: BackpressureMode::Reject,
+                backpressure_delay_ms: 0,
+            },
+            QuotaProfile {
+                name: "agent".to_owned(),
+                publish_payload_max_bytes: 64 * 1024,
+                publish_requests_per_window: 200,
+                publish_window_seconds: 1,
+                consume_max_limit: 200,
+                consume_requests_per_window: 200,
+                consume_window_seconds: 1,
+                backpressure_mode: BackpressureMode::Reject,
+                backpressure_delay_ms: 0,
+            },
+        ];
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (_, developer_token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![
+                CapabilityScope {
+                    resource: "topic:*".to_owned(),
+                    actions: vec![Action::Admin, Action::Publish, Action::Consume],
+                },
+                CapabilityScope {
+                    resource: "registry:agents*".to_owned(),
+                    actions: vec![Action::Admin],
+                },
+            ],
+        );
+        let (_, agent_token) = issue_token(
+            &issuer,
+            "local:agent-alpha",
+            vec![
+                CapabilityScope {
+                    resource: "topic:*".to_owned(),
+                    actions: vec![Action::Publish, Action::Consume],
+                },
+                CapabilityScope {
+                    resource: "registry:agents*".to_owned(),
+                    actions: vec![Action::Admin],
+                },
+            ],
+        );
+
+        let endpoint = broker_endpoint(Arc::clone(&state));
+        create_topic(state.as_ref(), &developer_token, TASKS_TOPIC).await;
+        create_topic(state.as_ref(), &developer_token, TASK_EVENTS_TOPIC).await;
+
+        let agent_id = "summarizer";
+        sample_agent_bin::register_agent(
+            &endpoint,
+            &agent_token,
+            example_agent_registration(agent_id),
+        )
+        .await
+        .expect("register sample agent");
+
+        let output_dir = root.join("var/agent/results");
+        let agent_shutdown = CancellationToken::new();
+        let agent_handle = tokio::spawn(run_example_agent_loop(
+            endpoint.clone(),
+            agent_token.clone(),
+            agent_id.to_owned(),
+            output_dir.clone(),
+            agent_shutdown.clone(),
+        ));
+
+        let supervisor_state_path = root.join("var/orchestrator/state.json");
+        let supervisor_handle = tokio::spawn(orchestrator_bin::supervise(
+            endpoint.clone(),
+            developer_token.clone(),
+            supervisor_state_path.clone(),
+            25,
+            TASKS_TOPIC.to_owned(),
+            TASK_EVENTS_TOPIC.to_owned(),
+            50,
+            25,
+        ));
+
+        let source_path = root.join("inputs/cancel.md");
+        fs::create_dir_all(source_path.parent().expect("inputs dir")).expect("create inputs dir");
+        fs::write(&source_path, "Alpha\nBeta\nGamma\n").expect("write cancel source");
+
+        publish_task(
+            state.as_ref(),
+            &developer_token,
+            &summarize_task_with_delay(
+                "task-cancel",
+                &source_path,
+                3,
+                TaskRetryPolicy {
+                    max_attempts: 1,
+                    timeout_seconds: 10,
+                    retry_delay_seconds: 1,
+                },
+                1_500,
+            ),
+        )
+        .await;
+
+        let deadline = Instant::now() + StdDuration::from_secs(20);
+        let mut next_offset = 0;
+        let mut events = Vec::<TaskEvent>::new();
+        let mut cancel_published = false;
+        let artifact_path = output_dir.join("task-cancel.summary.json");
+
+        loop {
+            let messages = consume_messages_from_topic(
+                state.as_ref(),
+                &developer_token,
+                TASK_EVENTS_TOPIC,
+                next_offset,
+                20,
+            )
+            .await;
+            for message in messages {
+                next_offset = message.offset.saturating_add(1);
+                let event =
+                    serde_json::from_str::<TaskEvent>(&message.payload).expect("parse task event");
+                events.push(event);
+            }
+
+            if !cancel_published {
+                if let Some(assignment) = events.iter().find(|event| {
+                    event.task_id == "task-cancel"
+                        && event.status == TaskStatus::Assigned
+                        && event.agent_id.as_deref() == Some(agent_id)
+                }) {
+                    publish_task_event(
+                        state.as_ref(),
+                        &developer_token,
+                        &TaskEvent {
+                            event_id: Uuid::now_v7(),
+                            task_id: assignment.task_id.clone(),
+                            task_offset: assignment.task_offset,
+                            assignment_id: assignment.assignment_id,
+                            agent_id: assignment.agent_id.clone(),
+                            status: TaskStatus::Canceled,
+                            attempt: assignment.attempt,
+                            reason: Some("operator canceled stale work".to_owned()),
+                            emitted_at: Utc::now(),
+                        },
+                    )
+                    .await;
+                    cancel_published = true;
+                }
+            }
+
+            let canceled = events.iter().any(|event| {
+                event.task_id == "task-cancel" && event.status == TaskStatus::Canceled
+            });
+            let completed = events.iter().any(|event| {
+                event.task_id == "task-cancel" && event.status == TaskStatus::Completed
+            });
+
+            if cancel_published && canceled && !artifact_path.exists() && !completed {
+                sleep(StdDuration::from_millis(1_750)).await;
+                let new_messages = consume_messages_from_topic(
+                    state.as_ref(),
+                    &developer_token,
+                    TASK_EVENTS_TOPIC,
+                    next_offset,
+                    20,
+                )
+                .await;
+                for message in new_messages {
+                    let event = serde_json::from_str::<TaskEvent>(&message.payload)
+                        .expect("parse post-cancel task event");
+                    events.push(event);
+                }
+
+                let completed_after_wait = events.iter().any(|event| {
+                    event.task_id == "task-cancel" && event.status == TaskStatus::Completed
+                });
+                assert!(
+                    !completed_after_wait,
+                    "worker should not publish stale completion after cancellation: {events:?}"
+                );
+                assert!(
+                    !artifact_path.exists(),
+                    "worker should not write artifacts for canceled work"
+                );
+                break;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for canceled task flow; events: {events:?}"
+            );
+            sleep(StdDuration::from_millis(50)).await;
+        }
+
+        sleep(StdDuration::from_millis(100)).await;
+        let orchestrator_state = expressways_orchestrator::load_state(&supervisor_state_path)
+            .expect("load supervisor state");
+        assert_eq!(
+            orchestrator_state
+                .tasks
+                .get("task-cancel")
+                .expect("tracked canceled task")
+                .status,
+            TaskStatus::Canceled
+        );
+
+        agent_shutdown.cancel();
+        agent_handle
+            .await
+            .expect("agent task join")
+            .expect("agent task");
+        sample_agent_bin::remove_agent(&endpoint, &agent_token, agent_id)
+            .await
+            .expect("remove sample agent");
+
+        supervisor_handle.abort();
+        let _ = supervisor_handle.await;
     }
 
     #[tokio::test]

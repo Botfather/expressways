@@ -1,19 +1,68 @@
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use expressways_protocol::{ControlRequest, ControlResponse, StreamFrame};
+use chrono::{DateTime, Utc};
+use expressways_protocol::{
+    Classification, ControlCommand, ControlRequest, ControlResponse, StoredMessage, StreamFrame,
+    TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent, TaskStatus, TaskWorkItem,
+};
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+pub trait ClientIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ClientIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+pub type BoxedClientIo = Box<dyn ClientIo>;
+type BoxedConnectFuture = Pin<Box<dyn Future<Output = Result<BoxedClientIo, ClientError>> + Send>>;
+
+#[derive(Clone)]
+pub struct CustomEndpoint {
+    label: String,
+    connector: Arc<dyn Fn() -> BoxedConnectFuture + Send + Sync>,
+}
+
+impl std::fmt::Debug for CustomEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CustomEndpoint")
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+impl CustomEndpoint {
+    pub fn new<F, Fut>(label: impl Into<String>, connector: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<BoxedClientIo, ClientError>> + Send + 'static,
+    {
+        Self {
+            label: label.into(),
+            connector: Arc::new(move || Box::pin(connector())),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     Tcp(String),
     #[cfg(unix)]
     Unix(PathBuf),
+    Custom(CustomEndpoint),
 }
 
 #[derive(Debug)]
@@ -26,11 +75,103 @@ pub struct StreamClient {
     transport: Transport,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentWorkerState {
+    #[serde(default)]
+    pub task_event_offset: u64,
+    #[serde(default)]
+    pub pending_report: Option<TaskEvent>,
+}
+
+#[derive(Clone)]
+pub struct AgentWorker {
+    endpoint: Endpoint,
+    capability_token: String,
+    agent_id: String,
+    tasks_topic: String,
+    task_events_topic: String,
+    batch_limit: usize,
+    state: AgentWorkerState,
+    #[cfg(test)]
+    mock_exchanges: Option<Arc<Mutex<VecDeque<MockExchange>>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssignedTask {
+    pub assignment: TaskEvent,
+    pub task_message: StoredMessage,
+    pub task: TaskWorkItem,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskExecutionContext {
+    cancellation: CancellationToken,
+    invalidation: Arc<Mutex<Option<TaskInvalidation>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskInvalidation {
+    pub status: TaskStatus,
+    pub reason: Option<String>,
+    pub emitted_at: DateTime<Utc>,
+    pub assignment_id: Option<Uuid>,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerRunOutcome {
+    Idle,
+    Completed {
+        task_id: String,
+        assignment_id: Uuid,
+    },
+    Failed {
+        task_id: String,
+        assignment_id: Option<Uuid>,
+        reason: String,
+    },
+    Canceled {
+        task_id: String,
+        assignment_id: Option<Uuid>,
+        status: TaskStatus,
+        reason: Option<String>,
+    },
+}
+
 enum Transport {
     Tcp(Framed<TcpStream, LinesCodec>),
     #[cfg(unix)]
     Unix(Framed<UnixStream, LinesCodec>),
+    Custom(Framed<BoxedClientIo, LinesCodec>),
+}
+
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Tcp(_) => "tcp",
+            #[cfg(unix)]
+            Self::Unix(_) => "unix",
+            Self::Custom(_) => "custom",
+        };
+        formatter.debug_tuple("Transport").field(&kind).finish()
+    }
+}
+
+enum WorkerClient {
+    Live(Client),
+    #[cfg(test)]
+    Mock(MockClient),
+}
+
+#[cfg(test)]
+struct MockClient {
+    exchanges: Arc<Mutex<VecDeque<MockExchange>>>,
+}
+
+#[cfg(test)]
+struct MockExchange {
+    check: Box<dyn Fn(&ControlRequest) + Send + Sync>,
+    response: Result<ControlResponse, ClientError>,
 }
 
 #[derive(Debug, Error)]
@@ -45,6 +186,64 @@ pub enum ClientError {
     ConnectionClosed,
     #[error("unix sockets are not supported on this platform")]
     UnixUnsupported,
+}
+
+#[derive(Debug, Error)]
+pub enum WorkerError {
+    #[error(transparent)]
+    Serialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    #[error("broker returned an error while {operation}: {code}: {message}")]
+    Broker {
+        operation: &'static str,
+        code: String,
+        message: String,
+    },
+    #[error("unexpected response while {operation}: {response}")]
+    UnexpectedResponse {
+        operation: &'static str,
+        response: String,
+    },
+    #[error("malformed assignment event for task `{task_id}`: {detail}")]
+    MalformedAssignment { task_id: String, detail: String },
+}
+
+#[derive(Debug, Error)]
+enum TaskResolutionError {
+    #[error("assignment for task `{task_id}` is missing task_offset")]
+    MissingTaskOffset { task_id: String },
+    #[error("task `{task_id}` was not found at offset {task_offset}")]
+    TaskNotFound { task_id: String, task_offset: u64 },
+    #[error(
+        "task assignment expected `{task_id}` at offset {expected_offset}, but broker returned offset {actual_offset}"
+    )]
+    UnexpectedTaskOffset {
+        task_id: String,
+        expected_offset: u64,
+        actual_offset: u64,
+    },
+    #[error(
+        "task assignment references `{expected_task_id}` but task payload declared `{actual_task_id}`"
+    )]
+    TaskIdMismatch {
+        expected_task_id: String,
+        actual_task_id: String,
+    },
+    #[error("failed to parse task payload at offset {task_offset}: {source}")]
+    InvalidTaskPayload {
+        task_offset: u64,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+#[derive(Debug, Error)]
+enum AssignmentFetchError {
+    #[error(transparent)]
+    Worker(#[from] WorkerError),
+    #[error(transparent)]
+    Task(#[from] TaskResolutionError),
 }
 
 type LinesCodecError = tokio_util::codec::LinesCodecError;
@@ -66,6 +265,12 @@ impl Client {
                     transport: Transport::Unix(Framed::new(stream, LinesCodec::new())),
                 })
             }
+            Endpoint::Custom(custom) => {
+                let stream = (custom.connector)().await?;
+                Ok(Self {
+                    transport: Transport::Custom(Framed::new(stream, LinesCodec::new())),
+                })
+            }
         }
     }
 
@@ -74,6 +279,7 @@ impl Client {
             Transport::Tcp(transport) => send_request(transport, request).await,
             #[cfg(unix)]
             Transport::Unix(transport) => send_request(transport, request).await,
+            Transport::Custom(transport) => send_request(transport, request).await,
         }
     }
 
@@ -90,6 +296,7 @@ impl StreamClient {
             Transport::Tcp(transport) => send_stream_open(transport, request).await,
             #[cfg(unix)]
             Transport::Unix(transport) => send_stream_open(transport, request).await,
+            Transport::Custom(transport) => send_stream_open(transport, request).await,
         }
     }
 
@@ -98,8 +305,540 @@ impl StreamClient {
             Transport::Tcp(transport) => read_stream_frame(transport).await,
             #[cfg(unix)]
             Transport::Unix(transport) => read_stream_frame(transport).await,
+            Transport::Custom(transport) => read_stream_frame(transport).await,
         }
     }
+}
+
+impl WorkerClient {
+    async fn send(&mut self, request: ControlRequest) -> Result<ControlResponse, ClientError> {
+        match self {
+            Self::Live(client) => client.send(request).await,
+            #[cfg(test)]
+            Self::Mock(client) => client.send(request).await,
+        }
+    }
+}
+
+#[cfg(test)]
+impl MockClient {
+    async fn send(&mut self, request: ControlRequest) -> Result<ControlResponse, ClientError> {
+        let exchange = self
+            .exchanges
+            .lock()
+            .expect("queue lock")
+            .pop_front()
+            .expect("unexpected request");
+        (exchange.check)(&request);
+        exchange.response
+    }
+}
+
+impl AgentWorker {
+    pub fn new(
+        endpoint: Endpoint,
+        capability_token: impl Into<String>,
+        agent_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint,
+            capability_token: capability_token.into(),
+            agent_id: agent_id.into(),
+            tasks_topic: TASKS_TOPIC.to_owned(),
+            task_events_topic: TASK_EVENTS_TOPIC.to_owned(),
+            batch_limit: 50,
+            state: AgentWorkerState::default(),
+            #[cfg(test)]
+            mock_exchanges: None,
+        }
+    }
+
+    pub fn with_topics(
+        mut self,
+        tasks_topic: impl Into<String>,
+        task_events_topic: impl Into<String>,
+    ) -> Self {
+        self.tasks_topic = tasks_topic.into();
+        self.task_events_topic = task_events_topic.into();
+        self
+    }
+
+    pub fn with_batch_limit(mut self, batch_limit: usize) -> Self {
+        self.batch_limit = batch_limit.max(1);
+        self
+    }
+
+    pub fn with_state(mut self, state: AgentWorkerState) -> Self {
+        self.state = state;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_mock_exchanges(mut self, exchanges: Vec<MockExchange>) -> Self {
+        self.mock_exchanges = Some(Arc::new(Mutex::new(VecDeque::from(exchanges))));
+        self
+    }
+
+    pub fn state(&self) -> &AgentWorkerState {
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut AgentWorkerState {
+        &mut self.state
+    }
+
+    pub fn into_state(self) -> AgentWorkerState {
+        self.state
+    }
+
+    pub async fn flush_pending_report(&mut self) -> Result<bool, WorkerError> {
+        let mut client = self.connect_worker_client().await?;
+        self.flush_pending_report_with_client(&mut client).await
+    }
+
+    pub async fn run_once<H, Fut>(&mut self, handler: H) -> Result<WorkerRunOutcome, WorkerError>
+    where
+        H: FnOnce(AssignedTask) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        self.run_once_with_context(|assignment, _context| handler(assignment))
+            .await
+    }
+
+    pub async fn run_once_with_context<H, Fut>(
+        &mut self,
+        handler: H,
+    ) -> Result<WorkerRunOutcome, WorkerError>
+    where
+        H: FnOnce(AssignedTask, TaskExecutionContext) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        let mut client = self.connect_worker_client().await?;
+        self.flush_pending_report_with_client(&mut client).await?;
+
+        let Some(assignment_event) = self.poll_next_assignment_event(&mut client).await? else {
+            return Ok(WorkerRunOutcome::Idle);
+        };
+
+        let report = match self
+            .resolve_assignment(&mut client, &assignment_event)
+            .await
+        {
+            Ok(assignment) => {
+                let context = TaskExecutionContext::default();
+                let watch_client = self.connect_worker_client().await?;
+                let capability_token = self.capability_token.clone();
+                let task_events_topic = self.task_events_topic.clone();
+                let watch_offset = self.state.task_event_offset;
+                let batch_limit = self.batch_limit;
+                let watched_assignment = assignment_event.clone();
+                let watched_context = context.clone();
+                let watch_handle = tokio::spawn(async move {
+                    watch_assignment_invalidation_loop(
+                        watch_client,
+                        capability_token,
+                        task_events_topic,
+                        watch_offset,
+                        batch_limit,
+                        watched_assignment,
+                        watched_context,
+                    )
+                    .await
+                });
+                let handler_result = handler(assignment, context.clone()).await;
+
+                let final_scan = if context.is_cancelled() {
+                    Ok(())
+                } else {
+                    let mut scan_client = self.connect_worker_client().await?;
+                    scan_assignment_invalidation_once(
+                        &mut scan_client,
+                        &self.capability_token,
+                        &self.task_events_topic,
+                        self.state.task_event_offset,
+                        self.batch_limit,
+                        &assignment_event,
+                        &context,
+                    )
+                    .await
+                };
+
+                if !watch_handle.is_finished() {
+                    watch_handle.abort();
+                }
+                let watcher_result = match watch_handle.await {
+                    Ok(result) => result,
+                    Err(error) if error.is_cancelled() => Ok(()),
+                    Err(error) => Err(WorkerError::UnexpectedResponse {
+                        operation: "watching assignment invalidation",
+                        response: error.to_string(),
+                    }),
+                };
+
+                if let Some(invalidation) = context.invalidation() {
+                    return Ok(WorkerRunOutcome::Canceled {
+                        task_id: assignment_event.task_id.clone(),
+                        assignment_id: assignment_event.assignment_id,
+                        status: invalidation.status,
+                        reason: invalidation.reason,
+                    });
+                }
+
+                watcher_result?;
+                final_scan?;
+
+                match handler_result {
+                    Ok(()) => {
+                        self.build_task_report(&assignment_event, TaskStatus::Completed, None)
+                    }
+                    Err(reason) => {
+                        self.build_task_report(&assignment_event, TaskStatus::Failed, Some(reason))
+                    }
+                }
+            }
+            Err(AssignmentFetchError::Task(error)) => self.build_task_report(
+                &assignment_event,
+                TaskStatus::Failed,
+                Some(error.to_string()),
+            ),
+            Err(AssignmentFetchError::Worker(error)) => return Err(error),
+        };
+
+        let outcome = outcome_from_report(&report);
+        self.state.pending_report = Some(report);
+        self.flush_pending_report_with_client(&mut client).await?;
+        Ok(outcome)
+    }
+
+    async fn connect_worker_client(&self) -> Result<WorkerClient, ClientError> {
+        #[cfg(test)]
+        if let Some(exchanges) = &self.mock_exchanges {
+            return Ok(WorkerClient::Mock(MockClient {
+                exchanges: Arc::clone(exchanges),
+            }));
+        }
+
+        Ok(WorkerClient::Live(
+            Client::connect(self.endpoint.clone()).await?,
+        ))
+    }
+
+    async fn flush_pending_report_with_client(
+        &mut self,
+        client: &mut WorkerClient,
+    ) -> Result<bool, WorkerError> {
+        let Some(event) = self.state.pending_report.clone() else {
+            return Ok(false);
+        };
+
+        publish_task_event(
+            client,
+            &self.capability_token,
+            &self.task_events_topic,
+            &event,
+        )
+        .await?;
+        self.state.pending_report = None;
+        Ok(true)
+    }
+
+    async fn poll_next_assignment_event(
+        &mut self,
+        client: &mut WorkerClient,
+    ) -> Result<Option<TaskEvent>, WorkerError> {
+        loop {
+            let messages = consume_messages(
+                client,
+                &self.capability_token,
+                &self.task_events_topic,
+                self.state.task_event_offset,
+                self.batch_limit,
+            )
+            .await?;
+            let message_count = messages.len();
+
+            if messages.is_empty() {
+                return Ok(None);
+            }
+
+            for message in messages {
+                self.state.task_event_offset = self
+                    .state
+                    .task_event_offset
+                    .max(message.offset.saturating_add(1));
+                let event = match serde_json::from_str::<TaskEvent>(&message.payload) {
+                    Ok(event) => event,
+                    Err(_) => continue,
+                };
+
+                if event.status != TaskStatus::Assigned {
+                    continue;
+                }
+
+                if event.agent_id.as_deref() != Some(self.agent_id.as_str()) {
+                    continue;
+                }
+
+                if event.assignment_id.is_none() {
+                    return Err(WorkerError::MalformedAssignment {
+                        task_id: event.task_id.clone(),
+                        detail: "assignment event is missing assignment_id".to_owned(),
+                    });
+                }
+
+                return Ok(Some(event));
+            }
+
+            if message_count < self.batch_limit {
+                return Ok(None);
+            }
+        }
+    }
+
+    async fn resolve_assignment(
+        &self,
+        client: &mut WorkerClient,
+        assignment: &TaskEvent,
+    ) -> Result<AssignedTask, AssignmentFetchError> {
+        let task_offset =
+            assignment
+                .task_offset
+                .ok_or_else(|| TaskResolutionError::MissingTaskOffset {
+                    task_id: assignment.task_id.clone(),
+                })?;
+        let mut messages = consume_messages(
+            client,
+            &self.capability_token,
+            &self.tasks_topic,
+            task_offset,
+            1,
+        )
+        .await?;
+        let task_message = messages
+            .pop()
+            .ok_or_else(|| TaskResolutionError::TaskNotFound {
+                task_id: assignment.task_id.clone(),
+                task_offset,
+            })?;
+        if task_message.offset != task_offset {
+            return Err(TaskResolutionError::UnexpectedTaskOffset {
+                task_id: assignment.task_id.clone(),
+                expected_offset: task_offset,
+                actual_offset: task_message.offset,
+            }
+            .into());
+        }
+
+        let task =
+            serde_json::from_str::<TaskWorkItem>(&task_message.payload).map_err(|source| {
+                TaskResolutionError::InvalidTaskPayload {
+                    task_offset,
+                    source,
+                }
+            })?;
+        if task.task_id != assignment.task_id {
+            return Err(TaskResolutionError::TaskIdMismatch {
+                expected_task_id: assignment.task_id.clone(),
+                actual_task_id: task.task_id.clone(),
+            }
+            .into());
+        }
+
+        Ok(AssignedTask {
+            assignment: assignment.clone(),
+            task_message,
+            task,
+        })
+    }
+
+    fn build_task_report(
+        &self,
+        assignment: &TaskEvent,
+        status: TaskStatus,
+        reason: Option<String>,
+    ) -> TaskEvent {
+        TaskEvent {
+            event_id: Uuid::now_v7(),
+            task_id: assignment.task_id.clone(),
+            task_offset: assignment.task_offset,
+            assignment_id: assignment.assignment_id,
+            agent_id: Some(self.agent_id.clone()),
+            status,
+            attempt: assignment.attempt,
+            reason,
+            emitted_at: Utc::now(),
+        }
+    }
+}
+
+impl Default for TaskExecutionContext {
+    fn default() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            invalidation: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl TaskExecutionContext {
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    pub fn invalidation(&self) -> Option<TaskInvalidation> {
+        self.invalidation
+            .lock()
+            .expect("execution context lock")
+            .clone()
+    }
+
+    fn invalidate(&self, invalidation: TaskInvalidation) {
+        let mut slot = self.invalidation.lock().expect("execution context lock");
+        if slot.is_none() {
+            *slot = Some(invalidation);
+            self.cancellation.cancel();
+        }
+    }
+}
+
+async fn watch_assignment_invalidation_loop(
+    mut client: WorkerClient,
+    capability_token: String,
+    task_events_topic: String,
+    start_offset: u64,
+    batch_limit: usize,
+    assignment: TaskEvent,
+    context: TaskExecutionContext,
+) -> Result<(), WorkerError> {
+    let mut next_offset = start_offset;
+
+    loop {
+        if scan_assignment_invalidation_batch(
+            &mut client,
+            &capability_token,
+            &task_events_topic,
+            &mut next_offset,
+            batch_limit,
+            &assignment,
+            &context,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn scan_assignment_invalidation_once(
+    client: &mut WorkerClient,
+    capability_token: &str,
+    task_events_topic: &str,
+    start_offset: u64,
+    batch_limit: usize,
+    assignment: &TaskEvent,
+    context: &TaskExecutionContext,
+) -> Result<(), WorkerError> {
+    let mut next_offset = start_offset;
+
+    loop {
+        let messages = consume_messages(
+            client,
+            capability_token,
+            task_events_topic,
+            next_offset,
+            batch_limit,
+        )
+        .await?;
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        for message in messages {
+            next_offset = message.offset.saturating_add(1);
+            let Ok(event) = serde_json::from_str::<TaskEvent>(&message.payload) else {
+                continue;
+            };
+            if let Some(invalidation) = task_invalidation_for_event(assignment, &event) {
+                context.invalidate(invalidation);
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn scan_assignment_invalidation_batch(
+    client: &mut WorkerClient,
+    capability_token: &str,
+    task_events_topic: &str,
+    next_offset: &mut u64,
+    batch_limit: usize,
+    assignment: &TaskEvent,
+    context: &TaskExecutionContext,
+) -> Result<bool, WorkerError> {
+    let messages = consume_messages(
+        client,
+        capability_token,
+        task_events_topic,
+        *next_offset,
+        batch_limit,
+    )
+    .await?;
+    if messages.is_empty() {
+        return Ok(false);
+    }
+
+    for message in messages {
+        *next_offset = message.offset.saturating_add(1);
+        let Ok(event) = serde_json::from_str::<TaskEvent>(&message.payload) else {
+            continue;
+        };
+        if let Some(invalidation) = task_invalidation_for_event(assignment, &event) {
+            context.invalidate(invalidation);
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn task_invalidation_for_event(
+    assignment: &TaskEvent,
+    event: &TaskEvent,
+) -> Option<TaskInvalidation> {
+    if event.task_id != assignment.task_id {
+        return None;
+    }
+
+    let same_assignment = event.assignment_id == assignment.assignment_id
+        && event.agent_id.as_deref() == assignment.agent_id.as_deref();
+
+    let invalidates = match event.status {
+        TaskStatus::Assigned => !same_assignment,
+        TaskStatus::Pending => same_assignment || event.assignment_id.is_none(),
+        TaskStatus::RetryScheduled
+        | TaskStatus::TimedOut
+        | TaskStatus::Exhausted
+        | TaskStatus::Canceled => same_assignment || event.assignment_id.is_none(),
+        TaskStatus::Completed | TaskStatus::Failed => same_assignment,
+    };
+
+    invalidates.then(|| TaskInvalidation {
+        status: event.status,
+        reason: event.reason.clone(),
+        emitted_at: event.emitted_at,
+        assignment_id: event.assignment_id,
+        agent_id: event.agent_id.clone(),
+    })
 }
 
 async fn send_request<T>(
@@ -147,5 +886,580 @@ where
     match transport.next().await {
         Some(line) => Ok(Some(serde_json::from_str(&line?)?)),
         None => Ok(None),
+    }
+}
+
+async fn publish_task_event(
+    client: &mut WorkerClient,
+    capability_token: &str,
+    topic: &str,
+    event: &TaskEvent,
+) -> Result<(), WorkerError> {
+    let response = client
+        .send(ControlRequest {
+            capability_token: capability_token.to_owned(),
+            command: ControlCommand::Publish {
+                topic: topic.to_owned(),
+                classification: Some(Classification::Internal),
+                payload: serde_json::to_string(event)?,
+            },
+        })
+        .await?;
+
+    match response {
+        ControlResponse::PublishAccepted { .. } => Ok(()),
+        ControlResponse::Error { code, message } => Err(WorkerError::Broker {
+            operation: "publishing task event",
+            code,
+            message,
+        }),
+        other => Err(WorkerError::UnexpectedResponse {
+            operation: "publishing task event",
+            response: format!("{other:?}"),
+        }),
+    }
+}
+
+async fn consume_messages(
+    client: &mut WorkerClient,
+    capability_token: &str,
+    topic: &str,
+    offset: u64,
+    limit: usize,
+) -> Result<Vec<StoredMessage>, WorkerError> {
+    let response = client
+        .send(ControlRequest {
+            capability_token: capability_token.to_owned(),
+            command: ControlCommand::Consume {
+                topic: topic.to_owned(),
+                offset,
+                limit,
+            },
+        })
+        .await?;
+
+    match response {
+        ControlResponse::Messages { messages, .. } => Ok(messages),
+        ControlResponse::Error { code, message } => Err(WorkerError::Broker {
+            operation: "consuming messages",
+            code,
+            message,
+        }),
+        other => Err(WorkerError::UnexpectedResponse {
+            operation: "consuming messages",
+            response: format!("{other:?}"),
+        }),
+    }
+}
+
+fn outcome_from_report(report: &TaskEvent) -> WorkerRunOutcome {
+    match report.status {
+        TaskStatus::Completed => WorkerRunOutcome::Completed {
+            task_id: report.task_id.clone(),
+            assignment_id: report.assignment_id.unwrap_or_else(Uuid::nil),
+        },
+        TaskStatus::Failed => WorkerRunOutcome::Failed {
+            task_id: report.task_id.clone(),
+            assignment_id: report.assignment_id,
+            reason: report
+                .reason
+                .clone()
+                .unwrap_or_else(|| "task failed".to_owned()),
+        },
+        _ => WorkerRunOutcome::Idle,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+    use expressways_protocol::TaskRequirements;
+
+    #[tokio::test]
+    async fn agent_worker_runs_assignment_and_publishes_completion() {
+        let assignment_id =
+            Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa11").expect("assignment id");
+        let assignment = TaskEvent {
+            event_id: Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa12").expect("event id"),
+            task_id: "task-1".to_owned(),
+            task_offset: Some(4),
+            assignment_id: Some(assignment_id),
+            agent_id: Some("alpha".to_owned()),
+            status: TaskStatus::Assigned,
+            attempt: 1,
+            reason: None,
+            emitted_at: Utc::now(),
+        };
+        let task = task_work_item("task-1");
+        let mut worker =
+            AgentWorker::new(Endpoint::Tcp("unused".to_owned()), "signed-token", "alpha")
+                .with_mock_exchanges(vec![
+                    expect_consume(
+                        TASK_EVENTS_TOPIC,
+                        0,
+                        50,
+                        ControlResponse::Messages {
+                            topic: TASK_EVENTS_TOPIC.to_owned(),
+                            messages: vec![stored_message(
+                                TASK_EVENTS_TOPIC,
+                                0,
+                                serde_json::to_string(&assignment).expect("serialize assignment"),
+                            )],
+                            next_offset: 1,
+                        },
+                    ),
+                    expect_consume(
+                        TASKS_TOPIC,
+                        4,
+                        1,
+                        ControlResponse::Messages {
+                            topic: TASKS_TOPIC.to_owned(),
+                            messages: vec![stored_message(
+                                TASKS_TOPIC,
+                                4,
+                                serde_json::to_string(&task).expect("serialize task"),
+                            )],
+                            next_offset: 5,
+                        },
+                    ),
+                    expect_consume(
+                        TASK_EVENTS_TOPIC,
+                        1,
+                        50,
+                        ControlResponse::Messages {
+                            topic: TASK_EVENTS_TOPIC.to_owned(),
+                            messages: Vec::new(),
+                            next_offset: 1,
+                        },
+                    ),
+                    expect_publish_task_event(
+                        TASK_EVENTS_TOPIC,
+                        TaskStatus::Completed,
+                        "task-1",
+                        Some(assignment_id),
+                        "alpha",
+                        None,
+                        ControlResponse::PublishAccepted {
+                            message_id: Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa13")
+                                .expect("message id"),
+                            offset: 1,
+                            classification: Classification::Internal,
+                        },
+                    ),
+                ]);
+        let outcome = worker
+            .run_once(|assignment| async move {
+                assert_eq!(assignment.task.task_id, "task-1");
+                Ok(())
+            })
+            .await
+            .expect("run worker");
+
+        assert_eq!(
+            outcome,
+            WorkerRunOutcome::Completed {
+                task_id: "task-1".to_owned(),
+                assignment_id,
+            }
+        );
+        assert_eq!(worker.state().task_event_offset, 1);
+        assert!(worker.state().pending_report.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_worker_retries_pending_report_before_consuming_new_work() {
+        let assignment_id =
+            Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa21").expect("assignment id");
+        let assignment = TaskEvent {
+            event_id: Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa22").expect("event id"),
+            task_id: "task-1".to_owned(),
+            task_offset: Some(4),
+            assignment_id: Some(assignment_id),
+            agent_id: Some("alpha".to_owned()),
+            status: TaskStatus::Assigned,
+            attempt: 1,
+            reason: None,
+            emitted_at: Utc::now(),
+        };
+        let task = task_work_item("task-1");
+        let mut worker =
+            AgentWorker::new(Endpoint::Tcp("unused".to_owned()), "signed-token", "alpha")
+                .with_mock_exchanges(vec![
+                    expect_consume(
+                        TASK_EVENTS_TOPIC,
+                        0,
+                        50,
+                        ControlResponse::Messages {
+                            topic: TASK_EVENTS_TOPIC.to_owned(),
+                            messages: vec![stored_message(
+                                TASK_EVENTS_TOPIC,
+                                0,
+                                serde_json::to_string(&assignment).expect("serialize assignment"),
+                            )],
+                            next_offset: 1,
+                        },
+                    ),
+                    expect_consume(
+                        TASKS_TOPIC,
+                        4,
+                        1,
+                        ControlResponse::Messages {
+                            topic: TASKS_TOPIC.to_owned(),
+                            messages: vec![stored_message(
+                                TASKS_TOPIC,
+                                4,
+                                serde_json::to_string(&task).expect("serialize task"),
+                            )],
+                            next_offset: 5,
+                        },
+                    ),
+                    expect_consume(
+                        TASK_EVENTS_TOPIC,
+                        1,
+                        50,
+                        ControlResponse::Messages {
+                            topic: TASK_EVENTS_TOPIC.to_owned(),
+                            messages: Vec::new(),
+                            next_offset: 1,
+                        },
+                    ),
+                    expect_publish_task_event(
+                        TASK_EVENTS_TOPIC,
+                        TaskStatus::Completed,
+                        "task-1",
+                        Some(assignment_id),
+                        "alpha",
+                        None,
+                        ControlResponse::Error {
+                            code: "service_degraded".to_owned(),
+                            message: "task events unavailable".to_owned(),
+                        },
+                    ),
+                    expect_publish_task_event(
+                        TASK_EVENTS_TOPIC,
+                        TaskStatus::Completed,
+                        "task-1",
+                        Some(assignment_id),
+                        "alpha",
+                        None,
+                        ControlResponse::PublishAccepted {
+                            message_id: Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa23")
+                                .expect("message id"),
+                            offset: 1,
+                            classification: Classification::Internal,
+                        },
+                    ),
+                    expect_consume(
+                        TASK_EVENTS_TOPIC,
+                        1,
+                        50,
+                        ControlResponse::Messages {
+                            topic: TASK_EVENTS_TOPIC.to_owned(),
+                            messages: Vec::new(),
+                            next_offset: 1,
+                        },
+                    ),
+                ]);
+        let error = worker
+            .run_once(|_| async move { Ok(()) })
+            .await
+            .expect_err("initial publish should fail");
+        match error {
+            WorkerError::Broker {
+                operation, code, ..
+            } => {
+                assert_eq!(operation, "publishing task event");
+                assert_eq!(code, "service_degraded");
+            }
+            other => panic!("expected broker error, got {other:?}"),
+        }
+        assert_eq!(worker.state().task_event_offset, 1);
+        assert!(worker.state().pending_report.is_some());
+
+        let outcome = worker
+            .run_once(|_| async move { panic!("handler should not run") })
+            .await
+            .expect("retry pending report");
+        assert_eq!(outcome, WorkerRunOutcome::Idle);
+        assert!(worker.state().pending_report.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_worker_marks_missing_task_payload_as_failed() {
+        let assignment_id =
+            Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa31").expect("assignment id");
+        let assignment = TaskEvent {
+            event_id: Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa32").expect("event id"),
+            task_id: "task-1".to_owned(),
+            task_offset: Some(9),
+            assignment_id: Some(assignment_id),
+            agent_id: Some("alpha".to_owned()),
+            status: TaskStatus::Assigned,
+            attempt: 2,
+            reason: None,
+            emitted_at: Utc::now(),
+        };
+        let mut worker =
+            AgentWorker::new(Endpoint::Tcp("unused".to_owned()), "signed-token", "alpha")
+                .with_mock_exchanges(vec![
+                    expect_consume(
+                        TASK_EVENTS_TOPIC,
+                        0,
+                        50,
+                        ControlResponse::Messages {
+                            topic: TASK_EVENTS_TOPIC.to_owned(),
+                            messages: vec![stored_message(
+                                TASK_EVENTS_TOPIC,
+                                0,
+                                serde_json::to_string(&assignment).expect("serialize assignment"),
+                            )],
+                            next_offset: 1,
+                        },
+                    ),
+                    expect_consume(
+                        TASKS_TOPIC,
+                        9,
+                        1,
+                        ControlResponse::Messages {
+                            topic: TASKS_TOPIC.to_owned(),
+                            messages: Vec::new(),
+                            next_offset: 9,
+                        },
+                    ),
+                    expect_publish_task_event(
+                        TASK_EVENTS_TOPIC,
+                        TaskStatus::Failed,
+                        "task-1",
+                        Some(assignment_id),
+                        "alpha",
+                        Some("not found"),
+                        ControlResponse::PublishAccepted {
+                            message_id: Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa33")
+                                .expect("message id"),
+                            offset: 1,
+                            classification: Classification::Internal,
+                        },
+                    ),
+                ]);
+        let outcome = worker
+            .run_once(|_| async move { panic!("handler should not run") })
+            .await
+            .expect("run worker");
+
+        match outcome {
+            WorkerRunOutcome::Failed {
+                task_id,
+                assignment_id: Some(id),
+                reason,
+            } => {
+                assert_eq!(task_id, "task-1");
+                assert_eq!(id, assignment_id);
+                assert!(reason.contains("not found"));
+            }
+            other => panic!("expected failed outcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_worker_stops_when_assignment_is_canceled() {
+        let assignment_id =
+            Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa41").expect("assignment id");
+        let assignment = TaskEvent {
+            event_id: Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa42").expect("event id"),
+            task_id: "task-1".to_owned(),
+            task_offset: Some(4),
+            assignment_id: Some(assignment_id),
+            agent_id: Some("alpha".to_owned()),
+            status: TaskStatus::Assigned,
+            attempt: 1,
+            reason: None,
+            emitted_at: Utc::now(),
+        };
+        let canceled = TaskEvent {
+            event_id: Uuid::parse_str("018f7f2f-8d84-7b11-9f4e-9b5531e3aa43")
+                .expect("cancel event id"),
+            task_id: "task-1".to_owned(),
+            task_offset: Some(4),
+            assignment_id: Some(assignment_id),
+            agent_id: Some("alpha".to_owned()),
+            status: TaskStatus::Canceled,
+            attempt: 1,
+            reason: Some("operator canceled work".to_owned()),
+            emitted_at: Utc::now(),
+        };
+        let task = task_work_item("task-1");
+        let mut worker =
+            AgentWorker::new(Endpoint::Tcp("unused".to_owned()), "signed-token", "alpha")
+                .with_mock_exchanges(vec![
+                    expect_consume(
+                        TASK_EVENTS_TOPIC,
+                        0,
+                        50,
+                        ControlResponse::Messages {
+                            topic: TASK_EVENTS_TOPIC.to_owned(),
+                            messages: vec![stored_message(
+                                TASK_EVENTS_TOPIC,
+                                0,
+                                serde_json::to_string(&assignment).expect("serialize assignment"),
+                            )],
+                            next_offset: 1,
+                        },
+                    ),
+                    expect_consume(
+                        TASKS_TOPIC,
+                        4,
+                        1,
+                        ControlResponse::Messages {
+                            topic: TASKS_TOPIC.to_owned(),
+                            messages: vec![stored_message(
+                                TASKS_TOPIC,
+                                4,
+                                serde_json::to_string(&task).expect("serialize task"),
+                            )],
+                            next_offset: 5,
+                        },
+                    ),
+                    expect_consume(
+                        TASK_EVENTS_TOPIC,
+                        1,
+                        50,
+                        ControlResponse::Messages {
+                            topic: TASK_EVENTS_TOPIC.to_owned(),
+                            messages: vec![stored_message(
+                                TASK_EVENTS_TOPIC,
+                                1,
+                                serde_json::to_string(&canceled).expect("serialize cancel event"),
+                            )],
+                            next_offset: 2,
+                        },
+                    ),
+                ]);
+
+        let outcome = worker
+            .run_once_with_context(|_, context| async move {
+                context.cancelled().await;
+                Err("handler should stop after cancellation".to_owned())
+            })
+            .await
+            .expect("run worker");
+
+        assert_eq!(
+            outcome,
+            WorkerRunOutcome::Canceled {
+                task_id: "task-1".to_owned(),
+                assignment_id: Some(assignment_id),
+                status: TaskStatus::Canceled,
+                reason: Some("operator canceled work".to_owned()),
+            }
+        );
+        assert!(worker.state().pending_report.is_none());
+    }
+
+    fn expect_consume(
+        topic: &str,
+        offset: u64,
+        limit: usize,
+        response: ControlResponse,
+    ) -> MockExchange {
+        let topic = topic.to_owned();
+        MockExchange {
+            check: Box::new(move |request| {
+                assert_eq!(request.capability_token, "signed-token");
+                match &request.command {
+                    ControlCommand::Consume {
+                        topic: actual_topic,
+                        offset: actual_offset,
+                        limit: actual_limit,
+                    } => {
+                        assert_eq!(actual_topic, &topic);
+                        assert_eq!(*actual_offset, offset);
+                        assert_eq!(*actual_limit, limit);
+                    }
+                    other => panic!("expected consume request, got {other:?}"),
+                }
+            }),
+            response: Ok(response),
+        }
+    }
+
+    fn expect_publish_task_event(
+        topic: &str,
+        expected_status: TaskStatus,
+        expected_task_id: &str,
+        expected_assignment_id: Option<Uuid>,
+        expected_agent_id: &str,
+        reason_contains: Option<&str>,
+        response: ControlResponse,
+    ) -> MockExchange {
+        let topic = topic.to_owned();
+        let expected_task_id = expected_task_id.to_owned();
+        let expected_agent_id = expected_agent_id.to_owned();
+        let reason_contains = reason_contains.map(str::to_owned);
+
+        MockExchange {
+            check: Box::new(move |request| {
+                assert_eq!(request.capability_token, "signed-token");
+                match &request.command {
+                    ControlCommand::Publish {
+                        topic: actual_topic,
+                        classification,
+                        payload,
+                    } => {
+                        assert_eq!(actual_topic, &topic);
+                        assert_eq!(classification, &Some(Classification::Internal));
+                        let event: TaskEvent =
+                            serde_json::from_str(payload).expect("parse task event payload");
+                        assert_eq!(event.status, expected_status);
+                        assert_eq!(event.task_id, expected_task_id);
+                        assert_eq!(event.assignment_id, expected_assignment_id);
+                        assert_eq!(event.agent_id.as_deref(), Some(expected_agent_id.as_str()));
+                        if let Some(expected_reason) = &reason_contains {
+                            assert!(
+                                event
+                                    .reason
+                                    .as_deref()
+                                    .is_some_and(|reason| reason.contains(expected_reason)),
+                                "expected reason containing `{expected_reason}`, got {:?}",
+                                event.reason
+                            );
+                        }
+                    }
+                    other => panic!("expected publish request, got {other:?}"),
+                }
+            }),
+            response: Ok(response),
+        }
+    }
+
+    fn task_work_item(task_id: &str) -> TaskWorkItem {
+        TaskWorkItem {
+            task_id: task_id.to_owned(),
+            task_type: "summarize_document".to_owned(),
+            priority: 0,
+            requirements: TaskRequirements {
+                skill: Some("summarize".to_owned()),
+                topic: Some("topic:results".to_owned()),
+                principal: None,
+                preferred_agents: Vec::new(),
+                avoid_agents: Vec::new(),
+            },
+            payload: serde_json::json!({ "path": "notes.md" }),
+            retry_policy: Default::default(),
+            submitted_at: Utc::now(),
+        }
+    }
+
+    fn stored_message(topic: &str, offset: u64, payload: String) -> StoredMessage {
+        StoredMessage {
+            message_id: Uuid::now_v7(),
+            topic: topic.to_owned(),
+            offset,
+            timestamp: Utc::now(),
+            producer: "local:agent-orchestrator".to_owned(),
+            classification: Classification::Internal,
+            payload,
+        }
     }
 }

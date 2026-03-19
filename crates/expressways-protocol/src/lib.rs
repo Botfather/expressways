@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 pub const BROKER_RESOURCE: &str = "system:broker";
 pub const REGISTRY_RESOURCE: &str = "registry:agents";
+pub const TASKS_TOPIC: &str = "tasks";
+pub const TASK_EVENTS_TOPIC: &str = "task_events";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -210,6 +212,119 @@ pub struct AgentQuery {
     pub principal: Option<String>,
     #[serde(default)]
     pub include_stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TaskRequirements {
+    pub skill: Option<String>,
+    pub topic: Option<String>,
+    pub principal: Option<String>,
+    #[serde(default)]
+    pub preferred_agents: Vec<String>,
+    #[serde(default)]
+    pub avoid_agents: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRetryPolicy {
+    #[serde(default = "default_task_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_task_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_task_retry_delay_seconds")]
+    pub retry_delay_seconds: u64,
+}
+
+impl Default for TaskRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_task_max_attempts(),
+            timeout_seconds: default_task_timeout_seconds(),
+            retry_delay_seconds: default_task_retry_delay_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskWorkItem {
+    pub task_id: String,
+    pub task_type: String,
+    #[serde(default = "default_task_priority")]
+    pub priority: i32,
+    #[serde(default)]
+    pub requirements: TaskRequirements,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub retry_policy: TaskRetryPolicy,
+    #[serde(default = "default_timestamp")]
+    pub submitted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    Assigned,
+    Completed,
+    Failed,
+    RetryScheduled,
+    TimedOut,
+    Exhausted,
+    Canceled,
+}
+
+impl TaskStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Exhausted | Self::Canceled)
+    }
+}
+
+impl Display for TaskStatus {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Pending => "pending",
+            Self::Assigned => "assigned",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::RetryScheduled => "retry_scheduled",
+            Self::TimedOut => "timed_out",
+            Self::Exhausted => "exhausted",
+            Self::Canceled => "canceled",
+        })
+    }
+}
+
+impl FromStr for TaskStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "assigned" => Ok(Self::Assigned),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "retry_scheduled" => Ok(Self::RetryScheduled),
+            "timed_out" => Ok(Self::TimedOut),
+            "exhausted" => Ok(Self::Exhausted),
+            "canceled" => Ok(Self::Canceled),
+            other => Err(format!("unsupported task status `{other}`")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEvent {
+    pub event_id: Uuid,
+    pub task_id: String,
+    pub task_offset: Option<u64>,
+    pub assignment_id: Option<Uuid>,
+    pub agent_id: Option<String>,
+    pub status: TaskStatus,
+    pub attempt: u32,
+    pub reason: Option<String>,
+    #[serde(default = "default_timestamp")]
+    pub emitted_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -514,6 +629,26 @@ fn default_audience() -> String {
     "expressways".to_owned()
 }
 
+fn default_task_max_attempts() -> u32 {
+    3
+}
+
+fn default_task_timeout_seconds() -> u64 {
+    300
+}
+
+fn default_task_retry_delay_seconds() -> u64 {
+    5
+}
+
+fn default_task_priority() -> i32 {
+    0
+}
+
+fn default_timestamp() -> DateTime<Utc> {
+    Utc::now()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +660,27 @@ mod tests {
 
         let action: Action = serde_json::from_str(&json).expect("deserialize action");
         assert_eq!(action, Action::Publish);
+    }
+
+    #[test]
+    fn task_status_round_trips_as_snake_case() {
+        let json = serde_json::to_string(&TaskStatus::Canceled).expect("serialize task status");
+        assert_eq!(json, "\"canceled\"");
+
+        let status: TaskStatus = serde_json::from_str(&json).expect("deserialize task status");
+        assert_eq!(status, TaskStatus::Canceled);
+    }
+
+    #[test]
+    fn task_work_item_defaults_scheduler_fields() {
+        let task: TaskWorkItem = serde_json::from_value(serde_json::json!({
+            "task_id": "task-1",
+            "task_type": "summarize_document"
+        }))
+        .expect("deserialize task work item");
+
+        assert_eq!(task.priority, 0);
+        assert!(task.requirements.preferred_agents.is_empty());
+        assert!(task.requirements.avoid_agents.is_empty());
     }
 }
