@@ -597,6 +597,8 @@ cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev
 
 ```bash
 cargo run -p expressways-server -- --config configs/expressways.example.toml
+make help
+make run-expressways
 ```
 
 The sample config enables:
@@ -704,11 +706,16 @@ cargo run -p expressways-client --bin expresswaysctl -- export-audit --path ./va
 
 ```bash
 cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 supervise --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --tasks-topic tasks --task-events-topic task_events
+cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 serve-dashboard --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --listen 127.0.0.1:8787
+make run-orchestrator
+make run-dashboard
+make run-stack
 cargo run -p expressways-orchestrator -- show-metrics --state-path ./var/orchestrator/state.json
-cargo run -p expressways-orchestrator -- list-tasks --state-path ./var/orchestrator/state.json --status assigned
+cargo run -p expressways-orchestrator -- list-tasks --state-path ./var/orchestrator/state.json --status assigned --sort-by priority --output table
+cargo run -p expressways-orchestrator -- watch-tasks --state-path ./var/orchestrator/state.json --status assigned --sort-by priority --output table --refresh-interval-ms 1000
 cargo run -p expressways-orchestrator -- show-task --state-path ./var/orchestrator/state.json --task-id task-1
-cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 show-task-history --token-file ./var/auth/developer.token --task-id task-1 --limit 10
-cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 tail-task-events --token-file ./var/auth/developer.token --task-id task-1 --offset 0 --limit 5
+cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 show-task-history --token-file ./var/auth/developer.token --task-id task-1 --status assigned --output table --limit 10
+cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 tail-task-events --token-file ./var/auth/developer.token --status assigned --agent-id summarizer --output table --offset 0 --limit 5
 cargo run -p expressways-orchestrator -- requeue-task --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --task-id task-1 --reason "operator requested reroute"
 cargo run -p expressways-orchestrator -- cancel-task --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --task-id task-1 --reason "operator canceled obsolete work"
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 submit-task --token-file ./var/auth/developer.token --task-id task-1 --task-type summarize_document --skill summarize --priority 50 --preferred-agent summarizer --avoid-agent fallback --payload-json '{"path":"notes.md"}'
@@ -716,7 +723,7 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 report-task --token-file ./var/auth/developer.token --task-id task-1 --assignment-id <assignment-id> --agent-id summarizer --status completed --attempt 1
 ```
 
-This loop lets the supervisor consume `tasks`, emit audited `assigned` records to `task_events`, and then close the task when an agent reports `completed` or `failed`. The same topic also carries orchestrator-published `timed_out`, `retry_scheduled`, `exhausted`, and `canceled` lifecycle events. `show-metrics` summarizes the persisted orchestrator state with per-status counts, total retries, and oldest in-flight assignment age, while `list-tasks` and `show-task` let operators inspect which specific task is active, retrying, or stuck. Both `list-tasks` and `show-task` now include the latest assignment rationale from the scheduler, and `show-task-history` reads the broker-backed `task_events` timeline for one task if you want the raw lifecycle log. `tail-task-events` streams line-delimited JSON events for live debugging. `submit-task` now accepts scheduler hints such as `--priority`, repeated `--preferred-agent`, and repeated `--avoid-agent`, and the orchestrator uses those hints alongside current in-flight load to choose the best eligible agent. Each orchestrator-generated `assigned` event now also includes a human-readable scheduler reason so operators can see why that agent won. `requeue-task` and `cancel-task` publish audited control events instead of mutating local state silently, and cancellation-aware workers can observe those events before they emit a stale completion.
+This loop lets the supervisor consume `tasks`, emit audited `assigned` records to `task_events`, and then close the task when an agent reports `completed` or `failed`. The same topic also carries orchestrator-published `timed_out`, `retry_scheduled`, `exhausted`, and `canceled` lifecycle events. `show-metrics` summarizes the persisted orchestrator state with per-status counts, total retries, and oldest in-flight assignment age, while `list-tasks`, `watch-tasks`, and `show-task` let operators inspect which specific task is active, retrying, or stuck. `watch-tasks` is a live terminal view that refreshes the same filtered and sorted queue output used by `list-tasks`, so operators can monitor assignments without rerunning commands manually. `serve-dashboard` exposes the same queue and lifecycle data over a small local HTTP server with `/api/metrics`, `/api/tasks`, `/api/tasks/<task-id>`, and `/api/tasks/<task-id>/history`, plus a built-in browser dashboard on `http://127.0.0.1:8787/`. If you want quick local entrypoints instead of pasting the full commands, `make help` lists the common workflows and `make run-expressways`, `make run-orchestrator`, `make run-dashboard`, and `make run-stack` wrap the same broker, supervisor, and dashboard flows. Both `list-tasks` and `show-task` now include the latest assignment rationale from the scheduler, and `list-tasks` can sort by `offset`, `priority`, `age`, or `retries` to make the queue more actionable. `show-task-history` and `tail-task-events` now share the same event filters for `task_id`, `status`, `agent_id`, and `assignment_id`, plus matching `json`, `jsonl`, and compact `table` outputs, so point-in-time inspection and live tailing use the same operator workflow. `submit-task` now accepts scheduler hints such as `--priority`, repeated `--preferred-agent`, and repeated `--avoid-agent`, and the orchestrator uses those hints alongside current in-flight load to choose the best eligible agent. Each orchestrator-generated `assigned` event now also includes a human-readable scheduler reason so operators can see why that agent won. `requeue-task` and `cancel-task` publish audited control events instead of mutating local state silently, and cancellation-aware workers can observe those events before they emit a stale completion.
 
 ### Example: Run the sample task agent
 

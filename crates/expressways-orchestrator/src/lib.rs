@@ -73,11 +73,27 @@ pub struct OrchestratorMetricsView {
     pub tasks: TaskLifecycleMetrics,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TaskListSort {
+    Offset,
+    Priority,
+    Age,
+    Retries,
+}
+
+impl Default for TaskListSort {
+    fn default() -> Self {
+        Self::Offset
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TaskListQuery {
     pub status: Option<TaskStatus>,
     pub skill: Option<String>,
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub sort_by: TaskListSort,
     pub limit: Option<usize>,
 }
 
@@ -228,11 +244,7 @@ pub fn list_tasks(state: &OrchestratorState, query: &TaskListQuery) -> Vec<TaskS
         .filter(|task| task_matches_query(task, query))
         .map(task_summary_view)
         .collect::<Vec<_>>();
-    tasks.sort_by(|left, right| {
-        left.task_offset
-            .cmp(&right.task_offset)
-            .then_with(|| left.task_id.cmp(&right.task_id))
-    });
+    tasks.sort_by(|left, right| compare_task_summaries(left, right, &query.sort_by));
 
     if let Some(limit) = query.limit {
         tasks.truncate(limit.max(1));
@@ -918,6 +930,36 @@ fn task_summary_view(task: &TaskRecord) -> TaskSummaryView {
     }
 }
 
+fn compare_task_summaries(
+    left: &TaskSummaryView,
+    right: &TaskSummaryView,
+    sort_by: &TaskListSort,
+) -> std::cmp::Ordering {
+    match sort_by {
+        TaskListSort::Offset => left
+            .task_offset
+            .cmp(&right.task_offset)
+            .then_with(|| left.task_id.cmp(&right.task_id)),
+        TaskListSort::Priority => right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.task_offset.cmp(&right.task_offset))
+            .then_with(|| left.task_id.cmp(&right.task_id)),
+        TaskListSort::Age => left
+            .submitted_at
+            .cmp(&right.submitted_at)
+            .then_with(|| left.task_offset.cmp(&right.task_offset))
+            .then_with(|| left.task_id.cmp(&right.task_id)),
+        TaskListSort::Retries => right
+            .attempts
+            .saturating_sub(1)
+            .cmp(&left.attempts.saturating_sub(1))
+            .then_with(|| right.priority.cmp(&left.priority))
+            .then_with(|| left.task_offset.cmp(&right.task_offset))
+            .then_with(|| left.task_id.cmp(&right.task_id)),
+    }
+}
+
 fn task_detail_view(task: &TaskRecord, now: DateTime<Utc>) -> TaskDetailView {
     TaskDetailView {
         task_id: task.work_item.task_id.clone(),
@@ -1580,6 +1622,7 @@ mod tests {
                 status: Some(TaskStatus::Assigned),
                 skill: None,
                 agent_id: Some("alpha".to_owned()),
+                sort_by: TaskListSort::Offset,
                 limit: None,
             },
         );
@@ -1597,11 +1640,104 @@ mod tests {
                 status: None,
                 skill: Some("summarize".to_owned()),
                 agent_id: None,
+                sort_by: TaskListSort::Offset,
                 limit: Some(1),
             },
         );
         assert_eq!(summarize_limited.len(), 1);
         assert_eq!(summarize_limited[0].task_id, "task-2");
+    }
+
+    #[test]
+    fn list_tasks_can_sort_by_priority_age_and_retries() {
+        let mut state = OrchestratorState::default();
+        assert!(ingest_task(
+            &mut state,
+            task_with_hints("task-low", "summarize", 3, -5, Vec::new(), Vec::new()),
+            0
+        ));
+        assert!(ingest_task(
+            &mut state,
+            task_with_hints("task-high", "summarize", 3, 50, Vec::new(), Vec::new()),
+            1
+        ));
+        assert!(ingest_task(
+            &mut state,
+            task_with_hints("task-mid", "summarize", 3, 10, Vec::new(), Vec::new()),
+            2
+        ));
+
+        state
+            .tasks
+            .get_mut("task-low")
+            .expect("task-low")
+            .work_item
+            .submitted_at = Utc::now() - Duration::seconds(300);
+        state
+            .tasks
+            .get_mut("task-high")
+            .expect("task-high")
+            .work_item
+            .submitted_at = Utc::now() - Duration::seconds(100);
+        state
+            .tasks
+            .get_mut("task-mid")
+            .expect("task-mid")
+            .work_item
+            .submitted_at = Utc::now() - Duration::seconds(200);
+
+        state.tasks.get_mut("task-low").expect("task-low").attempts = 3;
+        state
+            .tasks
+            .get_mut("task-high")
+            .expect("task-high")
+            .attempts = 1;
+        state.tasks.get_mut("task-mid").expect("task-mid").attempts = 2;
+
+        let by_priority = list_tasks(
+            &state,
+            &TaskListQuery {
+                sort_by: TaskListSort::Priority,
+                ..TaskListQuery::default()
+            },
+        );
+        assert_eq!(
+            by_priority
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-high", "task-mid", "task-low"]
+        );
+
+        let by_age = list_tasks(
+            &state,
+            &TaskListQuery {
+                sort_by: TaskListSort::Age,
+                ..TaskListQuery::default()
+            },
+        );
+        assert_eq!(
+            by_age
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-low", "task-mid", "task-high"]
+        );
+
+        let by_retries = list_tasks(
+            &state,
+            &TaskListQuery {
+                sort_by: TaskListSort::Retries,
+                ..TaskListQuery::default()
+            },
+        );
+        assert_eq!(
+            by_retries
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["task-low", "task-mid", "task-high"]
+        );
     }
 
     #[test]
