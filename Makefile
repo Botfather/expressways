@@ -1,4 +1,4 @@
-.PHONY: benchmark help prepare-local-dirs run-expressways run-orchestrator run-dashboard run-stack
+.PHONY: benchmark generate-token help prepare-local-dirs run-expressways run-orchestrator run-dashboard run-stack
 
 EXPRESSWAYS_CONFIG ?= configs/expressways.example.toml
 BROKER_ADDRESS ?= 127.0.0.1:7766
@@ -56,4 +56,9 @@ benchmark: prepare-local-dirs
 
 generate-token:
 	@echo "Generating a new token..."
-	cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:developer --audience expressways --scope system:broker:health --scope 'system:broker:admin' --scope 'topic:*:admin,publish,consume' --scope 'registry:agents*:admin' --output ./var/auth/developer.token
+	@mkdir -p ./tmp ./var/auth ./var/agent ./var/benchmarks ./var/orchestrator
+	@if [ ! -f ./var/auth/issuer.private ] || [ ! -f ./var/auth/issuer.public ]; then \
+		echo "Issuer keypair missing. Generating local dev keypair..."; \
+		cargo run -p expressways-client --bin expresswaysctl -- generate-keypair --key-id dev --private-key ./var/auth/issuer.private --public-key ./var/auth/issuer.public; \
+	fi
+	cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:developer --audience expressways --scope system:broker:health --scope 'system:broker:admin' --scope 'topic:*:admin,publish,consume' --scope 'artifact:*:publish,consume,admin' --scope 'registry:agents*:admin' --output ./var/auth/developer.token

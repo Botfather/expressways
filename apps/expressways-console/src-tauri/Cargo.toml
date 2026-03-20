@@ -1,0 +1,28 @@
+[package]
+name = "expressways-console"
+version = "0.1.0"
+description = "Tauri monitoring suite for Expressways"
+authors = ["Expressways"]
+license = "MIT"
+repository = ""
+edition = "2024"
+rust-version = "1.93"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "expressways_console_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+serde_json = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+log = "0.4"
+tauri = { version = "2.10.3", features = [] }
+tauri-plugin-log = "2"
+expressways-client = { path = "../../../crates/expressways-client" }
+expressways-protocol = { path = "../../../crates/expressways-protocol" }
