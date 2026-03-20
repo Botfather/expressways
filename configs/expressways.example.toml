@@ -115,6 +115,11 @@ actions = ["publish", "consume", "admin"]
 
 [[policy.rules]]
 principal = "local:developer"
+resource = "artifact:*"
+actions = ["publish", "consume", "admin"]
+
+[[policy.rules]]
+principal = "local:developer"
 resource = "registry:agents*"
 actions = ["admin"]
 

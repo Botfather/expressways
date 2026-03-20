@@ -26,11 +26,14 @@ expressways-policy = { path = "../expressways-policy" }
 expressways-protocol = { path = "../expressways-protocol" }
 expressways-storage = { path = "../expressways-storage" }
 anyhow.workspace = true
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

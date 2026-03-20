@@ -417,6 +417,7 @@ name = "expressways-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "expressways-audit",
@@ -474,6 +475,7 @@ name = "expressways-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "expressways-adopter-api",
@@ -488,8 +490,10 @@ dependencies = [
  "expressways-protocol",
  "expressways-storage",
  "futures-util",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tokio-util",

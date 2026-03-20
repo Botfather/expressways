@@ -92,6 +92,7 @@ struct BlobInspectionArtifact {
     agent_id: String,
     task_type: String,
     payload_kind: String,
+    artifact_id: Option<String>,
     content_type: Option<String>,
     byte_length: usize,
     preview_hex: String,
@@ -299,6 +300,7 @@ fn build_artifact(
     output_path: &Path,
 ) -> BlobInspectionArtifact {
     let file_ref = assignment.payload_file_ref();
+    let artifact_ref = assignment.payload_artifact_ref();
     BlobInspectionArtifact {
         task_id: assignment.task.task_id.clone(),
         assignment_id: assignment
@@ -313,19 +315,38 @@ fn build_artifact(
             .unwrap_or_else(|| "unknown".to_owned()),
         task_type: assignment.task.task_type.clone(),
         payload_kind: assignment.payload_kind().to_owned(),
+        artifact_id: artifact_ref
+            .as_ref()
+            .map(|descriptor| descriptor.artifact_id.clone()),
         content_type: assignment.payload_content_type().map(ToOwned::to_owned),
         byte_length: bytes.len(),
         preview_hex: hex::encode(bytes.iter().take(24).copied().collect::<Vec<_>>()),
         utf8_preview: utf8_preview(bytes),
         source_path: file_ref
             .as_ref()
-            .map(|descriptor| descriptor.path.display().to_string()),
+            .map(|descriptor| descriptor.path.display().to_string())
+            .or_else(|| {
+                artifact_ref
+                    .as_ref()
+                    .and_then(|descriptor| descriptor.local_path.as_ref())
+                    .map(|path| path.display().to_string())
+            }),
         declared_byte_length: file_ref
             .as_ref()
-            .and_then(|descriptor| descriptor.byte_length),
+            .and_then(|descriptor| descriptor.byte_length)
+            .or_else(|| {
+                artifact_ref
+                    .as_ref()
+                    .and_then(|descriptor| descriptor.byte_length)
+            }),
         declared_sha256: file_ref
             .as_ref()
-            .and_then(|descriptor| descriptor.sha256.clone()),
+            .and_then(|descriptor| descriptor.sha256.clone())
+            .or_else(|| {
+                artifact_ref
+                    .as_ref()
+                    .and_then(|descriptor| descriptor.sha256.clone())
+            }),
         output_path: output_path.display().to_string(),
         generated_at: Utc::now(),
     }
@@ -672,6 +693,32 @@ mod tests {
         );
         assert_eq!(artifact.declared_byte_length, Some(2048));
         assert_eq!(artifact.declared_sha256.as_deref(), Some("abc123"));
+        assert!(artifact.preview_hex.starts_with("25504446"));
+    }
+
+    #[test]
+    fn build_artifact_preserves_artifact_ref_metadata_and_preview() {
+        let assignment = assigned_task(
+            "task-artifact",
+            TaskPayload::artifact_ref(
+                "artifact-1",
+                Some("application/pdf".to_owned()),
+                Some(4096),
+                Some("def456".to_owned()),
+                Some("./var/data/artifacts/blobs/artifact-1.blob".to_owned()),
+            ),
+        );
+        let output_path = PathBuf::from("./var/agent/blob-results/task-artifact.blob.json");
+        let artifact = build_artifact(&assignment, b"%PDF sample", &output_path);
+
+        assert_eq!(artifact.payload_kind, "artifact_ref");
+        assert_eq!(artifact.artifact_id.as_deref(), Some("artifact-1"));
+        assert_eq!(
+            artifact.source_path.as_deref(),
+            Some("./var/data/artifacts/blobs/artifact-1.blob")
+        );
+        assert_eq!(artifact.declared_byte_length, Some(4096));
+        assert_eq!(artifact.declared_sha256.as_deref(), Some("def456"));
         assert!(artifact.preview_hex.starts_with("25504446"));
     }
 

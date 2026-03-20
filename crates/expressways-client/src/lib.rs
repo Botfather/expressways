@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use expressways_protocol::{
-    Classification, ControlCommand, ControlRequest, ControlResponse, StoredMessage, StreamFrame,
-    TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent, TaskPayload, TaskStatus, TaskWorkItem,
+    Classification, ControlCommand, ControlRequest, ControlResponse, ControlWireEnvelope,
+    StoredMessage, StreamFrame, TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent, TaskPayload, TaskStatus,
+    TaskWorkItem,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -18,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio_util::codec::{Framed, LinesCodec};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -156,6 +157,25 @@ impl AssignedTask {
         }
     }
 
+    pub fn payload_artifact_ref(&self) -> Option<TaskArtifactRef> {
+        match &self.task.payload {
+            TaskPayload::ArtifactRef {
+                artifact_id,
+                content_type,
+                byte_length,
+                sha256,
+                local_path,
+            } => Some(TaskArtifactRef {
+                artifact_id: artifact_id.clone(),
+                content_type: content_type.clone(),
+                byte_length: *byte_length,
+                sha256: sha256.clone(),
+                local_path: local_path.as_ref().map(PathBuf::from),
+            }),
+            _ => None,
+        }
+    }
+
     pub fn decode_inline_bytes(&self) -> Result<Option<Vec<u8>>, PayloadAccessError> {
         self.task.payload.decode_inline_bytes().map_err(|detail| {
             PayloadAccessError::InvalidInlineBytes {
@@ -178,11 +198,27 @@ impl AssignedTask {
                 }
             });
         }
+        if let Some(artifact_ref) = self.payload_artifact_ref() {
+            let path =
+                artifact_ref
+                    .local_path
+                    .ok_or_else(|| PayloadAccessError::MissingArtifactPath {
+                        task_id: self.task.task_id.clone(),
+                        artifact_id: artifact_ref.artifact_id,
+                    })?;
+            return tokio::fs::read(&path)
+                .await
+                .map_err(|source| PayloadAccessError::Io {
+                    task_id: self.task.task_id.clone(),
+                    path,
+                    source,
+                });
+        }
         if let Some(text) = self.payload_text() {
             return Ok(text.as_bytes().to_vec());
         }
 
-        Err(self.unexpected_payload_kind("text, bytes, or file_ref"))
+        Err(self.unexpected_payload_kind("text, bytes, file_ref, or artifact_ref"))
     }
 
     fn unexpected_payload_kind(&self, expected: &'static str) -> PayloadAccessError {
@@ -200,6 +236,15 @@ pub struct TaskFileRef {
     pub content_type: Option<String>,
     pub byte_length: Option<u64>,
     pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskArtifactRef {
+    pub artifact_id: String,
+    pub content_type: Option<String>,
+    pub byte_length: Option<u64>,
+    pub sha256: Option<String>,
+    pub local_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +292,11 @@ pub enum PayloadAccessError {
     },
     #[error("task `{task_id}` has invalid inline bytes payload: {detail}")]
     InvalidInlineBytes { task_id: String, detail: String },
+    #[error("task `{task_id}` references artifact `{artifact_id}` without a local path")]
+    MissingArtifactPath {
+        task_id: String,
+        artifact_id: String,
+    },
     #[error("failed to decode JSON payload for task `{task_id}`: {source}")]
     InvalidJson {
         task_id: String,
@@ -263,10 +313,10 @@ pub enum PayloadAccessError {
 }
 
 enum Transport {
-    Tcp(Framed<TcpStream, LinesCodec>),
+    Tcp(Framed<TcpStream, LengthDelimitedCodec>),
     #[cfg(unix)]
-    Unix(Framed<UnixStream, LinesCodec>),
-    Custom(Framed<BoxedClientIo, LinesCodec>),
+    Unix(Framed<UnixStream, LengthDelimitedCodec>),
+    Custom(Framed<BoxedClientIo, LengthDelimitedCodec>),
 }
 
 impl std::fmt::Debug for Transport {
@@ -303,9 +353,13 @@ pub enum ClientError {
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("protocol framing error: {0}")]
-    Codec(#[from] LinesCodecError),
+    Codec(#[from] LengthDelimitedCodecError),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("wire protocol error: {0}")]
+    Wire(String),
+    #[error("unexpected binary attachment in response")]
+    UnexpectedAttachment,
     #[error("server closed the connection")]
     ConnectionClosed,
     #[error("unix sockets are not supported on this platform")]
@@ -370,7 +424,7 @@ enum AssignmentFetchError {
     Task(#[from] TaskResolutionError),
 }
 
-type LinesCodecError = tokio_util::codec::LinesCodecError;
+type LengthDelimitedCodecError = tokio_util::codec::LengthDelimitedCodecError;
 
 impl Client {
     pub async fn connect(endpoint: Endpoint) -> Result<Self, ClientError> {
@@ -379,31 +433,43 @@ impl Client {
                 let stream = TcpStream::connect(address).await?;
                 stream.set_nodelay(true)?;
                 Ok(Self {
-                    transport: Transport::Tcp(Framed::new(stream, LinesCodec::new())),
+                    transport: Transport::Tcp(Framed::new(stream, LengthDelimitedCodec::new())),
                 })
             }
             #[cfg(unix)]
             Endpoint::Unix(path) => {
                 let stream = UnixStream::connect(path).await?;
                 Ok(Self {
-                    transport: Transport::Unix(Framed::new(stream, LinesCodec::new())),
+                    transport: Transport::Unix(Framed::new(stream, LengthDelimitedCodec::new())),
                 })
             }
             Endpoint::Custom(custom) => {
                 let stream = (custom.connector)().await?;
                 Ok(Self {
-                    transport: Transport::Custom(Framed::new(stream, LinesCodec::new())),
+                    transport: Transport::Custom(Framed::new(stream, LengthDelimitedCodec::new())),
                 })
             }
         }
     }
 
     pub async fn send(&mut self, request: ControlRequest) -> Result<ControlResponse, ClientError> {
+        let (response, attachment) = self.send_with_attachment(request, None).await?;
+        if attachment.is_some() {
+            return Err(ClientError::UnexpectedAttachment);
+        }
+        Ok(response)
+    }
+
+    pub async fn send_with_attachment(
+        &mut self,
+        request: ControlRequest,
+        attachment: Option<Vec<u8>>,
+    ) -> Result<(ControlResponse, Option<Vec<u8>>), ClientError> {
         match &mut self.transport {
-            Transport::Tcp(transport) => send_request(transport, request).await,
+            Transport::Tcp(transport) => send_request(transport, request, attachment).await,
             #[cfg(unix)]
-            Transport::Unix(transport) => send_request(transport, request).await,
-            Transport::Custom(transport) => send_request(transport, request).await,
+            Transport::Unix(transport) => send_request(transport, request, attachment).await,
+            Transport::Custom(transport) => send_request(transport, request, attachment).await,
         }
     }
 
@@ -966,49 +1032,88 @@ fn task_invalidation_for_event(
 }
 
 async fn send_request<T>(
-    transport: &mut Framed<T, LinesCodec>,
+    transport: &mut Framed<T, LengthDelimitedCodec>,
     request: ControlRequest,
-) -> Result<ControlResponse, ClientError>
+    attachment: Option<Vec<u8>>,
+) -> Result<(ControlResponse, Option<Vec<u8>>), ClientError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let payload = serde_json::to_string(&request)?;
-    transport.send(payload).await?;
+    let payload = ControlWireEnvelope::Request {
+        request,
+        attachment_length: 0,
+    }
+    .encode_with_attachment(attachment.as_deref())?;
+    transport.send(payload.into()).await?;
 
-    let line = transport
+    let frame = transport
         .next()
         .await
         .ok_or(ClientError::ConnectionClosed)??;
-
-    Ok(serde_json::from_str(&line)?)
+    let (envelope, attachment) =
+        ControlWireEnvelope::decode_packet(&frame).map_err(ClientError::Wire)?;
+    match envelope {
+        ControlWireEnvelope::Response { response, .. } => {
+            Ok((response, (!attachment.is_empty()).then_some(attachment)))
+        }
+        other => Err(ClientError::Wire(format!(
+            "expected response packet, got {other:?}"
+        ))),
+    }
 }
 
 async fn send_stream_open<T>(
-    transport: &mut Framed<T, LinesCodec>,
+    transport: &mut Framed<T, LengthDelimitedCodec>,
     request: ControlRequest,
 ) -> Result<StreamFrame, ClientError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let payload = serde_json::to_string(&request)?;
-    transport.send(payload).await?;
+    let payload = ControlWireEnvelope::Request {
+        request,
+        attachment_length: 0,
+    }
+    .encode_with_attachment(None)?;
+    transport.send(payload.into()).await?;
 
-    let line = transport
+    let frame = transport
         .next()
         .await
         .ok_or(ClientError::ConnectionClosed)??;
-
-    Ok(serde_json::from_str(&line)?)
+    let (envelope, attachment) =
+        ControlWireEnvelope::decode_packet(&frame).map_err(ClientError::Wire)?;
+    if !attachment.is_empty() {
+        return Err(ClientError::UnexpectedAttachment);
+    }
+    match envelope {
+        ControlWireEnvelope::Stream { frame } => Ok(frame),
+        other => Err(ClientError::Wire(format!(
+            "expected stream packet, got {other:?}"
+        ))),
+    }
 }
 
 async fn read_stream_frame<T>(
-    transport: &mut Framed<T, LinesCodec>,
+    transport: &mut Framed<T, LengthDelimitedCodec>,
 ) -> Result<Option<StreamFrame>, ClientError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     match transport.next().await {
-        Some(line) => Ok(Some(serde_json::from_str(&line?)?)),
+        Some(frame) => {
+            let frame = frame?;
+            let (envelope, attachment) =
+                ControlWireEnvelope::decode_packet(&frame).map_err(ClientError::Wire)?;
+            if !attachment.is_empty() {
+                return Err(ClientError::UnexpectedAttachment);
+            }
+            match envelope {
+                ControlWireEnvelope::Stream { frame } => Ok(Some(frame)),
+                other => Err(ClientError::Wire(format!(
+                    "expected stream frame packet, got {other:?}"
+                ))),
+            }
+        }
         None => Ok(None),
     }
 }
@@ -1504,6 +1609,7 @@ mod tests {
         );
         assert!(assigned.payload_text().is_none());
         assert!(assigned.payload_file_ref().is_none());
+        assert!(assigned.payload_artifact_ref().is_none());
     }
 
     #[tokio::test]
@@ -1543,6 +1649,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(file_ref.path);
+    }
+
+    #[tokio::test]
+    async fn assigned_task_helpers_read_artifact_ref_payload_bytes() {
+        let path =
+            std::env::temp_dir().join(format!("expressways-artifact-{}.bin", Uuid::now_v7()));
+        std::fs::write(&path, b"PROTO").expect("write artifact file");
+        let mut task = task_work_item("task-artifact");
+        task.payload = TaskPayload::artifact_ref(
+            "artifact-1",
+            Some("application/x-protobuf".to_owned()),
+            Some(5),
+            Some("abc123".to_owned()),
+            Some(path.display().to_string()),
+        );
+        let assigned = assigned_task(task);
+
+        let artifact_ref = assigned.payload_artifact_ref().expect("artifact ref");
+        assert_eq!(artifact_ref.artifact_id, "artifact-1");
+        assert_eq!(
+            artifact_ref.content_type.as_deref(),
+            Some("application/x-protobuf")
+        );
+        assert_eq!(
+            assigned
+                .read_payload_bytes()
+                .await
+                .expect("read artifact payload"),
+            b"PROTO".to_vec()
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     fn expect_consume(

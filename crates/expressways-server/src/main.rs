@@ -1,4 +1,5 @@
 mod adopters;
+mod artifacts;
 mod config;
 mod metrics;
 mod quota;
@@ -18,9 +19,10 @@ use expressways_audit::{
 use expressways_auth::{AuthSnapshot, CapabilityVerifier, RevocationList, VerifiedCapability};
 use expressways_policy::PolicyEngine;
 use expressways_protocol::{
-    Action, AgentQuery, AgentRegistration, AuthIssuerView, AuthPrincipalView, AuthRevocationView,
-    AuthStateView, BROKER_RESOURCE, ControlCommand, ControlRequest, ControlResponse,
-    REGISTRY_RESOURCE, RegistryEventKind, StreamFrame, TopicSpec, registry_entry_resource,
+    ARTIFACT_COLLECTION_RESOURCE, Action, AgentQuery, AgentRegistration, AuthIssuerView,
+    AuthPrincipalView, AuthRevocationView, AuthStateView, BROKER_RESOURCE, ControlCommand,
+    ControlRequest, ControlResponse, ControlWireEnvelope, REGISTRY_RESOURCE, RegistryEventKind,
+    RetentionClass, StreamFrame, TopicSpec, artifact_resource, registry_entry_resource,
     topic_resource,
 };
 use expressways_storage::{DiskPressurePolicy, RetentionPolicy, Storage, StorageConfig};
@@ -30,11 +32,12 @@ use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use tokio_util::codec::{Framed, LinesCodec};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::adopters::AdopterManager;
+use crate::artifacts::{ArtifactError, ArtifactStore, PutArtifactRequest};
 use crate::config::{AppConfig, RegistryBackend, ResilienceSection, ServerConfig, TransportKind};
 use crate::metrics::MetricsCollector;
 use crate::quota::QuotaManager;
@@ -57,6 +60,7 @@ struct BrokerState {
     service_mode: ServiceModeTracker,
     metrics: MetricsCollector,
     storage: Mutex<Option<Storage>>,
+    artifacts: Mutex<Option<ArtifactStore>>,
     registry: Mutex<AgentRegistry>,
     registry_events: RegistryEventHub,
     adopters: AdopterManager,
@@ -343,6 +347,15 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
         }
         Err(error) => return Err(error.into()),
     };
+    let artifacts = match ArtifactStore::new(config.server.data_dir.join("artifacts")) {
+        Ok(artifacts) => Some(artifacts),
+        Err(error) if config.resilience.allow_degraded_startup => {
+            service_mode.mark_degraded("artifacts", error.to_string());
+            warn!(error = %error, "artifact store initialization failed; starting in degraded mode");
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
     let verifier = CapabilityVerifier::from_config(&config.auth)?;
     let quotas = QuotaManager::new(config.quotas.clone())?;
     let registry = build_registry(config);
@@ -365,6 +378,7 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
         service_mode,
         metrics: MetricsCollector::new(),
         storage: Mutex::new(storage),
+        artifacts: Mutex::new(artifacts),
         registry: Mutex::new(registry),
         registry_events,
         adopters,
@@ -544,26 +558,27 @@ async fn handle_connection<T>(stream: T, state: Arc<BrokerState>) -> anyhow::Res
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut framed = Framed::new(stream, LinesCodec::new());
+    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
 
     while let Some(frame) = framed.next().await {
-        let line = match frame {
-            Ok(line) => line,
+        let packet = match frame {
+            Ok(packet) => packet,
             Err(error) => {
                 warn!(error = %error, "failed to read request frame");
                 continue;
             }
         };
 
-        let request = match serde_json::from_str::<ControlRequest>(&line) {
+        let (request, attachment) = match decode_request_packet(&packet) {
             Ok(request) => request,
             Err(error) => {
                 warn!(error = %error, "failed to decode request");
-                let serialized = serde_json::to_string(&ControlResponse::error(
-                    "invalid_request",
-                    error.to_string(),
-                ))?;
-                framed.send(serialized).await?;
+                send_response_packet(
+                    &mut framed,
+                    ControlResponse::error("invalid_request", error),
+                    None,
+                )
+                .await?;
                 continue;
             }
         };
@@ -573,16 +588,16 @@ where
             break;
         }
 
-        let response = process_request(&state, request).await;
-        let serialized = serde_json::to_string(&response)?;
-        framed.send(serialized).await?;
+        let (response, attachment) =
+            process_request_with_attachment(&state, request, attachment).await;
+        send_response_packet(&mut framed, response, attachment).await?;
     }
 
     Ok(())
 }
 
 async fn serve_streaming_request<T>(
-    framed: &mut Framed<T, LinesCodec>,
+    framed: &mut Framed<T, LengthDelimitedCodec>,
     state: &Arc<BrokerState>,
     request: ControlRequest,
 ) -> anyhow::Result<()>
@@ -874,19 +889,50 @@ where
     Ok(())
 }
 
+fn decode_request_packet(packet: &[u8]) -> Result<(ControlRequest, Option<Vec<u8>>), String> {
+    let (envelope, attachment) = ControlWireEnvelope::decode_packet(packet)?;
+    match envelope {
+        ControlWireEnvelope::Request { request, .. } => {
+            Ok((request, (!attachment.is_empty()).then_some(attachment)))
+        }
+        other => Err(format!("expected request packet, got {other:?}")),
+    }
+}
+
+async fn send_response_packet<T>(
+    framed: &mut Framed<T, LengthDelimitedCodec>,
+    response: ControlResponse,
+    attachment: Option<Vec<u8>>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let packet = ControlWireEnvelope::Response {
+        response,
+        attachment_length: 0,
+    }
+    .encode_with_attachment(attachment.as_deref())?;
+    framed.send(packet.into()).await?;
+    Ok(())
+}
+
 async fn send_stream_frame<T>(
-    framed: &mut Framed<T, LinesCodec>,
+    framed: &mut Framed<T, LengthDelimitedCodec>,
     frame: &StreamFrame,
     send_timeout: Duration,
 ) -> Result<(), StreamSendError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let serialized = serde_json::to_string(frame).map_err(StreamSendError::from)?;
-    tokio::time::timeout(send_timeout, framed.send(serialized))
+    let serialized = ControlWireEnvelope::Stream {
+        frame: frame.clone(),
+    }
+    .encode_with_attachment(None)
+    .map_err(StreamSendError::from)?;
+    tokio::time::timeout(send_timeout, framed.send(serialized.into()))
         .await
         .map_err(|_| StreamSendError::TimedOut)?
-        .map_err(StreamSendError::from)?;
+        .map_err(|error| StreamSendError::Failed(error.into()))?;
     Ok(())
 }
 
@@ -919,8 +965,8 @@ impl From<serde_json::Error> for StreamSendError {
     }
 }
 
-impl From<tokio_util::codec::LinesCodecError> for StreamSendError {
-    fn from(error: tokio_util::codec::LinesCodecError) -> Self {
+impl From<tokio_util::codec::LengthDelimitedCodecError> for StreamSendError {
+    fn from(error: tokio_util::codec::LengthDelimitedCodecError) -> Self {
         Self::Failed(error.into())
     }
 }
@@ -936,10 +982,22 @@ fn stream_error_from_response(response: ControlResponse) -> StreamFrame {
 }
 
 async fn process_request(state: &BrokerState, request: ControlRequest) -> ControlResponse {
+    process_request_with_attachment(state, request, None)
+        .await
+        .0
+}
+
+async fn process_request_with_attachment(
+    state: &BrokerState,
+    request: ControlRequest,
+    attachment: Option<Vec<u8>>,
+) -> (ControlResponse, Option<Vec<u8>>) {
     let action = match &request.command {
         ControlCommand::Health => Action::Health,
-        ControlCommand::Publish { .. } => Action::Publish,
-        ControlCommand::Consume { .. } => Action::Consume,
+        ControlCommand::Publish { .. } | ControlCommand::PutArtifact { .. } => Action::Publish,
+        ControlCommand::Consume { .. }
+        | ControlCommand::GetArtifact { .. }
+        | ControlCommand::StatArtifact { .. } => Action::Consume,
         ControlCommand::GetAuthState
         | ControlCommand::GetAdopters
         | ControlCommand::GetMetrics
@@ -957,28 +1015,38 @@ async fn process_request(state: &BrokerState, request: ControlRequest) -> Contro
     };
     state.metrics.record_request(&action);
 
-    match request.command {
-        ControlCommand::Health => handle_health(state, request.capability_token).await,
-        ControlCommand::GetMetrics => handle_get_metrics(state, request.capability_token).await,
-        ControlCommand::GetAdopters => handle_get_adopters(state, request.capability_token).await,
-        ControlCommand::GetAuthState => {
-            handle_get_auth_state(state, request.capability_token).await
-        }
-        ControlCommand::RegisterAgent { registration } => {
-            handle_register_agent(state, request.capability_token, registration).await
-        }
-        ControlCommand::HeartbeatAgent { agent_id } => {
-            handle_heartbeat_agent(state, request.capability_token, agent_id).await
-        }
-        ControlCommand::ListAgents { query } => {
-            handle_list_agents(state, request.capability_token, query).await
-        }
+    let response = match request.command {
+        ControlCommand::Health => (handle_health(state, request.capability_token).await, None),
+        ControlCommand::GetMetrics => (
+            handle_get_metrics(state, request.capability_token).await,
+            None,
+        ),
+        ControlCommand::GetAdopters => (
+            handle_get_adopters(state, request.capability_token).await,
+            None,
+        ),
+        ControlCommand::GetAuthState => (
+            handle_get_auth_state(state, request.capability_token).await,
+            None,
+        ),
+        ControlCommand::RegisterAgent { registration } => (
+            handle_register_agent(state, request.capability_token, registration).await,
+            None,
+        ),
+        ControlCommand::HeartbeatAgent { agent_id } => (
+            handle_heartbeat_agent(state, request.capability_token, agent_id).await,
+            None,
+        ),
+        ControlCommand::ListAgents { query } => (
+            handle_list_agents(state, request.capability_token, query).await,
+            None,
+        ),
         ControlCommand::WatchAgents {
             query,
             cursor,
             max_events,
             wait_timeout_ms,
-        } => {
+        } => (
             handle_watch_agents(
                 state,
                 request.capability_token,
@@ -987,35 +1055,74 @@ async fn process_request(state: &BrokerState, request: ControlRequest) -> Contro
                 max_events,
                 wait_timeout_ms,
             )
-            .await
-        }
-        ControlCommand::OpenAgentWatchStream { .. } => ControlResponse::error(
-            "invalid_request",
-            "streaming watch must use the streaming transport",
+            .await,
+            None,
         ),
-        ControlCommand::CleanupStaleAgents => {
-            handle_cleanup_stale_agents(state, request.capability_token).await
+        ControlCommand::OpenAgentWatchStream { .. } => (
+            ControlResponse::error(
+                "invalid_request",
+                "streaming watch must use the streaming transport",
+            ),
+            None,
+        ),
+        ControlCommand::CleanupStaleAgents => (
+            handle_cleanup_stale_agents(state, request.capability_token).await,
+            None,
+        ),
+        ControlCommand::RemoveAgent { agent_id } => (
+            handle_remove_agent(state, request.capability_token, agent_id).await,
+            None,
+        ),
+        ControlCommand::CreateTopic { topic } => (
+            handle_create_topic(state, request.capability_token, topic).await,
+            None,
+        ),
+        ControlCommand::RevokeToken { token_id } => (
+            handle_revoke_token(state, request.capability_token, token_id).await,
+            None,
+        ),
+        ControlCommand::RevokePrincipal { principal } => (
+            handle_revoke_principal(state, request.capability_token, principal).await,
+            None,
+        ),
+        ControlCommand::RevokeKey { key_id } => (
+            handle_revoke_key(state, request.capability_token, key_id).await,
+            None,
+        ),
+        ControlCommand::PutArtifact {
+            artifact_id,
+            content_type,
+            byte_length,
+            sha256,
+            classification,
+            retention_class,
+        } => (
+            handle_put_artifact(
+                state,
+                request.capability_token,
+                artifact_id,
+                content_type,
+                byte_length,
+                sha256,
+                classification,
+                retention_class,
+                attachment,
+            )
+            .await,
+            None,
+        ),
+        ControlCommand::GetArtifact { artifact_id } => {
+            handle_get_artifact(state, request.capability_token, artifact_id).await
         }
-        ControlCommand::RemoveAgent { agent_id } => {
-            handle_remove_agent(state, request.capability_token, agent_id).await
-        }
-        ControlCommand::CreateTopic { topic } => {
-            handle_create_topic(state, request.capability_token, topic).await
-        }
-        ControlCommand::RevokeToken { token_id } => {
-            handle_revoke_token(state, request.capability_token, token_id).await
-        }
-        ControlCommand::RevokePrincipal { principal } => {
-            handle_revoke_principal(state, request.capability_token, principal).await
-        }
-        ControlCommand::RevokeKey { key_id } => {
-            handle_revoke_key(state, request.capability_token, key_id).await
-        }
+        ControlCommand::StatArtifact { artifact_id } => (
+            handle_stat_artifact(state, request.capability_token, artifact_id).await,
+            None,
+        ),
         ControlCommand::Publish {
             topic,
             classification,
             payload,
-        } => {
+        } => (
             handle_publish(
                 state,
                 request.capability_token,
@@ -1023,14 +1130,20 @@ async fn process_request(state: &BrokerState, request: ControlRequest) -> Contro
                 classification,
                 payload,
             )
-            .await
-        }
+            .await,
+            None,
+        ),
         ControlCommand::Consume {
             topic,
             offset,
             limit,
-        } => handle_consume(state, request.capability_token, topic, offset, limit).await,
-    }
+        } => (
+            handle_consume(state, request.capability_token, topic, offset, limit).await,
+            None,
+        ),
+    };
+
+    response
 }
 
 async fn handle_health(state: &BrokerState, capability_token: String) -> ControlResponse {
@@ -2072,6 +2185,140 @@ async fn handle_publish(
     }
 }
 
+async fn handle_put_artifact(
+    state: &BrokerState,
+    capability_token: String,
+    artifact_id: Option<String>,
+    content_type: String,
+    byte_length: u64,
+    sha256: Option<String>,
+    classification: Option<expressways_protocol::Classification>,
+    retention_class: Option<RetentionClass>,
+    attachment: Option<Vec<u8>>,
+) -> ControlResponse {
+    let started_at = Instant::now();
+    let resource = ARTIFACT_COLLECTION_RESOURCE.to_owned();
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Publish,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    let bytes = match attachment {
+        Some(bytes) => bytes,
+        None => {
+            let message = "put-artifact requires a binary attachment".to_owned();
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Publish,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            return ControlResponse::error("invalid_request", message);
+        }
+    };
+    if bytes.len() as u64 != byte_length {
+        let message = format!(
+            "artifact attachment length mismatch: declared {byte_length} bytes, got {}",
+            bytes.len()
+        );
+        let _ = finalize_failure(
+            state,
+            &identity,
+            Action::Publish,
+            &resource,
+            Some(message.clone()),
+        )
+        .await;
+        return ControlResponse::error("invalid_request", message);
+    }
+
+    if let Err(response) = enforce_publish_quota(state, &identity, &resource, bytes.len()).await {
+        return response;
+    }
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Publish,
+        &resource,
+        Some("store broker-managed artifact".to_owned()),
+    )
+    .await
+    {
+        return response;
+    }
+
+    let artifacts = match acquire_artifact_store(state).await {
+        Ok(artifacts) => artifacts,
+        Err(message) => {
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Publish,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            return ControlResponse::error("service_degraded", message);
+        }
+    };
+
+    match artifacts.put(PutArtifactRequest {
+        artifact_id,
+        content_type,
+        data: bytes,
+        sha256,
+        classification: classification.unwrap_or_default(),
+        retention_class: retention_class.unwrap_or_default(),
+        principal: identity.principal.clone(),
+    }) {
+        Ok(artifact) => {
+            state.service_mode.clear_component("artifacts");
+            if let Err(error) = finalize_success(
+                state,
+                &identity,
+                Action::Publish,
+                &resource,
+                Some(format!(
+                    "stored artifact {} ({} bytes)",
+                    artifact.artifact_id, artifact.byte_length
+                )),
+            )
+            .await
+            {
+                state.metrics.record_audit_failure();
+                state
+                    .metrics
+                    .record_publish_result(false, started_at.elapsed());
+                return ControlResponse::error("audit_failure", error.to_string());
+            }
+            state
+                .metrics
+                .record_publish_result(true, started_at.elapsed());
+            ControlResponse::ArtifactStored { artifact }
+        }
+        Err(error) => {
+            state
+                .metrics
+                .record_publish_result(false, started_at.elapsed());
+            let message = error.to_string();
+            handle_artifact_store_error(state, &error);
+            let _ =
+                finalize_failure(state, &identity, Action::Publish, &resource, Some(message)).await;
+            artifact_error_response(error)
+        }
+    }
+}
+
 async fn handle_consume(
     state: &BrokerState,
     capability_token: String,
@@ -2172,6 +2419,187 @@ async fn handle_consume(
     }
 }
 
+async fn handle_get_artifact(
+    state: &BrokerState,
+    capability_token: String,
+    artifact_id: String,
+) -> (ControlResponse, Option<Vec<u8>>) {
+    let started_at = Instant::now();
+    let resource = artifact_resource(&artifact_id);
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Consume,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return (response, None),
+    };
+
+    if let Err(response) = enforce_consume_quota(state, &identity, &resource, 1).await {
+        return (response, None);
+    }
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Consume,
+        &resource,
+        Some(format!("fetch artifact {artifact_id}")),
+    )
+    .await
+    {
+        return (response, None);
+    }
+
+    let artifacts = match acquire_artifact_store(state).await {
+        Ok(artifacts) => artifacts,
+        Err(message) => {
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Consume,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            return (ControlResponse::error("service_degraded", message), None);
+        }
+    };
+
+    match artifacts.get(&artifact_id) {
+        Ok((artifact, bytes)) => {
+            state.service_mode.clear_component("artifacts");
+            if let Err(error) = finalize_success(
+                state,
+                &identity,
+                Action::Consume,
+                &resource,
+                Some(format!(
+                    "returned artifact {} ({} bytes)",
+                    artifact.artifact_id, artifact.byte_length
+                )),
+            )
+            .await
+            {
+                state.metrics.record_audit_failure();
+                state
+                    .metrics
+                    .record_consume_result(false, started_at.elapsed());
+                return (
+                    ControlResponse::error("audit_failure", error.to_string()),
+                    None,
+                );
+            }
+            state
+                .metrics
+                .record_consume_result(true, started_at.elapsed());
+            (ControlResponse::Artifact { artifact }, Some(bytes))
+        }
+        Err(error) => {
+            state
+                .metrics
+                .record_consume_result(false, started_at.elapsed());
+            let message = error.to_string();
+            handle_artifact_store_error(state, &error);
+            let _ =
+                finalize_failure(state, &identity, Action::Consume, &resource, Some(message)).await;
+            (artifact_error_response(error), None)
+        }
+    }
+}
+
+async fn handle_stat_artifact(
+    state: &BrokerState,
+    capability_token: String,
+    artifact_id: String,
+) -> ControlResponse {
+    let started_at = Instant::now();
+    let resource = artifact_resource(&artifact_id);
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Consume,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    if let Err(response) = enforce_consume_quota(state, &identity, &resource, 1).await {
+        return response;
+    }
+
+    if let Err(response) = record_attempt(
+        state,
+        &identity,
+        Action::Consume,
+        &resource,
+        Some(format!("inspect artifact {artifact_id}")),
+    )
+    .await
+    {
+        return response;
+    }
+
+    let artifacts = match acquire_artifact_store(state).await {
+        Ok(artifacts) => artifacts,
+        Err(message) => {
+            let _ = finalize_failure(
+                state,
+                &identity,
+                Action::Consume,
+                &resource,
+                Some(message.clone()),
+            )
+            .await;
+            return ControlResponse::error("service_degraded", message);
+        }
+    };
+
+    match artifacts.stat(&artifact_id) {
+        Ok(artifact) => {
+            state.service_mode.clear_component("artifacts");
+            if let Err(error) = finalize_success(
+                state,
+                &identity,
+                Action::Consume,
+                &resource,
+                Some(format!(
+                    "returned artifact metadata {}",
+                    artifact.artifact_id
+                )),
+            )
+            .await
+            {
+                state.metrics.record_audit_failure();
+                state
+                    .metrics
+                    .record_consume_result(false, started_at.elapsed());
+                return ControlResponse::error("audit_failure", error.to_string());
+            }
+            state
+                .metrics
+                .record_consume_result(true, started_at.elapsed());
+            ControlResponse::ArtifactMetadata { artifact }
+        }
+        Err(error) => {
+            state
+                .metrics
+                .record_consume_result(false, started_at.elapsed());
+            let message = error.to_string();
+            handle_artifact_store_error(state, &error);
+            let _ =
+                finalize_failure(state, &identity, Action::Consume, &resource, Some(message)).await;
+            artifact_error_response(error)
+        }
+    }
+}
+
 async fn revocation_success_response(
     state: &BrokerState,
     identity: &RequestIdentity,
@@ -2244,6 +2672,16 @@ async fn with_storage<T>(
     }
 }
 
+async fn acquire_artifact_store(state: &BrokerState) -> Result<ArtifactStore, String> {
+    let artifacts = state.artifacts.lock().await;
+    match artifacts.as_ref() {
+        Some(artifacts) => Ok(artifacts.clone()),
+        None => {
+            Err("artifact subsystem unavailable; broker is running in degraded mode".to_owned())
+        }
+    }
+}
+
 fn is_degraded_service_response(message: &str) -> bool {
     message.contains("degraded mode")
 }
@@ -2253,6 +2691,38 @@ fn storage_error_response(message: String) -> ControlResponse {
         ControlResponse::error("service_degraded", message)
     } else {
         ControlResponse::error("storage_error", message)
+    }
+}
+
+fn handle_artifact_store_error(state: &BrokerState, error: &ArtifactError) {
+    if matches!(
+        error,
+        ArtifactError::Io(_) | ArtifactError::Serialization(_)
+    ) {
+        state.metrics.record_storage_failure();
+        state
+            .service_mode
+            .mark_degraded("artifacts", error.to_string());
+    }
+}
+
+fn artifact_error_response(error: ArtifactError) -> ControlResponse {
+    match error {
+        ArtifactError::InvalidArtifactId(_) | ArtifactError::EmptyContentType => {
+            ControlResponse::error("invalid_request", error.to_string())
+        }
+        ArtifactError::AlreadyExists(_) => {
+            ControlResponse::error("artifact_exists", error.to_string())
+        }
+        ArtifactError::Missing(_) => {
+            ControlResponse::error("artifact_not_found", error.to_string())
+        }
+        ArtifactError::Sha256Mismatch { .. } => {
+            ControlResponse::error("integrity_error", error.to_string())
+        }
+        ArtifactError::Io(_) | ArtifactError::Serialization(_) => {
+            ControlResponse::error("artifact_error", error.to_string())
+        }
     }
 }
 
@@ -2643,15 +3113,16 @@ mod tests {
     use expressways_policy::{DefaultDecision, PolicyConfig, Rule};
     use expressways_protocol::{
         Action, AgentEndpoint, AgentQuery, AgentRegistration, CapabilityClaims, CapabilityScope,
-        Classification, ControlCommand, ControlRequest, ControlResponse, RegistryEventKind,
-        RetentionClass, StoredMessage, StreamFrame, TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent,
-        TaskPayload, TaskRequirements, TaskRetryPolicy, TaskStatus, TaskWorkItem, TopicSpec,
+        Classification, ControlCommand, ControlRequest, ControlResponse, ControlWireEnvelope,
+        RegistryEventKind, RetentionClass, StoredMessage, StreamFrame, TASK_EVENTS_TOPIC,
+        TASKS_TOPIC, TaskEvent, TaskPayload, TaskRequirements, TaskRetryPolicy, TaskStatus,
+        TaskWorkItem, TopicSpec,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
     use tokio::io::duplex;
     use tokio::time::{Instant, sleep};
-    use tokio_util::codec::{Framed, LinesCodec};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -2779,12 +3250,22 @@ mod tests {
                     },
                     Rule {
                         principal: "local:developer".to_owned(),
+                        resource: "artifact:*".to_owned(),
+                        actions: vec![Action::Admin, Action::Publish, Action::Consume],
+                    },
+                    Rule {
+                        principal: "local:developer".to_owned(),
                         resource: "registry:agents*".to_owned(),
                         actions: vec![Action::Admin],
                     },
                     Rule {
                         principal: "local:agent-alpha".to_owned(),
                         resource: "topic:*".to_owned(),
+                        actions: vec![Action::Publish, Action::Consume],
+                    },
+                    Rule {
+                        principal: "local:agent-alpha".to_owned(),
+                        resource: "artifact:*".to_owned(),
                         actions: vec![Action::Publish, Action::Consume],
                     },
                     Rule {
@@ -2914,6 +3395,41 @@ mod tests {
         match response {
             ControlResponse::Messages { messages, .. } => messages,
             other => panic!("expected messages response, got {other:?}"),
+        }
+    }
+
+    async fn send_wire_request<T>(
+        client: &mut Framed<T, LengthDelimitedCodec>,
+        request: ControlRequest,
+    ) where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let packet = ControlWireEnvelope::Request {
+            request,
+            attachment_length: 0,
+        }
+        .encode_with_attachment(None)
+        .expect("encode request packet");
+        client
+            .send(packet.into())
+            .await
+            .expect("send request packet");
+    }
+
+    async fn read_wire_stream_frame<T>(client: &mut Framed<T, LengthDelimitedCodec>) -> StreamFrame
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let packet = client.next().await.expect("frame").expect("frame io");
+        let (envelope, attachment) =
+            ControlWireEnvelope::decode_packet(&packet).expect("decode stream packet");
+        assert!(
+            attachment.is_empty(),
+            "stream frame should not include attachment"
+        );
+        match envelope {
+            ControlWireEnvelope::Stream { frame } => frame,
+            other => panic!("expected stream frame packet, got {other:?}"),
         }
     }
 
@@ -3601,6 +4117,135 @@ mod tests {
         let audit = fs::read_to_string(&config.audit.path).expect("read audit");
         assert!(audit.contains("\"decision\":\"deny\""));
         assert!(audit.contains("quota_profile=agent"));
+    }
+
+    #[tokio::test]
+    async fn artifact_commands_store_fetch_and_report_metadata() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "artifact:*".to_owned(),
+                actions: vec![Action::Publish, Action::Consume],
+            }],
+        );
+
+        let (put, put_attachment) = process_request_with_attachment(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::PutArtifact {
+                    artifact_id: Some("artifact-1".to_owned()),
+                    content_type: "application/pdf".to_owned(),
+                    byte_length: 3,
+                    sha256: None,
+                    classification: Some(Classification::Restricted),
+                    retention_class: Some(RetentionClass::Regulated),
+                },
+            },
+            Some(b"PDF".to_vec()),
+        )
+        .await;
+        assert!(put_attachment.is_none());
+
+        let stored = match put {
+            ControlResponse::ArtifactStored { artifact } => artifact,
+            other => panic!("expected artifact stored response, got {other:?}"),
+        };
+        assert_eq!(stored.artifact_id, "artifact-1");
+        assert_eq!(stored.content_type, "application/pdf");
+        assert_eq!(stored.byte_length, 3);
+        assert_eq!(stored.classification, Classification::Restricted);
+        assert_eq!(stored.retention_class, RetentionClass::Regulated);
+        assert!(
+            stored
+                .local_path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).exists())
+        );
+
+        let stat = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::StatArtifact {
+                    artifact_id: "artifact-1".to_owned(),
+                },
+            },
+        )
+        .await;
+        match stat {
+            ControlResponse::ArtifactMetadata { artifact } => {
+                assert_eq!(artifact.artifact_id, "artifact-1");
+                assert_eq!(artifact.sha256, stored.sha256);
+            }
+            other => panic!("expected artifact metadata response, got {other:?}"),
+        }
+
+        let (get, attachment) = process_request_with_attachment(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::GetArtifact {
+                    artifact_id: "artifact-1".to_owned(),
+                },
+            },
+            None,
+        )
+        .await;
+        match get {
+            ControlResponse::Artifact { artifact } => {
+                assert_eq!(artifact.artifact_id, "artifact-1");
+                assert_eq!(attachment.expect("artifact bytes"), b"PDF".to_vec());
+            }
+            other => panic!("expected artifact response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_integrity_mismatches_are_rejected() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "artifact:*".to_owned(),
+                actions: vec![Action::Publish],
+            }],
+        );
+
+        let (response, attachment) = process_request_with_attachment(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::PutArtifact {
+                    artifact_id: Some("artifact-bad".to_owned()),
+                    content_type: "application/octet-stream".to_owned(),
+                    byte_length: 3,
+                    sha256: Some("deadbeef".to_owned()),
+                    classification: None,
+                    retention_class: None,
+                },
+            },
+            Some(b"abc".to_vec()),
+        )
+        .await;
+        assert!(attachment.is_none());
+
+        match response {
+            ControlResponse::Error { code, message } => {
+                assert_eq!(code, "integrity_error");
+                assert!(message.contains("sha256 mismatch"));
+            }
+            other => panic!("expected integrity error response, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4399,30 +5044,23 @@ mod tests {
         let server_state = Arc::clone(&state);
         let server =
             tokio::spawn(async move { handle_connection(server_stream, server_state).await });
-        let mut client = Framed::new(client_stream, LinesCodec::new());
+        let mut client = Framed::new(client_stream, LengthDelimitedCodec::new());
 
-        client
-            .send(
-                serde_json::to_string(&ControlRequest {
-                    capability_token: developer_token.clone(),
-                    command: ControlCommand::OpenAgentWatchStream {
-                        query: AgentQuery::default(),
-                        cursor: None,
-                        max_events: 10,
-                        wait_timeout_ms: 2_000,
-                    },
-                })
-                .expect("serialize stream-open request"),
-            )
-            .await
-            .expect("send stream-open request");
+        send_wire_request(
+            &mut client,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::OpenAgentWatchStream {
+                    query: AgentQuery::default(),
+                    cursor: None,
+                    max_events: 10,
+                    wait_timeout_ms: 2_000,
+                },
+            },
+        )
+        .await;
 
-        let opened = client
-            .next()
-            .await
-            .expect("opening frame")
-            .expect("opening frame io");
-        let opened: StreamFrame = serde_json::from_str(&opened).expect("parse opening frame");
+        let opened = read_wire_stream_frame(&mut client).await;
         match opened {
             StreamFrame::AgentWatchOpened { cursor } => assert_eq!(cursor, 0),
             other => panic!("expected watch-opened frame, got {other:?}"),
@@ -4456,13 +5094,7 @@ mod tests {
         .await;
         assert!(matches!(register, ControlResponse::AgentRegistered { .. }));
 
-        let event_frame = client
-            .next()
-            .await
-            .expect("event frame")
-            .expect("event frame io");
-        let event_frame: StreamFrame =
-            serde_json::from_str(&event_frame).expect("parse event frame");
+        let event_frame = read_wire_stream_frame(&mut client).await;
         match event_frame {
             StreamFrame::RegistryEvents { events, cursor } => {
                 assert_eq!(events.len(), 1);
@@ -4499,39 +5131,26 @@ mod tests {
         let server_state = Arc::clone(&state);
         let server =
             tokio::spawn(async move { handle_connection(server_stream, server_state).await });
-        let mut client = Framed::new(client_stream, LinesCodec::new());
+        let mut client = Framed::new(client_stream, LengthDelimitedCodec::new());
 
-        client
-            .send(
-                serde_json::to_string(&ControlRequest {
-                    capability_token: developer_token,
-                    command: ControlCommand::OpenAgentWatchStream {
-                        query: AgentQuery::default(),
-                        cursor: None,
-                        max_events: 10,
-                        wait_timeout_ms: 1,
-                    },
-                })
-                .expect("serialize stream-open request"),
-            )
-            .await
-            .expect("send stream-open request");
+        send_wire_request(
+            &mut client,
+            ControlRequest {
+                capability_token: developer_token,
+                command: ControlCommand::OpenAgentWatchStream {
+                    query: AgentQuery::default(),
+                    cursor: None,
+                    max_events: 10,
+                    wait_timeout_ms: 1,
+                },
+            },
+        )
+        .await;
 
-        let opened = client
-            .next()
-            .await
-            .expect("opening frame")
-            .expect("opening frame io");
-        let opened: StreamFrame = serde_json::from_str(&opened).expect("parse opening frame");
+        let opened = read_wire_stream_frame(&mut client).await;
         assert!(matches!(opened, StreamFrame::AgentWatchOpened { .. }));
 
-        let keepalive = client
-            .next()
-            .await
-            .expect("keepalive frame")
-            .expect("keepalive frame io");
-        let keepalive: StreamFrame =
-            serde_json::from_str(&keepalive).expect("parse keepalive frame");
+        let keepalive = read_wire_stream_frame(&mut client).await;
         assert!(matches!(keepalive, StreamFrame::KeepAlive { .. }));
 
         drop(client);
@@ -4561,65 +5180,41 @@ mod tests {
         let server_state = Arc::clone(&state);
         let server =
             tokio::spawn(async move { handle_connection(server_stream, server_state).await });
-        let mut client = Framed::new(client_stream, LinesCodec::new());
+        let mut client = Framed::new(client_stream, LengthDelimitedCodec::new());
 
-        client
-            .send(
-                serde_json::to_string(&ControlRequest {
-                    capability_token: developer_token.clone(),
-                    command: ControlCommand::OpenAgentWatchStream {
-                        query: AgentQuery::default(),
-                        cursor: None,
-                        max_events: 10,
-                        wait_timeout_ms: 1,
-                    },
-                })
-                .expect("serialize stream-open request"),
-            )
-            .await
-            .expect("send stream-open request");
+        send_wire_request(
+            &mut client,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::OpenAgentWatchStream {
+                    query: AgentQuery::default(),
+                    cursor: None,
+                    max_events: 10,
+                    wait_timeout_ms: 1,
+                },
+            },
+        )
+        .await;
 
-        let opened = client
-            .next()
-            .await
-            .expect("opening frame")
-            .expect("opening frame io");
-        let opened: StreamFrame = serde_json::from_str(&opened).expect("parse opening frame");
+        let opened = read_wire_stream_frame(&mut client).await;
         assert!(matches!(
             opened,
             StreamFrame::AgentWatchOpened { cursor: 0 }
         ));
 
-        let keepalive_one = client
-            .next()
-            .await
-            .expect("first keepalive")
-            .expect("first keepalive io");
-        let keepalive_one: StreamFrame =
-            serde_json::from_str(&keepalive_one).expect("parse first keepalive");
+        let keepalive_one = read_wire_stream_frame(&mut client).await;
         assert!(matches!(
             keepalive_one,
             StreamFrame::KeepAlive { cursor: 0 }
         ));
 
-        let keepalive_two = client
-            .next()
-            .await
-            .expect("second keepalive")
-            .expect("second keepalive io");
-        let keepalive_two: StreamFrame =
-            serde_json::from_str(&keepalive_two).expect("parse second keepalive");
+        let keepalive_two = read_wire_stream_frame(&mut client).await;
         assert!(matches!(
             keepalive_two,
             StreamFrame::KeepAlive { cursor: 0 }
         ));
 
-        let closed = client
-            .next()
-            .await
-            .expect("closed frame")
-            .expect("closed frame io");
-        let closed: StreamFrame = serde_json::from_str(&closed).expect("parse closed frame");
+        let closed = read_wire_stream_frame(&mut client).await;
         let resume_cursor = match closed {
             StreamFrame::StreamClosed { cursor, reason } => {
                 assert!(reason.contains("idle_timeout_after_2_keepalives"));
@@ -4640,31 +5235,23 @@ mod tests {
             tokio::spawn(
                 async move { handle_connection(resume_server_stream, resume_state).await },
             );
-        let mut resume_client = Framed::new(resume_client_stream, LinesCodec::new());
+        let mut resume_client = Framed::new(resume_client_stream, LengthDelimitedCodec::new());
 
-        resume_client
-            .send(
-                serde_json::to_string(&ControlRequest {
-                    capability_token: developer_token.clone(),
-                    command: ControlCommand::OpenAgentWatchStream {
-                        query: AgentQuery::default(),
-                        cursor: Some(resume_cursor),
-                        max_events: 10,
-                        wait_timeout_ms: 2_000,
-                    },
-                })
-                .expect("serialize resumed stream-open request"),
-            )
-            .await
-            .expect("send resumed stream-open request");
+        send_wire_request(
+            &mut resume_client,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::OpenAgentWatchStream {
+                    query: AgentQuery::default(),
+                    cursor: Some(resume_cursor),
+                    max_events: 10,
+                    wait_timeout_ms: 2_000,
+                },
+            },
+        )
+        .await;
 
-        let resumed_open = resume_client
-            .next()
-            .await
-            .expect("resumed opening frame")
-            .expect("resumed opening frame io");
-        let resumed_open: StreamFrame =
-            serde_json::from_str(&resumed_open).expect("parse resumed opening frame");
+        let resumed_open = read_wire_stream_frame(&mut resume_client).await;
         assert!(matches!(
             resumed_open,
             StreamFrame::AgentWatchOpened { cursor } if cursor == resume_cursor
@@ -4698,13 +5285,7 @@ mod tests {
         .await;
         assert!(matches!(register, ControlResponse::AgentRegistered { .. }));
 
-        let resumed_event = resume_client
-            .next()
-            .await
-            .expect("resumed event frame")
-            .expect("resumed event frame io");
-        let resumed_event: StreamFrame =
-            serde_json::from_str(&resumed_event).expect("parse resumed event frame");
+        let resumed_event = read_wire_stream_frame(&mut resume_client).await;
         match resumed_event {
             StreamFrame::RegistryEvents { events, cursor } => {
                 assert_eq!(events.len(), 1);
@@ -4742,30 +5323,23 @@ mod tests {
         let server_state = Arc::clone(&state);
         let server =
             tokio::spawn(async move { handle_connection(server_stream, server_state).await });
-        let mut client = Framed::new(client_stream, LinesCodec::new());
+        let mut client = Framed::new(client_stream, LengthDelimitedCodec::new());
 
-        client
-            .send(
-                serde_json::to_string(&ControlRequest {
-                    capability_token: developer_token.clone(),
-                    command: ControlCommand::OpenAgentWatchStream {
-                        query: AgentQuery::default(),
-                        cursor: None,
-                        max_events: 10,
-                        wait_timeout_ms: 2_000,
-                    },
-                })
-                .expect("serialize stream-open request"),
-            )
-            .await
-            .expect("send stream-open request");
+        send_wire_request(
+            &mut client,
+            ControlRequest {
+                capability_token: developer_token.clone(),
+                command: ControlCommand::OpenAgentWatchStream {
+                    query: AgentQuery::default(),
+                    cursor: None,
+                    max_events: 10,
+                    wait_timeout_ms: 2_000,
+                },
+            },
+        )
+        .await;
 
-        let opened = client
-            .next()
-            .await
-            .expect("opening frame")
-            .expect("opening frame io");
-        let opened: StreamFrame = serde_json::from_str(&opened).expect("parse opening frame");
+        let opened = read_wire_stream_frame(&mut client).await;
         assert!(matches!(opened, StreamFrame::AgentWatchOpened { .. }));
 
         let register = process_request(

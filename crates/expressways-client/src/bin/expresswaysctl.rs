@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
+use base64::Engine as _;
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use expressways_audit::{load_events, verify_file};
@@ -220,6 +221,40 @@ enum Command {
         payload: String,
         #[arg(long)]
         classification: Option<Classification>,
+    },
+    PutArtifact {
+        #[command(flatten)]
+        token: TokenArgs,
+        #[arg(long)]
+        artifact_id: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        base64: Option<String>,
+        #[arg(long)]
+        content_type: Option<String>,
+        #[arg(long)]
+        sha256: Option<String>,
+        #[arg(long)]
+        classification: Option<Classification>,
+        #[arg(long, default_value = "operational")]
+        retention_class: RetentionClass,
+    },
+    GetArtifact {
+        #[command(flatten)]
+        token: TokenArgs,
+        #[arg(long)]
+        artifact_id: String,
+        #[arg(long)]
+        output_file: Option<PathBuf>,
+    },
+    StatArtifact {
+        #[command(flatten)]
+        token: TokenArgs,
+        #[arg(long)]
+        artifact_id: String,
     },
     SubmitTask {
         #[command(flatten)]
@@ -548,6 +583,174 @@ async fn main() -> anyhow::Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
             }
         }
+        Command::PutArtifact {
+            token,
+            artifact_id,
+            file,
+            text,
+            base64,
+            content_type,
+            sha256,
+            classification,
+            retention_class,
+        } => {
+            let endpoint = endpoint_from_cli(cli.transport, cli.address, cli.socket)?;
+            let mut client = Client::connect(endpoint).await?;
+            let capability_token = resolve_token(token)?;
+            let (command, attachment) = build_put_artifact_request(
+                artifact_id,
+                file,
+                text,
+                base64,
+                content_type,
+                sha256,
+                classification,
+                retention_class,
+            )?;
+            let (response, returned_attachment) = client
+                .send_with_attachment(
+                    ControlRequest {
+                        capability_token,
+                        command,
+                    },
+                    Some(attachment),
+                )
+                .await?;
+            if returned_attachment.is_some() {
+                bail!("broker returned unexpected binary attachment for put-artifact");
+            }
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
+        Command::GetArtifact {
+            token,
+            artifact_id,
+            output_file,
+        } => {
+            let endpoint = endpoint_from_cli(cli.transport, cli.address, cli.socket)?;
+            let mut client = Client::connect(endpoint).await?;
+            let (response, attachment) = client
+                .send_with_attachment(
+                    ControlRequest {
+                        capability_token: resolve_token(token)?,
+                        command: ControlCommand::GetArtifact { artifact_id },
+                    },
+                    None,
+                )
+                .await?;
+            if let Some(path) = output_file {
+                match &response {
+                    ControlResponse::Artifact { artifact } => {
+                        let bytes = attachment
+                            .as_deref()
+                            .context("broker response is missing artifact bytes")?;
+                        if let Some(parent) = path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::write(&path, bytes)
+                            .with_context(|| format!("failed to write {}", path.display()))?;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "artifact": artifact,
+                                "output_file": path,
+                            }))?
+                        );
+                    }
+                    _ => {
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    }
+                }
+            } else if attachment.is_some() {
+                match &response {
+                    ControlResponse::Artifact { artifact } => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "artifact": artifact,
+                                "byte_stream_available": true,
+                            }))?
+                        );
+                    }
+                    _ => {
+                        println!("{}", serde_json::to_string_pretty(&response)?);
+                    }
+                }
+            } else {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            }
+            Ok(())
+        }
+        Command::SubmitTask {
+            token,
+            topic,
+            task_id,
+            task_type,
+            skill,
+            requires_topic,
+            principal,
+            preferred_agents,
+            avoid_agents,
+            priority,
+            payload_json,
+            payload_text,
+            payload_file,
+            payload_base64,
+            payload_inline,
+            payload_content_type,
+            payload_sha256,
+            max_attempts,
+            timeout_seconds,
+            retry_delay_seconds,
+            classification,
+        } => {
+            let endpoint = endpoint_from_cli(cli.transport, cli.address, cli.socket)?;
+            let mut client = Client::connect(endpoint).await?;
+            let capability_token = resolve_token(token)?;
+            let payload = build_submit_task_payload_with_client(
+                &mut client,
+                &capability_token,
+                payload_json,
+                payload_text,
+                payload_file,
+                payload_base64,
+                payload_inline,
+                payload_content_type,
+                payload_sha256,
+                classification.clone(),
+            )
+            .await?;
+            let response = client
+                .send(ControlRequest {
+                    capability_token,
+                    command: ControlCommand::Publish {
+                        topic,
+                        classification,
+                        payload: serde_json::to_string(&TaskWorkItem {
+                            task_id: task_id.unwrap_or_else(|| Uuid::now_v7().to_string()),
+                            task_type,
+                            priority,
+                            requirements: TaskRequirements {
+                                skill,
+                                topic: requires_topic,
+                                principal,
+                                preferred_agents,
+                                avoid_agents,
+                            },
+                            payload,
+                            retry_policy: TaskRetryPolicy {
+                                max_attempts,
+                                timeout_seconds,
+                                retry_delay_seconds,
+                            },
+                            submitted_at: Utc::now(),
+                        })?,
+                    },
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
         command => {
             let endpoint = endpoint_from_cli(cli.transport, cli.address, cli.socket)?;
             let mut client = Client::connect(endpoint).await?;
@@ -710,6 +913,16 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
                 payload,
             },
         }),
+        Command::PutArtifact { .. } => {
+            bail!("put-artifact is handled directly by the CLI runtime")
+        }
+        Command::GetArtifact { .. } => {
+            bail!("get-artifact is handled directly by the CLI runtime")
+        }
+        Command::StatArtifact { token, artifact_id } => Ok(ControlRequest {
+            capability_token: resolve_token(token)?,
+            command: ControlCommand::StatArtifact { artifact_id },
+        }),
         Command::SubmitTask {
             token,
             topic,
@@ -732,40 +945,48 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
             timeout_seconds,
             retry_delay_seconds,
             classification,
-        } => Ok(ControlRequest {
-            capability_token: resolve_token(token)?,
-            command: ControlCommand::Publish {
-                topic,
-                classification,
-                payload: serde_json::to_string(&TaskWorkItem {
-                    task_id: task_id.unwrap_or_else(|| Uuid::now_v7().to_string()),
-                    task_type,
-                    priority,
-                    requirements: TaskRequirements {
-                        skill,
-                        topic: requires_topic,
-                        principal,
-                        preferred_agents,
-                        avoid_agents,
-                    },
-                    payload: build_submit_task_payload(
-                        payload_json,
-                        payload_text,
-                        payload_file,
-                        payload_base64,
-                        payload_inline,
-                        payload_content_type,
-                        payload_sha256,
-                    )?,
-                    retry_policy: TaskRetryPolicy {
-                        max_attempts,
-                        timeout_seconds,
-                        retry_delay_seconds,
-                    },
-                    submitted_at: Utc::now(),
-                })?,
-            },
-        }),
+        } => {
+            if payload_file.is_some() && !payload_inline {
+                bail!(
+                    "submit-task with broker-managed file uploads is handled directly by the CLI runtime"
+                );
+            }
+
+            Ok(ControlRequest {
+                capability_token: resolve_token(token)?,
+                command: ControlCommand::Publish {
+                    topic,
+                    classification,
+                    payload: serde_json::to_string(&TaskWorkItem {
+                        task_id: task_id.unwrap_or_else(|| Uuid::now_v7().to_string()),
+                        task_type,
+                        priority,
+                        requirements: TaskRequirements {
+                            skill,
+                            topic: requires_topic,
+                            principal,
+                            preferred_agents,
+                            avoid_agents,
+                        },
+                        payload: build_submit_task_payload(
+                            payload_json,
+                            payload_text,
+                            payload_file,
+                            payload_base64,
+                            payload_inline,
+                            payload_content_type,
+                            payload_sha256,
+                        )?,
+                        retry_policy: TaskRetryPolicy {
+                            max_attempts,
+                            timeout_seconds,
+                            retry_delay_seconds,
+                        },
+                        submitted_at: Utc::now(),
+                    })?,
+                },
+            })
+        }
         Command::ReportTask {
             token,
             topic,
@@ -879,27 +1100,14 @@ fn build_submit_task_payload(
     payload_content_type: Option<String>,
     payload_sha256: Option<String>,
 ) -> anyhow::Result<TaskPayload> {
-    let supplied_sources = [
+    validate_submit_task_payload_selection(
         payload_json.is_some(),
         payload_text.is_some(),
         payload_file.is_some(),
         payload_base64.is_some(),
-    ]
-    .into_iter()
-    .filter(|present| *present)
-    .count();
-
-    if supplied_sources > 1 {
-        bail!(
-            "submit-task accepts only one payload source: choose one of --payload-json, --payload-text, --payload-file, or --payload-base64"
-        );
-    }
-    if payload_inline && payload_file.is_none() {
-        bail!("--payload-inline can only be used together with --payload-file");
-    }
-    if payload_sha256.is_some() && payload_file.is_none() {
-        bail!("--payload-sha256 can only be used together with --payload-file");
-    }
+        payload_inline,
+        payload_sha256.is_some(),
+    )?;
 
     if let Some(payload_json) = payload_json {
         return Ok(TaskPayload::json(
@@ -944,6 +1152,174 @@ fn build_submit_task_payload(
     }
 
     Ok(TaskPayload::default())
+}
+
+async fn build_submit_task_payload_with_client(
+    client: &mut Client,
+    capability_token: &str,
+    payload_json: Option<String>,
+    payload_text: Option<String>,
+    payload_file: Option<PathBuf>,
+    payload_base64: Option<String>,
+    payload_inline: bool,
+    payload_content_type: Option<String>,
+    payload_sha256: Option<String>,
+    classification: Option<Classification>,
+) -> anyhow::Result<TaskPayload> {
+    validate_submit_task_payload_selection(
+        payload_json.is_some(),
+        payload_text.is_some(),
+        payload_file.is_some(),
+        payload_base64.is_some(),
+        payload_inline,
+        payload_sha256.is_some(),
+    )?;
+
+    if let Some(payload_file) = payload_file {
+        if payload_inline {
+            return build_submit_task_payload(
+                payload_json,
+                payload_text,
+                Some(payload_file),
+                payload_base64,
+                true,
+                payload_content_type,
+                payload_sha256,
+            );
+        }
+
+        let (command, attachment) = build_put_artifact_request(
+            None,
+            Some(payload_file),
+            None,
+            None,
+            payload_content_type,
+            payload_sha256,
+            classification,
+            RetentionClass::Operational,
+        )?;
+        let (response, returned_attachment) = client
+            .send_with_attachment(
+                ControlRequest {
+                    capability_token: capability_token.to_owned(),
+                    command,
+                },
+                Some(attachment),
+            )
+            .await?;
+        if returned_attachment.is_some() {
+            bail!("broker returned unexpected binary attachment while uploading task artifact");
+        }
+        match response {
+            ControlResponse::ArtifactStored { artifact } => Ok(TaskPayload::artifact_ref(
+                artifact.artifact_id,
+                Some(artifact.content_type),
+                Some(artifact.byte_length),
+                Some(artifact.sha256),
+                artifact.local_path,
+            )),
+            ControlResponse::Error { code, message } => {
+                bail!("broker rejected artifact upload: {code}: {message}")
+            }
+            other => bail!("unexpected response while uploading task artifact: {other:?}"),
+        }
+    } else {
+        build_submit_task_payload(
+            payload_json,
+            payload_text,
+            None,
+            payload_base64,
+            payload_inline,
+            payload_content_type,
+            payload_sha256,
+        )
+    }
+}
+
+fn validate_submit_task_payload_selection(
+    payload_json: bool,
+    payload_text: bool,
+    payload_file: bool,
+    payload_base64: bool,
+    payload_inline: bool,
+    payload_sha256: bool,
+) -> anyhow::Result<()> {
+    let supplied_sources = [payload_json, payload_text, payload_file, payload_base64]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+
+    if supplied_sources > 1 {
+        bail!(
+            "submit-task accepts only one payload source: choose one of --payload-json, --payload-text, --payload-file, or --payload-base64"
+        );
+    }
+    if payload_inline && !payload_file {
+        bail!("--payload-inline can only be used together with --payload-file");
+    }
+    if payload_sha256 && !payload_file {
+        bail!("--payload-sha256 can only be used together with --payload-file");
+    }
+
+    Ok(())
+}
+
+fn build_put_artifact_request(
+    artifact_id: Option<String>,
+    file: Option<PathBuf>,
+    text: Option<String>,
+    base64: Option<String>,
+    content_type: Option<String>,
+    sha256: Option<String>,
+    classification: Option<Classification>,
+    retention_class: RetentionClass,
+) -> anyhow::Result<(ControlCommand, Vec<u8>)> {
+    let supplied_sources = [file.is_some(), text.is_some(), base64.is_some()]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if supplied_sources != 1 {
+        bail!("put-artifact accepts exactly one source: choose one of --file, --text, or --base64");
+    }
+    if sha256.is_some() && file.is_none() && base64.is_none() {
+        bail!("--sha256 can only be used together with --file or --base64");
+    }
+
+    let (bytes, content_type): (Vec<u8>, String) = if let Some(path) = file {
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read payload file {}", path.display()))?;
+        (
+            bytes,
+            content_type.unwrap_or_else(|| "application/octet-stream".to_owned()),
+        )
+    } else if let Some(text) = text {
+        (
+            text.into_bytes(),
+            content_type.unwrap_or_else(|| "text/plain; charset=utf-8".to_owned()),
+        )
+    } else if let Some(data_base64) = base64 {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_base64)
+            .context("failed to decode --base64 artifact payload")?;
+        (
+            bytes,
+            content_type.unwrap_or_else(|| "application/octet-stream".to_owned()),
+        )
+    } else {
+        unreachable!("validated exactly one artifact source");
+    };
+
+    Ok((
+        ControlCommand::PutArtifact {
+            artifact_id,
+            content_type,
+            byte_length: bytes.len() as u64,
+            sha256,
+            classification,
+            retention_class: Some(retention_class),
+        },
+        bytes,
+    ))
 }
 
 #[cfg(test)]
@@ -1058,6 +1434,84 @@ mod tests {
         }
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn put_artifact_builds_binary_upload_command() {
+        let path =
+            std::env::temp_dir().join(format!("expressways-artifact-{}.bin", Uuid::now_v7()));
+        fs::write(&path, b"PDF").expect("write artifact file");
+
+        let (command, attachment) = build_put_artifact_request(
+            Some("blob-1".to_owned()),
+            Some(path.clone()),
+            None,
+            None,
+            Some("application/pdf".to_owned()),
+            Some("abc123".to_owned()),
+            Some(Classification::Restricted),
+            RetentionClass::Regulated,
+        )
+        .expect("request");
+
+        match command {
+            ControlCommand::PutArtifact {
+                artifact_id,
+                content_type,
+                byte_length,
+                sha256,
+                classification,
+                retention_class,
+            } => {
+                assert_eq!(artifact_id.as_deref(), Some("blob-1"));
+                assert_eq!(content_type, "application/pdf");
+                assert_eq!(byte_length, 3);
+                assert_eq!(attachment, b"PDF".to_vec());
+                assert_eq!(sha256.as_deref(), Some("abc123"));
+                assert_eq!(classification, Some(Classification::Restricted));
+                assert_eq!(retention_class, Some(RetentionClass::Regulated));
+            }
+            other => panic!("expected artifact upload request, got {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn submit_task_rejects_non_inline_file_requests_from_request_builder() {
+        let error = request_from_command(Command::SubmitTask {
+            token: TokenArgs {
+                token: Some("signed-token".to_owned()),
+                token_file: None,
+            },
+            topic: TASKS_TOPIC.to_owned(),
+            task_id: Some("task-file".to_owned()),
+            task_type: "inspect_blob".to_owned(),
+            skill: Some("binary".to_owned()),
+            requires_topic: None,
+            principal: None,
+            preferred_agents: Vec::new(),
+            avoid_agents: Vec::new(),
+            priority: 0,
+            payload_json: None,
+            payload_text: None,
+            payload_file: Some(PathBuf::from("./var/agent/incoming/report.pdf")),
+            payload_base64: None,
+            payload_inline: false,
+            payload_content_type: Some("application/pdf".to_owned()),
+            payload_sha256: None,
+            max_attempts: 3,
+            timeout_seconds: 300,
+            retry_delay_seconds: 5,
+            classification: None,
+        })
+        .expect_err("runtime-managed upload should bail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("handled directly by the CLI runtime")
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 pub const BROKER_RESOURCE: &str = "system:broker";
 pub const REGISTRY_RESOURCE: &str = "registry:agents";
+pub const ARTIFACT_COLLECTION_RESOURCE: &str = "artifact:blobs";
 pub const TASKS_TOPIC: &str = "tasks";
 pub const TASK_EVENTS_TOPIC: &str = "task_events";
 
@@ -246,6 +247,22 @@ impl Default for TaskRetryPolicy {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactMetadata {
+    pub artifact_id: String,
+    pub content_type: String,
+    pub byte_length: u64,
+    pub sha256: String,
+    #[serde(default)]
+    pub classification: Classification,
+    #[serde(default)]
+    pub retention_class: RetentionClass,
+    #[serde(default = "default_timestamp")]
+    pub created_at: DateTime<Utc>,
+    pub principal: String,
+    pub local_path: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskPayload {
     Json(serde_json::Value),
@@ -263,6 +280,13 @@ pub enum TaskPayload {
         content_type: Option<String>,
         byte_length: Option<u64>,
         sha256: Option<String>,
+    },
+    ArtifactRef {
+        artifact_id: String,
+        content_type: Option<String>,
+        byte_length: Option<u64>,
+        sha256: Option<String>,
+        local_path: Option<String>,
     },
 }
 
@@ -318,12 +342,29 @@ impl TaskPayload {
         }
     }
 
+    pub fn artifact_ref(
+        artifact_id: impl Into<String>,
+        content_type: Option<String>,
+        byte_length: Option<u64>,
+        sha256: Option<String>,
+        local_path: Option<String>,
+    ) -> Self {
+        Self::ArtifactRef {
+            artifact_id: artifact_id.into(),
+            content_type,
+            byte_length,
+            sha256,
+            local_path,
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Json(_) => "json",
             Self::Text { .. } => "text",
             Self::Bytes { .. } => "bytes",
             Self::FileRef { .. } => "file_ref",
+            Self::ArtifactRef { .. } => "artifact_ref",
         }
     }
 
@@ -333,7 +374,9 @@ impl TaskPayload {
             Self::Text { content_type, .. } | Self::Bytes { content_type, .. } => {
                 Some(content_type.as_str())
             }
-            Self::FileRef { content_type, .. } => content_type.as_deref(),
+            Self::FileRef { content_type, .. } | Self::ArtifactRef { content_type, .. } => {
+                content_type.as_deref()
+            }
         }
     }
 
@@ -382,6 +425,13 @@ enum TaskPayloadEnvelope {
         byte_length: Option<u64>,
         sha256: Option<String>,
     },
+    ArtifactRef {
+        artifact_id: String,
+        content_type: Option<String>,
+        byte_length: Option<u64>,
+        sha256: Option<String>,
+        local_path: Option<String>,
+    },
 }
 
 impl Serialize for TaskPayload {
@@ -416,6 +466,20 @@ impl Serialize for TaskPayload {
                 content_type: content_type.clone(),
                 byte_length: *byte_length,
                 sha256: sha256.clone(),
+            }
+            .serialize(serializer),
+            Self::ArtifactRef {
+                artifact_id,
+                content_type,
+                byte_length,
+                sha256,
+                local_path,
+            } => TaskPayloadEnvelope::ArtifactRef {
+                artifact_id: artifact_id.clone(),
+                content_type: content_type.clone(),
+                byte_length: *byte_length,
+                sha256: sha256.clone(),
+                local_path: local_path.clone(),
             }
             .serialize(serializer),
         }
@@ -459,6 +523,19 @@ impl<'de> Deserialize<'de> for TaskPayload {
                     content_type,
                     byte_length,
                     sha256,
+                },
+                TaskPayloadEnvelope::ArtifactRef {
+                    artifact_id,
+                    content_type,
+                    byte_length,
+                    sha256,
+                    local_path,
+                } => Self::ArtifactRef {
+                    artifact_id,
+                    content_type,
+                    byte_length,
+                    sha256,
+                    local_path,
                 },
             });
         }
@@ -730,6 +807,20 @@ pub enum ControlCommand {
     RevokeKey {
         key_id: String,
     },
+    PutArtifact {
+        artifact_id: Option<String>,
+        content_type: String,
+        byte_length: u64,
+        sha256: Option<String>,
+        classification: Option<Classification>,
+        retention_class: Option<RetentionClass>,
+    },
+    GetArtifact {
+        artifact_id: String,
+    },
+    StatArtifact {
+        artifact_id: String,
+    },
     Publish {
         topic: String,
         classification: Option<Classification>,
@@ -814,6 +905,15 @@ pub enum ControlResponse {
     RevocationUpdated {
         revocations: AuthRevocationView,
     },
+    ArtifactStored {
+        artifact: ArtifactMetadata,
+    },
+    ArtifactMetadata {
+        artifact: ArtifactMetadata,
+    },
+    Artifact {
+        artifact: ArtifactMetadata,
+    },
     PublishAccepted {
         message_id: Uuid,
         offset: u64,
@@ -839,12 +939,101 @@ impl ControlResponse {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlWireEnvelope {
+    Request {
+        request: ControlRequest,
+        #[serde(default)]
+        attachment_length: u64,
+    },
+    Response {
+        response: ControlResponse,
+        #[serde(default)]
+        attachment_length: u64,
+    },
+    Stream {
+        frame: StreamFrame,
+    },
+}
+
+impl ControlWireEnvelope {
+    pub fn encode_with_attachment(
+        &self,
+        attachment: Option<&[u8]>,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        let attachment_length = attachment.map_or(0usize, |bytes| bytes.len());
+        let envelope = match self {
+            Self::Request { request, .. } => Self::Request {
+                request: request.clone(),
+                attachment_length: attachment_length as u64,
+            },
+            Self::Response { response, .. } => Self::Response {
+                response: response.clone(),
+                attachment_length: attachment_length as u64,
+            },
+            Self::Stream { frame } => Self::Stream {
+                frame: frame.clone(),
+            },
+        };
+
+        let header = serde_json::to_vec(&envelope)?;
+        let mut packet = Vec::with_capacity(4 + header.len() + attachment_length);
+        packet.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        packet.extend_from_slice(&header);
+        if let Some(attachment) = attachment {
+            packet.extend_from_slice(attachment);
+        }
+        Ok(packet)
+    }
+
+    pub fn decode_packet(bytes: &[u8]) -> Result<(Self, Vec<u8>), String> {
+        if bytes.len() < 4 {
+            return Err("control packet is missing header length prefix".to_owned());
+        }
+
+        let header_len = u32::from_le_bytes(
+            bytes[..4]
+                .try_into()
+                .map_err(|_| "failed to decode header length".to_owned())?,
+        ) as usize;
+        if bytes.len() < 4 + header_len {
+            return Err("control packet is truncated".to_owned());
+        }
+
+        let header = serde_json::from_slice::<Self>(&bytes[4..4 + header_len])
+            .map_err(|error| format!("failed to decode control header: {error}"))?;
+        let attachment = bytes[4 + header_len..].to_vec();
+        let expected_length = match &header {
+            Self::Request {
+                attachment_length, ..
+            }
+            | Self::Response {
+                attachment_length, ..
+            } => *attachment_length as usize,
+            Self::Stream { .. } => 0,
+        };
+        if attachment.len() != expected_length {
+            return Err(format!(
+                "control attachment length mismatch: expected {expected_length} bytes, got {}",
+                attachment.len()
+            ));
+        }
+
+        Ok((header, attachment))
+    }
+}
+
 pub fn topic_resource(name: &str) -> String {
     format!("topic:{name}")
 }
 
 pub fn registry_entry_resource(agent_id: &str) -> String {
     format!("registry:agents:{agent_id}")
+}
+
+pub fn artifact_resource(artifact_id: &str) -> String {
+    format!("artifact:{artifact_id}")
 }
 
 fn default_audience() -> String {
@@ -955,5 +1144,61 @@ mod tests {
         let file_ref_json = serde_json::to_value(&file_ref).expect("serialize file ref payload");
         assert_eq!(file_ref_json["_expressways_payload_kind"], "file_ref");
         assert_eq!(file_ref_json["path"], "./var/agent/incoming/doc.pdf");
+
+        let artifact_ref = TaskPayload::artifact_ref(
+            "artifact-1",
+            Some("application/pdf".to_owned()),
+            Some(2048),
+            Some("def456".to_owned()),
+            Some("./var/data/artifacts/blobs/artifact-1.blob".to_owned()),
+        );
+        let artifact_ref_json =
+            serde_json::to_value(&artifact_ref).expect("serialize artifact ref payload");
+        assert_eq!(
+            artifact_ref_json["_expressways_payload_kind"],
+            "artifact_ref"
+        );
+        assert_eq!(artifact_ref_json["artifact_id"], "artifact-1");
+        assert_eq!(artifact_ref.content_type(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn control_wire_envelope_round_trips_attachment() {
+        let packet = ControlWireEnvelope::Request {
+            request: ControlRequest {
+                capability_token: "signed-token".to_owned(),
+                command: ControlCommand::PutArtifact {
+                    artifact_id: Some("artifact-1".to_owned()),
+                    content_type: "application/pdf".to_owned(),
+                    byte_length: 3,
+                    sha256: None,
+                    classification: Some(Classification::Internal),
+                    retention_class: Some(RetentionClass::Operational),
+                },
+            },
+            attachment_length: 0,
+        }
+        .encode_with_attachment(Some(b"PDF"))
+        .expect("encode wire packet");
+
+        let (decoded, attachment) =
+            ControlWireEnvelope::decode_packet(&packet).expect("decode wire packet");
+        assert_eq!(attachment, b"PDF");
+
+        match decoded {
+            ControlWireEnvelope::Request {
+                request,
+                attachment_length,
+            } => {
+                assert_eq!(attachment_length, 3);
+                match request.command {
+                    ControlCommand::PutArtifact { byte_length, .. } => {
+                        assert_eq!(byte_length, 3);
+                    }
+                    other => panic!("expected put-artifact command, got {other:?}"),
+                }
+            }
+            other => panic!("expected request packet, got {other:?}"),
+        }
     }
 }
