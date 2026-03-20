@@ -13,6 +13,9 @@ OLLAMA_MODEL ?= llama3.2
 OLLAMA_URL ?= http://127.0.0.1:11434
 OLLAMA_RESULTS_TOPIC ?= ollama_results
 GATEWAY_PORT ?= 8899
+ORCHESTRATOR_RETRY_DELAY_MS ?= 500
+ORCHESTRATOR_CONSUME_LIMIT ?= 25
+ORCHESTRATOR_POLL_INTERVAL_MS ?= 1000
 
 help:
 	@echo "Available targets:"
@@ -33,7 +36,7 @@ run-expressways: prepare-local-dirs
 	cargo run -p expressways-server -- --config $(EXPRESSWAYS_CONFIG)
 
 run-orchestrator: prepare-local-dirs
-	cargo run -p expressways-orchestrator -- --transport tcp --address $(BROKER_ADDRESS) supervise --token-file $(TOKEN_FILE) --state-path $(STATE_PATH) --tasks-topic $(TASKS_TOPIC) --task-events-topic $(TASK_EVENTS_TOPIC)
+	cargo run -p expressways-orchestrator -- --transport tcp --address $(BROKER_ADDRESS) supervise --token-file $(TOKEN_FILE) --state-path $(STATE_PATH) --retry-delay-ms $(ORCHESTRATOR_RETRY_DELAY_MS) --tasks-topic $(TASKS_TOPIC) --task-events-topic $(TASK_EVENTS_TOPIC) --consume-limit $(ORCHESTRATOR_CONSUME_LIMIT) --poll-interval-ms $(ORCHESTRATOR_POLL_INTERVAL_MS)
 
 run-dashboard: prepare-local-dirs
 	cargo run -p expressways-orchestrator -- --transport tcp --address $(BROKER_ADDRESS) serve-dashboard --token-file $(TOKEN_FILE) --state-path $(STATE_PATH) --listen $(DASHBOARD_LISTEN) --task-events-topic $(TASK_EVENTS_TOPIC)
@@ -53,7 +56,7 @@ run-stack: prepare-local-dirs
 	cargo run -p expressways-server -- --config $(EXPRESSWAYS_CONFIG) & \
 	server_pid=$$!; \
 	sleep $(STARTUP_DELAY_SECONDS); \
-	cargo run -p expressways-orchestrator -- --transport tcp --address $(BROKER_ADDRESS) supervise --token-file $(TOKEN_FILE) --state-path $(STATE_PATH) --tasks-topic $(TASKS_TOPIC) --task-events-topic $(TASK_EVENTS_TOPIC) & \
+	cargo run -p expressways-orchestrator -- --transport tcp --address $(BROKER_ADDRESS) supervise --token-file $(TOKEN_FILE) --state-path $(STATE_PATH) --retry-delay-ms $(ORCHESTRATOR_RETRY_DELAY_MS) --tasks-topic $(TASKS_TOPIC) --task-events-topic $(TASK_EVENTS_TOPIC) --consume-limit $(ORCHESTRATOR_CONSUME_LIMIT) --poll-interval-ms $(ORCHESTRATOR_POLL_INTERVAL_MS) & \
 	orchestrator_pid=$$!; \
 	sleep $(STARTUP_DELAY_SECONDS); \
 	cargo run -p expressways-orchestrator -- --transport tcp --address $(BROKER_ADDRESS) serve-dashboard --token-file $(TOKEN_FILE) --state-path $(STATE_PATH) --listen $(DASHBOARD_LISTEN) --task-events-topic $(TASK_EVENTS_TOPIC)
@@ -67,7 +70,7 @@ run-ollama-stack: prepare-local-dirs
 	cargo run -p expressways-server -- --config $(EXPRESSWAYS_CONFIG) & \
 	server_pid=$$!; \
 	sleep $(STARTUP_DELAY_SECONDS); \
-	cargo run -p expressways-orchestrator -- --transport tcp --address $(BROKER_ADDRESS) supervise --token-file $(TOKEN_FILE) --state-path $(STATE_PATH) --tasks-topic $(TASKS_TOPIC) --task-events-topic $(TASK_EVENTS_TOPIC) & \
+	cargo run -p expressways-orchestrator -- --transport tcp --address $(BROKER_ADDRESS) supervise --token-file $(TOKEN_FILE) --state-path $(STATE_PATH) --retry-delay-ms $(ORCHESTRATOR_RETRY_DELAY_MS) --tasks-topic $(TASKS_TOPIC) --task-events-topic $(TASK_EVENTS_TOPIC) --consume-limit $(ORCHESTRATOR_CONSUME_LIMIT) --poll-interval-ms $(ORCHESTRATOR_POLL_INTERVAL_MS) & \
 	orchestrator_pid=$$!; \
 	sleep $(STARTUP_DELAY_SECONDS); \
 	cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address $(BROKER_ADDRESS) create-topic --token-file $(TOKEN_FILE) --topic $(OLLAMA_RESULTS_TOPIC) >/dev/null 2>&1 || true; \
