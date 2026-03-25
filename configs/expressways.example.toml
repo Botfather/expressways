@@ -76,6 +76,30 @@ status = "active"
 allowed_key_ids = ["dev"]
 quota_profile = "agent"
 
+[[auth.principals]]
+id = "local:bridge-openclaw"
+kind = "service"
+display_name = "OpenClaw Bridge Ingress"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "bridge"
+
+[[auth.principals]]
+id = "local:bridge-zeroclaw"
+kind = "service"
+display_name = "ZeroClaw Bridge Runtime"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "bridge"
+
+[[auth.principals]]
+id = "local:bridge-egress"
+kind = "service"
+display_name = "Interop Reply Egress Bridge"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "bridge"
+
 [quotas]
 
 [[quotas.profiles]]
@@ -99,6 +123,17 @@ consume_requests_per_window = 10
 consume_window_seconds = 1
 backpressure_mode = "delay"
 backpressure_delay_ms = 150
+
+[[quotas.profiles]]
+name = "bridge"
+publish_payload_max_bytes = 65536
+publish_requests_per_window = 50
+publish_window_seconds = 1
+consume_max_limit = 200
+consume_requests_per_window = 50
+consume_window_seconds = 1
+backpressure_mode = "delay"
+backpressure_delay_ms = 50
 
 [policy]
 default_decision = "deny"
@@ -132,3 +167,33 @@ actions = ["publish", "consume", "admin"]
 principal = "local:agent-orchestrator"
 resource = "registry:agents*"
 actions = ["admin"]
+
+[[policy.rules]]
+principal = "local:bridge-openclaw"
+resource = "topic:interop.chat.requests"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:bridge-openclaw"
+resource = "artifact:*"
+actions = ["publish", "consume"]
+
+[[policy.rules]]
+principal = "local:bridge-zeroclaw"
+resource = "topic:interop.chat*"
+actions = ["publish", "consume", "admin"]
+
+[[policy.rules]]
+principal = "local:bridge-zeroclaw"
+resource = "artifact:*"
+actions = ["publish", "consume"]
+
+[[policy.rules]]
+principal = "local:bridge-egress"
+resource = "topic:interop.chat.replies"
+actions = ["consume", "admin"]
+
+[[policy.rules]]
+principal = "local:bridge-egress"
+resource = "artifact:*"
+actions = ["consume"]

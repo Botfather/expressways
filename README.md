@@ -10,7 +10,7 @@ The project is built around a simple idea:
 
 That means every meaningful operation should be authenticated, authorized, quota-aware, auditable, observable, and recoverable. Expressways starts there and only adds complexity when the simpler system is already trustworthy.
 
-The original long-range concept lives in [docs/main.md](docs/main.md). The implemented system is intentionally smaller, sharper, and more honest. The current scope is described in [docs/design/phase-1-system-design.md](docs/design/phase-1-system-design.md), [docs/design/security-compliance-baseline.md](docs/design/security-compliance-baseline.md), and [docs/adr/0001-phase-1-scope.md](docs/adr/0001-phase-1-scope.md).
+The original long-range concept lives in [docs/main.md](docs/main.md). The implemented system is intentionally smaller, sharper, and more honest. The current scope is described in [docs/design/phase-1-system-design.md](docs/design/phase-1-system-design.md), [docs/design/security-compliance-baseline.md](docs/design/security-compliance-baseline.md), [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md), and [docs/adr/0001-phase-1-scope.md](docs/adr/0001-phase-1-scope.md).
 
 ## Table of Contents
 
@@ -27,6 +27,7 @@ The original long-range concept lives in [docs/main.md](docs/main.md). The imple
 - [Workspace Layout](#workspace-layout)
 - [Quick Start](#quick-start)
 - [Guided Examples](#guided-examples)
+- [Interop Deployment](#interop-deployment)
 - [Raw Protocol Examples](#raw-protocol-examples)
 - [Configuration Guide](#configuration-guide)
 - [Security, Integrity, and Availability Model](#security-integrity-and-availability-model)
@@ -556,6 +557,7 @@ That means if you build with a subset of adopter features, you should update `ad
 
 - `crates/expressways-orchestrator`: task-driven supervisor and lifecycle tooling built on top of the broker.
 - `crates/expressways-bench`: benchmark harness for transport, storage, and watch paths.
+- `crates/expressways-interop-bridge-example`: webhook ingress bridge that normalizes OpenClaw or ZeroClaw messages into `TaskWorkItem` records.
 
 ### Adopter crates
 
@@ -579,6 +581,7 @@ Start with:
 
 - [docs/design/phase-1-system-design.md](docs/design/phase-1-system-design.md)
 - [docs/design/security-compliance-baseline.md](docs/design/security-compliance-baseline.md)
+- [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md)
 - [docs/adr/0001-phase-1-scope.md](docs/adr/0001-phase-1-scope.md)
 
 ### 2. Generate a development keypair
@@ -756,6 +759,69 @@ This example agent consumes `inspect_blob` tasks and uses the new `AssignedTask`
 cargo run -p expressways-bench -- suite --spawn-server --broker-iterations 100 --warmup-iterations 20 --payload-bytes 512 --message-count 2000 --read-batch 250 --output ./var/benchmarks/latest.json
 ```
 
+## Interop Deployment
+
+For OpenClaw and ZeroClaw on the same system, use Expressways as the audited coordination layer between runtime-specific ingress and egress services.
+
+Use this convention:
+
+- requests topic: `interop.chat.requests`
+- intermediate results topic: `interop.chat.results`
+- outbound replies topic: `interop.chat.replies`
+- canonical task type: `interop.chat.handoff`
+- canonical payload schema: [docs/design/schemas/interop-chat-handoff-v1.schema.json](docs/design/schemas/interop-chat-handoff-v1.schema.json)
+
+Full interop contract:
+
+- [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md)
+
+Issue bridge tokens:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-openclaw --audience expressways --scope system:broker:health --scope 'topic:interop.chat.requests:admin,publish' --scope 'artifact:*:publish,consume' --output ./var/auth/bridge-openclaw.token
+cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-zeroclaw --audience expressways --scope system:broker:health --scope 'topic:interop.chat*:admin,publish,consume' --scope 'artifact:*:publish,consume' --output ./var/auth/bridge-zeroclaw.token
+cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-egress --audience expressways --scope system:broker:health --scope 'topic:interop.chat.replies:admin,consume' --scope 'artifact:*:consume' --output ./var/auth/bridge-egress.token
+```
+
+Run the webhook ingress bridge:
+
+```bash
+cargo run -p expressways-interop-bridge-example -- --transport tcp --address 127.0.0.1:7766 --listen 127.0.0.1:8891 --token-file ./var/auth/bridge-openclaw.token --ingress-bearer local-bridge-secret --tasks-topic interop.chat.requests --task-type interop.chat.handoff --default-skill chat.reply
+```
+
+Submit a sample OpenClaw-style handoff:
+
+```bash
+curl -X POST http://127.0.0.1:8891/v1/webhook/handoff \
+  -H 'Authorization: Bearer local-bridge-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "schema_version": "interop.chat.handoff.v1",
+    "source_runtime": "openclaw",
+    "target_runtime": "zeroclaw",
+    "session": {
+      "session_id": "chat-42",
+      "channel": "whatsapp",
+      "account_id": "acct-main",
+      "sender_id": "user-1001"
+    },
+    "message": {
+      "text": "Summarize this build failure and suggest a fix."
+    },
+    "routing": {
+      "agent_id": "ops-assistant",
+      "workspace": "/Users/tusharmohan/Documents/@labs/expressways",
+      "labels": ["handoff","triage"]
+    }
+  }'
+```
+
+Inspect accepted handoff tasks:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 consume --token-file ./var/auth/developer.token --topic interop.chat.requests --offset 0 --limit 20
+```
+
 ## Raw Protocol Examples
 
 Expressways uses length-delimited control packets with JSON headers. Most commands are header-only, and artifact upload or download commands can attach raw binary bytes without base64 inflation.
@@ -921,6 +987,8 @@ Controls:
 - trusted issuers,
 - principal definitions.
 
+The sample config includes bridge principals (`local:bridge-openclaw`, `local:bridge-zeroclaw`, and `local:bridge-egress`) so OpenClaw and ZeroClaw adapters can run with least-privilege service identities.
+
 ### `[quotas]`
 
 Controls:
@@ -937,6 +1005,8 @@ Controls:
 
 - default decision,
 - rules mapping principals to resources and actions.
+
+The sample config includes interop topic policies for `topic:interop.chat.requests`, `topic:interop.chat*`, and `topic:interop.chat.replies` plus artifact access rules for bridge services.
 
 ## Security, Integrity, and Availability Model
 

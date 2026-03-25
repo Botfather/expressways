@@ -57,6 +57,18 @@ Every event includes:
 - `reason`
 - `emitted_at`
 
+### Interop Topic Convention
+
+For OpenClaw and ZeroClaw bridge deployments, use:
+
+- `interop.chat.requests` for inbound handoff tasks,
+- `interop.chat.results` for intermediate worker results,
+- `interop.chat.replies` for outbound runtime replies.
+
+Canonical handoff payload shape is documented in:
+
+- [openclaw-zeroclaw-interop.md](openclaw-zeroclaw-interop.md)
+
 ## Components
 
 - `expressways-orchestrator supervise`

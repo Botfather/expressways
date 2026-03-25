@@ -11,6 +11,10 @@ pub const REGISTRY_RESOURCE: &str = "registry:agents";
 pub const ARTIFACT_COLLECTION_RESOURCE: &str = "artifact:blobs";
 pub const TASKS_TOPIC: &str = "tasks";
 pub const TASK_EVENTS_TOPIC: &str = "task_events";
+pub const INTEROP_CHAT_REQUESTS_TOPIC: &str = "interop.chat.requests";
+pub const INTEROP_CHAT_RESULTS_TOPIC: &str = "interop.chat.results";
+pub const INTEROP_CHAT_REPLIES_TOPIC: &str = "interop.chat.replies";
+pub const INTEROP_CHAT_HANDOFF_TASK_TYPE: &str = "interop.chat.handoff";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]

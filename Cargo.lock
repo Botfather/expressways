@@ -1149,6 +1149,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "expressways-interop-bridge-example"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "expressways-client",
+ "expressways-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "expressways-orchestrator"
 version = "0.1.0"
 dependencies = [
