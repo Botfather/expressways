@@ -1,0 +1,14 @@
+{
+  "name": "expressways-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Express + SSE gateway for browser-to-Expressways chat tasks",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
