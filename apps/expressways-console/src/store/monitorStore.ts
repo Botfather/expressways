@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import {
   consumeTopic,
+  executeAdvancedControl as executeAdvancedControlApi,
   fetchConfigSnapshot,
   fetchSnapshot,
   listConfigBackups as listConfigBackupsApi,
@@ -11,6 +12,7 @@ import {
   updateConfigComponent as updateConfigComponentApi,
 } from '../api'
 import type {
+  AdvancedControlExecuteResult,
   ConfigBackupEntry,
   ConfigBackupsResult,
   ConfigComponentRollbackResult,
@@ -42,6 +44,9 @@ interface MonitorState {
   topicMessages: StoredMessageView[]
   topicNextOffset: number
   topicLoading: boolean
+  advancedControlRunning: boolean
+  advancedControlError: string | null
+  advancedControlHistory: AdvancedControlExecuteResult[]
   configSnapshot: ConfigConsoleSnapshot | null
   configLoading: boolean
   configError: string | null
@@ -59,6 +64,11 @@ interface MonitorState {
   applyStreamEvent: (payload: RegistryStreamEventPayload) => void
   clearRegistryEvents: () => void
   consumeTopic: (topic: string, offset: number, limit: number) => Promise<void>
+  runAdvancedControl: (
+    command: unknown,
+    attachmentBase64: string | null,
+  ) => Promise<AdvancedControlExecuteResult | null>
+  clearAdvancedControlHistory: () => void
   refreshConfig: () => Promise<void>
   saveConfigComponent: (
     componentId: string,
@@ -130,6 +140,9 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
   topicMessages: [],
   topicNextOffset: 0,
   topicLoading: false,
+  advancedControlRunning: false,
+  advancedControlError: null,
+  advancedControlHistory: [],
   configSnapshot: null,
   configLoading: false,
   configError: null,
@@ -223,6 +236,27 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
       const detail = error instanceof Error ? error.message : String(error)
       set({ loading: false, topicLoading: false, error: detail })
     }
+  },
+
+  runAdvancedControl: async (command, attachmentBase64) => {
+    const { settings } = get()
+    set({ advancedControlRunning: true, advancedControlError: null })
+    try {
+      const result = await executeAdvancedControlApi(settings, command, attachmentBase64)
+      set((state) => ({
+        advancedControlRunning: false,
+        advancedControlHistory: [result, ...state.advancedControlHistory].slice(0, 25),
+      }))
+      return result
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      set({ advancedControlRunning: false, advancedControlError: detail })
+      return null
+    }
+  },
+
+  clearAdvancedControlHistory: () => {
+    set({ advancedControlHistory: [], advancedControlError: null })
   },
 
   refreshConfig: async () => {

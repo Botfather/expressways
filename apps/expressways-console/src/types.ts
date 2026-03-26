@@ -168,6 +168,15 @@ export interface TopicConsumeResult {
   next_offset: number
 }
 
+export interface AdvancedControlExecuteResult {
+  commandType: string
+  responseType: string
+  response: unknown
+  attachmentBase64: string | null
+  attachmentBytes: number
+  executedAtMs: number
+}
+
 export interface ConfigSectionView {
   key: string
   kind: string

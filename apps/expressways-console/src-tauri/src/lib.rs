@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use expressways_client::{Client, Endpoint};
 use expressways_protocol::{
     AdopterStatusView, AgentCard, AgentQuery, AuthStateView, BrokerMetricsView, ControlCommand,
@@ -42,6 +43,25 @@ struct TopicConsumeResult {
     topic: String,
     messages: Vec<StoredMessage>,
     next_offset: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdvancedControlInput {
+    command: serde_json::Value,
+    #[serde(default)]
+    attachment_base64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdvancedControlResult {
+    command_type: String,
+    response_type: String,
+    response: serde_json::Value,
+    attachment_base64: Option<String>,
+    attachment_bytes: u64,
+    executed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -327,6 +347,56 @@ async fn monitor_consume_topic(
             response_name(&response)
         )),
     }
+}
+
+#[tauri::command]
+async fn monitor_execute_control(
+    settings: ConsoleSettings,
+    input: AdvancedControlInput,
+) -> Result<AdvancedControlResult, String> {
+    if settings.token.trim().is_empty() {
+        return Err("capability token is required".to_owned());
+    }
+
+    let command: ControlCommand = serde_json::from_value(input.command)
+        .map_err(|error| format!("invalid command payload: {error}"))?;
+    if matches!(command, ControlCommand::OpenAgentWatchStream { .. }) {
+        return Err(
+            "open_agent_watch_stream is stream-only. Use the Registry Stream tab instead."
+                .to_owned(),
+        );
+    }
+
+    let request_attachment = decode_optional_base64(input.attachment_base64.as_deref())?;
+
+    let endpoint = build_endpoint(&settings)?;
+    let mut client = Client::connect(endpoint)
+        .await
+        .map_err(|error| format!("failed to connect: {error}"))?;
+    let command_type = command_name(&command).to_owned();
+    let (response, response_attachment) =
+        send_command_with_attachment(&mut client, &settings.token, command, request_attachment)
+            .await?;
+    let response_type = response_name(&response).to_owned();
+    let response_json = serde_json::to_value(&response)
+        .map_err(|error| format!("failed to serialize response payload: {error}"))?;
+
+    let attachment_bytes = response_attachment
+        .as_ref()
+        .map(|bytes| bytes.len().min(u64::MAX as usize) as u64)
+        .unwrap_or(0);
+    let attachment_base64 = response_attachment
+        .as_ref()
+        .map(|bytes| BASE64_STANDARD.encode(bytes));
+
+    Ok(AdvancedControlResult {
+        command_type,
+        response_type,
+        response: response_json,
+        attachment_base64,
+        attachment_bytes,
+        executed_at_ms: system_time_to_millis(SystemTime::now()).unwrap_or(0),
+    })
 }
 
 #[tauri::command]
@@ -1203,11 +1273,27 @@ async fn send_command(
     token: &str,
     command: ControlCommand,
 ) -> Result<ControlResponse, String> {
-    let response = client
-        .send(ControlRequest {
-            capability_token: token.to_owned(),
-            command,
-        })
+    let (response, attachment) = send_command_with_attachment(client, token, command, None).await?;
+    if attachment.is_some() {
+        return Err("unexpected attachment in response".to_owned());
+    }
+    Ok(response)
+}
+
+async fn send_command_with_attachment(
+    client: &mut Client,
+    token: &str,
+    command: ControlCommand,
+    attachment: Option<Vec<u8>>,
+) -> Result<(ControlResponse, Option<Vec<u8>>), String> {
+    let (response, response_attachment) = client
+        .send_with_attachment(
+            ControlRequest {
+                capability_token: token.to_owned(),
+                command,
+            },
+            attachment,
+        )
         .await
         .map_err(|error| error.to_string())?;
 
@@ -1215,7 +1301,23 @@ async fn send_command(
         return Err(format!("{code}: {message}"));
     }
 
-    Ok(response)
+    Ok((response, response_attachment))
+}
+
+fn decode_optional_base64(input: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    BASE64_STANDARD
+        .decode(trimmed)
+        .map(Some)
+        .map_err(|error| format!("failed to decode attachmentBase64: {error}"))
 }
 
 fn response_name(response: &ControlResponse) -> &'static str {
@@ -1241,6 +1343,31 @@ fn response_name(response: &ControlResponse) -> &'static str {
     }
 }
 
+fn command_name(command: &ControlCommand) -> &'static str {
+    match command {
+        ControlCommand::Health => "health",
+        ControlCommand::GetAuthState => "get_auth_state",
+        ControlCommand::GetMetrics => "get_metrics",
+        ControlCommand::GetAdopters => "get_adopters",
+        ControlCommand::RegisterAgent { .. } => "register_agent",
+        ControlCommand::HeartbeatAgent { .. } => "heartbeat_agent",
+        ControlCommand::ListAgents { .. } => "list_agents",
+        ControlCommand::WatchAgents { .. } => "watch_agents",
+        ControlCommand::OpenAgentWatchStream { .. } => "open_agent_watch_stream",
+        ControlCommand::CleanupStaleAgents => "cleanup_stale_agents",
+        ControlCommand::RemoveAgent { .. } => "remove_agent",
+        ControlCommand::CreateTopic { .. } => "create_topic",
+        ControlCommand::RevokeToken { .. } => "revoke_token",
+        ControlCommand::RevokePrincipal { .. } => "revoke_principal",
+        ControlCommand::RevokeKey { .. } => "revoke_key",
+        ControlCommand::PutArtifact { .. } => "put_artifact",
+        ControlCommand::GetArtifact { .. } => "get_artifact",
+        ControlCommand::StatArtifact { .. } => "stat_artifact",
+        ControlCommand::Publish { .. } => "publish",
+        ControlCommand::Consume { .. } => "consume",
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1248,6 +1375,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             monitor_snapshot,
             monitor_consume_topic,
+            monitor_execute_control,
             monitor_start_registry_stream,
             monitor_stop_registry_stream,
             config_console_snapshot,

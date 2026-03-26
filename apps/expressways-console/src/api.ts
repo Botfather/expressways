@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
+  AdvancedControlExecuteResult,
   ConfigBackupsResult,
   ConfigComponentRollbackResult,
   ConfigComponentUpdateResult,
@@ -29,6 +30,21 @@ export async function consumeTopic(
     topic,
     offset,
     limit,
+  })
+}
+
+export async function executeAdvancedControl(
+  settings: ConsoleSettings,
+  command: unknown,
+  attachmentBase64: string | null,
+): Promise<AdvancedControlExecuteResult> {
+  const normalizedAttachment = attachmentBase64 && attachmentBase64.trim().length > 0 ? attachmentBase64.trim() : null
+  return invoke<AdvancedControlExecuteResult>('monitor_execute_control', {
+    settings,
+    input: {
+      command,
+      attachmentBase64: normalizedAttachment,
+    },
   })
 }
 

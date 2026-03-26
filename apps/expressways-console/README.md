@@ -36,6 +36,12 @@ The `Config Console` view supports:
 - rollback from backup history,
 - restart recommendations with one-click orchestration for supported services.
 
+The `Advanced Control` view supports:
+
+- command-template bootstrapping for raw `ControlCommand` JSON payloads,
+- optional `attachmentBase64` request bytes for attachment-aware commands,
+- response inspection with attachment preview and execution history.
+
 Service orchestration helper used by the restart action:
 
 ```bash

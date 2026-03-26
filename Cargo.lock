@@ -1138,6 +1138,7 @@ dependencies = [
 name = "expressways-console"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "expressways-client",
  "expressways-protocol",
  "log",

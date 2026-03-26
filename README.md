@@ -573,6 +573,7 @@ That means if you build with a subset of adopter features, you should update `ad
 - `docs/design`: architecture and baseline operational contracts.
 - `docs/adr`: scope and design decisions.
 - `docs/plans`: execution planning.
+- `docs/plans/productization-execution-plan.md`: productization milestones, ownership lanes, and acceptance gates.
 - `docs/reviews`: critical review material.
 
 ## Quick Start
@@ -597,6 +598,19 @@ cargo run -p expressways-client --bin expresswaysctl -- generate-keypair --key-i
 
 ```bash
 cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:developer --audience expressways --scope system:broker:health --scope 'system:broker:admin' --scope 'topic:*:admin,publish,consume' --scope 'artifact:*:publish,consume,admin' --scope 'registry:agents*:admin' --output ./var/auth/developer.token
+```
+
+Or use the Makefile shortcut to generate an admin token:
+
+```bash
+make generate-admin-token
+```
+
+By default this uses `local:developer` (registered in `configs/expressways.example.toml`) and writes `./var/auth/admin.token`.
+You can override the principal when needed:
+
+```bash
+ADMIN_PRINCIPAL=local:developer make generate-admin-token
 ```
 
 ### 4. Start the broker
@@ -867,6 +881,8 @@ pnpm dev:tauri
 ```
 
 The `Config Console` tab shows discovered TOML components (broker + Nanobot system files), current section summaries, and per-component apply flow with validation, diff preview, backup snapshotting, rollback controls, and one-click restart orchestration for supported services.
+
+The `Advanced Control` tab lets operators execute arbitrary control-plane commands from JSON templates (including attachment-aware artifact workflows), inspect full broker responses, and retain recent execution history for debugging and rehearsal runs.
 
 ### Example: Benchmark the broker
 

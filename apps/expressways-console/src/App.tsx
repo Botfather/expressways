@@ -4,7 +4,118 @@ import { onRegistryStreamEvent } from './api'
 import { useMonitorStore } from './store/monitorStore'
 import type { ConfigComponentView, ConfigRestartHint, MetricHistoryPoint, StoredMessageView } from './types'
 
-type TabKey = 'overview' | 'registry' | 'topics' | 'config'
+type TabKey = 'overview' | 'registry' | 'topics' | 'config' | 'advanced'
+
+type AdvancedCommandTemplate = {
+  id: string
+  label: string
+  description: string
+  command: Record<string, unknown>
+  defaultAttachmentBase64?: string
+}
+
+const ADVANCED_COMMAND_TEMPLATES: AdvancedCommandTemplate[] = [
+  {
+    id: 'health',
+    label: 'Health',
+    description: 'Broker liveness and service mode.',
+    command: {
+      type: 'health',
+    },
+  },
+  {
+    id: 'get_metrics',
+    label: 'Get Metrics',
+    description: 'Full broker metrics snapshot.',
+    command: {
+      type: 'get_metrics',
+    },
+  },
+  {
+    id: 'list_agents',
+    label: 'List Agents',
+    description: 'List discovery registry entries.',
+    command: {
+      type: 'list_agents',
+      query: {
+        include_stale: true,
+      },
+    },
+  },
+  {
+    id: 'watch_agents',
+    label: 'Watch Agents (poll)',
+    description: 'Long-poll registry events without opening a stream.',
+    command: {
+      type: 'watch_agents',
+      query: {
+        include_stale: true,
+      },
+      cursor: null,
+      max_events: 100,
+      wait_timeout_ms: 1000,
+    },
+  },
+  {
+    id: 'create_topic',
+    label: 'Create Topic',
+    description: 'Create a topic with retention and classification defaults.',
+    command: {
+      type: 'create_topic',
+      topic: {
+        name: 'interop.chat.requests',
+        retention_class: 'operational',
+        default_classification: 'internal',
+      },
+    },
+  },
+  {
+    id: 'publish',
+    label: 'Publish Message',
+    description: 'Publish a plain text payload to any topic.',
+    command: {
+      type: 'publish',
+      topic: 'interop.chat.requests',
+      classification: 'internal',
+      payload: '{"hello":"world"}',
+    },
+  },
+  {
+    id: 'consume',
+    label: 'Consume Messages',
+    description: 'Consume a message batch from a topic.',
+    command: {
+      type: 'consume',
+      topic: 'interop.chat.requests',
+      offset: 0,
+      limit: 50,
+    },
+  },
+  {
+    id: 'put_artifact',
+    label: 'Put Artifact',
+    description: 'Upload attachment bytes (set attachmentBase64 below).',
+    command: {
+      type: 'put_artifact',
+      artifact_id: null,
+      content_type: 'text/plain',
+      byte_length: 12,
+      sha256: null,
+      classification: 'internal',
+      retention_class: 'operational',
+    },
+    defaultAttachmentBase64: 'aGVsbG8gd29ybGQK',
+  },
+  {
+    id: 'get_artifact',
+    label: 'Get Artifact',
+    description: 'Fetch artifact metadata and binary attachment bytes.',
+    command: {
+      type: 'get_artifact',
+      artifact_id: 'replace-with-artifact-id',
+    },
+  },
+]
 
 type ToastState = {
   tone: 'success' | 'error'
@@ -38,6 +149,11 @@ function App() {
     topicMessages,
     topicNextOffset,
     topicLoading,
+    advancedControlRunning,
+    advancedControlError,
+    advancedControlHistory,
+    runAdvancedControl,
+    clearAdvancedControlHistory,
     configSnapshot,
     configLoading,
     configError,
@@ -60,6 +176,11 @@ function App() {
   const [producerFilter, setProducerFilter] = useState('')
   const [classificationFilter, setClassificationFilter] = useState('all')
   const [payloadFilter, setPayloadFilter] = useState('')
+  const [advancedTemplateId, setAdvancedTemplateId] = useState(ADVANCED_COMMAND_TEMPLATES[0]?.id ?? 'health')
+  const [advancedCommandInput, setAdvancedCommandInput] = useState(() =>
+    JSON.stringify(ADVANCED_COMMAND_TEMPLATES[0]?.command ?? { type: 'health' }, null, 2),
+  )
+  const [advancedAttachmentInput, setAdvancedAttachmentInput] = useState('')
   const [configDrafts, setConfigDrafts] = useState<Record<string, string>>({})
   const [visibleDiffs, setVisibleDiffs] = useState<Record<string, boolean>>({})
   const [visibleBackups, setVisibleBackups] = useState<Record<string, boolean>>({})
@@ -70,7 +191,9 @@ function App() {
     draftSettings.socketPath !== settings.socketPath ||
     draftSettings.token !== settings.token
 
-  const tokenLooksValid = draftSettings.token.trim().length > 0 && draftSettings.token.trim().split('.').length === 3
+  const tokenTrimmed = draftSettings.token.trim()
+  const tokenLooksPresent = tokenTrimmed.length > 0
+  const tokenLooksCanonical = tokenTrimmed.split('.').filter(Boolean).length === 2
 
   useEffect(() => {
     void refresh()
@@ -130,15 +253,18 @@ function App() {
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
-    if (!tokenLooksValid) {
-      setToast({ tone: 'error', message: 'Token format looks invalid. Expected 3 JWT sections.' })
+    if (!tokenLooksPresent) {
+      setToast({ tone: 'error', message: 'Capability token is required.' })
       return
     }
 
     saveSettings()
     const ok = await refresh()
     if (ok) {
-      setToast({ tone: 'success', message: 'Settings saved. New token is active.' })
+      const suffix = tokenLooksCanonical
+        ? ''
+        : ' Token format is non-canonical; expected payload.signature.'
+      setToast({ tone: 'success', message: `Settings saved. New token is active.${suffix}` })
       return
     }
     setToast({ tone: 'error', message: 'Saved, but refresh failed. Check broker and token scopes.' })
@@ -301,6 +427,57 @@ function App() {
     })
   }
 
+  const applyAdvancedTemplate = (templateId: string) => {
+    const template = ADVANCED_COMMAND_TEMPLATES.find((candidate) => candidate.id === templateId)
+    if (!template) {
+      return
+    }
+
+    setAdvancedTemplateId(template.id)
+    setAdvancedCommandInput(JSON.stringify(template.command, null, 2))
+    setAdvancedAttachmentInput(template.defaultAttachmentBase64 ?? '')
+  }
+
+  const runAdvancedControlCommand = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    if (hasUnsavedChanges) {
+      setToast({
+        tone: 'error',
+        message: 'Save settings before running advanced control commands.',
+      })
+      return
+    }
+
+    let parsedCommand: unknown
+    try {
+      parsedCommand = JSON.parse(advancedCommandInput)
+    } catch (error) {
+      setToast({
+        tone: 'error',
+        message: `Command JSON is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      })
+      return
+    }
+
+    const result = await runAdvancedControl(
+      parsedCommand,
+      advancedAttachmentInput.trim().length > 0 ? advancedAttachmentInput.trim() : null,
+    )
+    if (!result) {
+      setToast({
+        tone: 'error',
+        message: 'Advanced control command failed.',
+      })
+      return
+    }
+
+    setToast({
+      tone: 'success',
+      message: `Executed ${result.commandType} → ${result.responseType}.`,
+    })
+  }
+
   return (
     <main className="mx-auto min-h-screen max-w-7xl px-4 py-6 md:px-8">
       <header className="mb-6 animate-fadeup rounded-3xl border border-white/70 bg-white/70 p-6 shadow-xl backdrop-blur">
@@ -428,12 +605,18 @@ function App() {
             Save settings to apply updated token and connection details
           </p>
         ) : null}
+        {tokenLooksPresent && !tokenLooksCanonical ? (
+          <p className="mt-1 font-mono text-[11px] uppercase tracking-[0.12em] text-amber-700">
+            Token format hint: expected payload.signature (2 sections)
+          </p>
+        ) : null}
 
         <div className="mt-4 flex flex-wrap gap-2">
           <TabButton title="Overview" active={activeTab === 'overview'} onClick={() => setActiveTab('overview')} />
           <TabButton title="Registry Stream" active={activeTab === 'registry'} onClick={() => setActiveTab('registry')} />
           <TabButton title="Topic Monitor" active={activeTab === 'topics'} onClick={() => setActiveTab('topics')} />
           <TabButton title="Config Console" active={activeTab === 'config'} onClick={() => setActiveTab('config')} />
+          <TabButton title="Advanced Control" active={activeTab === 'advanced'} onClick={() => setActiveTab('advanced')} />
         </div>
 
         {error ? (
@@ -676,6 +859,166 @@ function App() {
                 <MessageCard key={message.message_id} message={message} />
               ))}
             </div>
+          </Panel>
+        </section>
+      ) : null}
+
+      {activeTab === 'advanced' ? (
+        <section className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+          <Panel title="Advanced Broker Control">
+            <form className="space-y-3" onSubmit={runAdvancedControlCommand}>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+                <label className="flex flex-col gap-1 text-xs font-medium uppercase tracking-[0.12em] text-ink/70 md:col-span-3">
+                  Template
+                  <select
+                    value={advancedTemplateId}
+                    onChange={(event) => setAdvancedTemplateId(event.target.value)}
+                    className="rounded-lg border border-ink/20 px-3 py-2 text-sm normal-case tracking-normal"
+                  >
+                    {ADVANCED_COMMAND_TEMPLATES.map((template) => (
+                      <option key={template.id} value={template.id}>
+                        {template.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => applyAdvancedTemplate(advancedTemplateId)}
+                  className="rounded-lg border border-ink/20 px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-ink"
+                >
+                  Load Template
+                </button>
+              </div>
+
+              <p className="text-xs text-ink/75">
+                {
+                  ADVANCED_COMMAND_TEMPLATES.find((template) => template.id === advancedTemplateId)
+                    ?.description
+                }
+              </p>
+
+              <label className="flex flex-col gap-1 text-xs font-medium uppercase tracking-[0.12em] text-ink/70">
+                Control Command JSON
+                <textarea
+                  value={advancedCommandInput}
+                  onChange={(event) => setAdvancedCommandInput(event.target.value)}
+                  className="h-80 rounded-lg border border-ink/20 bg-white px-3 py-2 font-mono text-xs text-ink"
+                  spellCheck={false}
+                />
+              </label>
+
+              <label className="flex flex-col gap-1 text-xs font-medium uppercase tracking-[0.12em] text-ink/70">
+                Optional attachmentBase64
+                <textarea
+                  value={advancedAttachmentInput}
+                  onChange={(event) => setAdvancedAttachmentInput(event.target.value)}
+                  className="h-20 rounded-lg border border-ink/20 bg-white px-3 py-2 font-mono text-xs text-ink"
+                  spellCheck={false}
+                  placeholder="Only needed for put_artifact or other attachment-aware workflows."
+                />
+              </label>
+
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="submit"
+                  className="rounded-lg bg-ink px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-white"
+                  disabled={advancedControlRunning || hasUnsavedChanges}
+                >
+                  {advancedControlRunning ? 'Executing...' : 'Execute Command'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    try {
+                      const parsed = JSON.parse(advancedCommandInput) as unknown
+                      setAdvancedCommandInput(JSON.stringify(parsed, null, 2))
+                    } catch {
+                      setToast({
+                        tone: 'error',
+                        message: 'Cannot format invalid JSON.',
+                      })
+                    }
+                  }}
+                  className="rounded-lg border border-ink/20 px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-ink"
+                >
+                  Format JSON
+                </button>
+              </div>
+            </form>
+
+            {hasUnsavedChanges ? (
+              <p className="mt-2 font-mono text-[11px] uppercase tracking-[0.12em] text-signal/85">
+                Save settings before executing advanced commands.
+              </p>
+            ) : null}
+
+            {advancedControlError ? (
+              <p className="mt-3 rounded-lg border border-signal/40 bg-signal/10 p-3 font-mono text-xs text-signal">
+                {advancedControlError}
+              </p>
+            ) : null}
+
+            <div className="mt-3 rounded-lg border border-amber-400/40 bg-amber-50 p-3 text-xs text-amber-900">
+              <p className="font-mono text-[11px] uppercase tracking-[0.1em] text-amber-800">Safety Notes</p>
+              <p className="mt-1">
+                `open_agent_watch_stream` is stream-only and should be used via the Registry Stream tab. Artifact
+                upload/download can carry binary bytes through `attachmentBase64`.
+              </p>
+            </div>
+          </Panel>
+
+          <Panel title="Execution History">
+            <div className="mb-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={clearAdvancedControlHistory}
+                className="rounded-lg border border-ink/20 px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-ink"
+                disabled={advancedControlHistory.length === 0}
+              >
+                Clear History
+              </button>
+              <p className="rounded-lg border border-ink/15 bg-paper px-3 py-2 font-mono text-[11px] uppercase tracking-[0.1em] text-ink/70">
+                Entries: {advancedControlHistory.length}
+              </p>
+            </div>
+
+            {advancedControlHistory.length === 0 ? (
+              <p className="text-sm text-ink/80">No advanced control executions yet.</p>
+            ) : (
+              <div className="max-h-[900px] space-y-3 overflow-y-auto pr-1">
+                {advancedControlHistory.map((entry, index) => (
+                  <article key={`${entry.executedAtMs}-${entry.commandType}-${index}`} className="rounded-xl border border-ink/10 bg-paper p-3">
+                    <div className="mb-2 flex flex-wrap items-start justify-between gap-2">
+                      <div>
+                        <p className="font-heading text-base text-ink">
+                          {entry.commandType} → {entry.responseType}
+                        </p>
+                        <p className="font-mono text-[11px] text-ink/70">{formatTimestamp(entry.executedAtMs)}</p>
+                      </div>
+                      <span className="rounded-full border border-ink/20 bg-white px-3 py-1 font-mono text-[10px] uppercase tracking-[0.1em] text-ink/70">
+                        attachment {formatBytes(entry.attachmentBytes)}
+                      </span>
+                    </div>
+
+                    <pre className="max-h-80 overflow-auto rounded-lg border border-ink/10 bg-white p-2 font-mono text-[11px] text-ink/85">
+                      {truncatePreview(formatJsonValue(entry.response), 16000)}
+                    </pre>
+
+                    {entry.attachmentBase64 ? (
+                      <details className="mt-2 rounded-lg border border-ink/10 bg-white p-2">
+                        <summary className="cursor-pointer font-mono text-[11px] uppercase tracking-[0.1em] text-ink/70">
+                          Response attachmentBase64
+                        </summary>
+                        <pre className="mt-2 max-h-40 overflow-auto rounded bg-paper p-2 font-mono text-[11px] text-ink/85">
+                          {truncatePreview(entry.attachmentBase64, 8000)}
+                        </pre>
+                      </details>
+                    ) : null}
+                  </article>
+                ))}
+              </div>
+            )}
           </Panel>
         </section>
       ) : null}
@@ -1038,6 +1381,21 @@ function formatBytes(value: number): string {
     return `${(value / 1024).toFixed(1)} KiB`
   }
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`
+}
+
+function formatJsonValue(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function truncatePreview(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value
+  }
+  return `${value.slice(0, maxChars)}...`
 }
 
 type DiffLine = {

@@ -1,8 +1,10 @@
-.PHONY: benchmark generate-token help prepare-local-dirs run-expressways run-orchestrator run-dashboard run-stack run-ollama-agent run-gateway run-ollama-stack
+.PHONY: benchmark generate-admin-token generate-token help prepare-local-dirs run-expressways run-orchestrator run-dashboard run-stack run-ollama-agent run-gateway run-ollama-stack
 
 EXPRESSWAYS_CONFIG ?= configs/expressways.example.toml
 BROKER_ADDRESS ?= 127.0.0.1:7766
 TOKEN_FILE ?= ./var/auth/developer.token
+ADMIN_TOKEN_FILE ?= ./var/auth/admin.token
+ADMIN_PRINCIPAL ?= local:developer
 STATE_PATH ?= ./var/orchestrator/state.json
 TASKS_TOPIC ?= tasks
 TASK_EVENTS_TOPIC ?= task_events
@@ -27,6 +29,8 @@ help:
 	@echo "  make run-ollama-agent  Start the Ollama AgentWorker bridge"
 	@echo "  make run-gateway       Start the browser SSE gateway"
 	@echo "  make run-ollama-stack  Start broker, orchestrator, Ollama worker, and gateway"
+	@echo "  make generate-admin-token Generate a local admin-scope capability token (default principal: $(ADMIN_PRINCIPAL))"
+	@echo "  make generate-token    Alias for generate-admin-token"
 	@echo "  make benchmark         Run the benchmark suite"
 
 prepare-local-dirs:
@@ -90,11 +94,13 @@ benchmark: prepare-local-dirs
 		--read-batch 250 \
 		--output ./var/benchmarks/latest.json
 
-generate-token:
-	@echo "Generating a new token..."
+generate-admin-token:
+	@echo "Generating a new admin token..."
 	@mkdir -p ./tmp ./var/auth ./var/agent ./var/benchmarks ./var/orchestrator
 	@if [ ! -f ./var/auth/issuer.private ] || [ ! -f ./var/auth/issuer.public ]; then \
 		echo "Issuer keypair missing. Generating local dev keypair..."; \
 		cargo run -p expressways-client --bin expresswaysctl -- generate-keypair --key-id dev --private-key ./var/auth/issuer.private --public-key ./var/auth/issuer.public; \
 	fi
-	cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:developer --audience expressways --scope system:broker:health --scope 'system:broker:admin' --scope 'topic:*:admin,publish,consume' --scope 'artifact:*:publish,consume,admin' --scope 'registry:agents*:admin' --output ./var/auth/developer.token
+	cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal $(ADMIN_PRINCIPAL) --audience expressways --scope system:broker:health --scope 'system:broker:admin' --scope 'topic:*:admin,publish,consume' --scope 'artifact:*:publish,consume,admin' --scope 'registry:agents*:admin' --output $(ADMIN_TOKEN_FILE)
+
+generate-token: generate-admin-token
