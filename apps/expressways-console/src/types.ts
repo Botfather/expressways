@@ -167,3 +167,76 @@ export interface TopicConsumeResult {
   messages: StoredMessageView[]
   next_offset: number
 }
+
+export interface ConfigSectionView {
+  key: string
+  kind: string
+  summary: string
+}
+
+export interface ConfigRestartHint {
+  serviceId: string | null
+  service: string
+  reason: string
+  command: string | null
+}
+
+export interface ConfigComponentView {
+  id: string
+  name: string
+  group: string
+  description: string
+  filePath: string
+  exists: boolean
+  editable: boolean
+  updatedAtMs: number | null
+  parseError: string | null
+  sections: ConfigSectionView[]
+  restartHints: ConfigRestartHint[]
+  content: string
+}
+
+export interface ConfigConsoleSnapshot {
+  rootPath: string
+  components: ConfigComponentView[]
+}
+
+export interface ConfigComponentUpdateResult {
+  component: ConfigComponentView
+  backupPath: string | null
+  appliedAtMs: number
+  restartHints: ConfigRestartHint[]
+}
+
+export interface ConfigBackupEntry {
+  backupPath: string
+  createdAtMs: number | null
+  sizeBytes: number
+}
+
+export interface ConfigBackupsResult {
+  componentId: string
+  backups: ConfigBackupEntry[]
+}
+
+export interface ConfigComponentRollbackResult {
+  component: ConfigComponentView
+  rollbackSource: string
+  backupPath: string | null
+  appliedAtMs: number
+  restartHints: ConfigRestartHint[]
+}
+
+export interface ConfigRestartServiceOutcome {
+  serviceId: string
+  ok: boolean
+  statusCode: number | null
+  message: string
+  stdout: string
+  stderr: string
+}
+
+export interface ConfigRestartServicesResult {
+  restartedAtMs: number
+  outcomes: ConfigRestartServiceOutcome[]
+}

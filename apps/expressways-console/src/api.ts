@@ -1,6 +1,14 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { ConsoleSettings, MonitorSnapshot } from './types'
+import type {
+  ConfigBackupsResult,
+  ConfigComponentRollbackResult,
+  ConfigComponentUpdateResult,
+  ConfigConsoleSnapshot,
+  ConsoleSettings,
+  ConfigRestartServicesResult,
+  MonitorSnapshot,
+} from './types'
 import type {
   RegistryStreamEventPayload,
   TopicConsumeResult,
@@ -43,5 +51,55 @@ export async function onRegistryStreamEvent(
 ): Promise<UnlistenFn> {
   return listen<RegistryStreamEventPayload>('registry-stream-event', (event) => {
     handler(event.payload)
+  })
+}
+
+export async function fetchConfigSnapshot(): Promise<ConfigConsoleSnapshot> {
+  return invoke<ConfigConsoleSnapshot>('config_console_snapshot')
+}
+
+export async function updateConfigComponent(
+  componentId: string,
+  content: string,
+): Promise<ConfigComponentUpdateResult> {
+  return invoke<ConfigComponentUpdateResult>('config_console_update_component', {
+    input: {
+      componentId,
+      content,
+    },
+  })
+}
+
+export async function listConfigBackups(
+  componentId: string,
+  limit = 50,
+): Promise<ConfigBackupsResult> {
+  return invoke<ConfigBackupsResult>('config_console_list_backups', {
+    input: {
+      componentId,
+      limit,
+    },
+  })
+}
+
+export async function rollbackConfigComponent(
+  componentId: string,
+  backupPath: string,
+): Promise<ConfigComponentRollbackResult> {
+  return invoke<ConfigComponentRollbackResult>('config_console_rollback_component', {
+    input: {
+      componentId,
+      backupPath,
+    },
+  })
+}
+
+export async function restartConfigServices(
+  serviceIds: string[],
+): Promise<ConfigRestartServicesResult> {
+  return invoke<ConfigRestartServicesResult>('config_console_restart_services', {
+    input: {
+      serviceIds,
+    },
   })
 }

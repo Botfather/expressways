@@ -100,6 +100,22 @@ status = "active"
 allowed_key_ids = ["dev"]
 quota_profile = "bridge"
 
+[[auth.principals]]
+id = "local:nanobot-runtime"
+kind = "agent"
+display_name = "Nanobot Runtime"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "nanobot_runtime"
+
+[[auth.principals]]
+id = "local:nanobot-bridge"
+kind = "service"
+display_name = "Nanobot Channel Bridge"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "nanobot_bridge"
+
 [quotas]
 
 [[quotas.profiles]]
@@ -131,6 +147,28 @@ publish_requests_per_window = 50
 publish_window_seconds = 1
 consume_max_limit = 200
 consume_requests_per_window = 50
+consume_window_seconds = 1
+backpressure_mode = "delay"
+backpressure_delay_ms = 50
+
+[[quotas.profiles]]
+name = "nanobot_runtime"
+publish_payload_max_bytes = 65536
+publish_requests_per_window = 30
+publish_window_seconds = 1
+consume_max_limit = 100
+consume_requests_per_window = 30
+consume_window_seconds = 1
+backpressure_mode = "delay"
+backpressure_delay_ms = 50
+
+[[quotas.profiles]]
+name = "nanobot_bridge"
+publish_payload_max_bytes = 65536
+publish_requests_per_window = 60
+publish_window_seconds = 1
+consume_max_limit = 200
+consume_requests_per_window = 60
 consume_window_seconds = 1
 backpressure_mode = "delay"
 backpressure_delay_ms = 50
@@ -197,3 +235,48 @@ actions = ["consume", "admin"]
 principal = "local:bridge-egress"
 resource = "artifact:*"
 actions = ["consume"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "topic:nanobot.inbound"
+actions = ["consume", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "topic:nanobot.outbound"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "topic:nanobot.outbound.stream"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "topic:nanobot.runtime.events"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "registry:agents*"
+actions = ["admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-bridge"
+resource = "topic:nanobot.inbound"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-bridge"
+resource = "topic:nanobot.outbound"
+actions = ["consume", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-bridge"
+resource = "topic:nanobot.outbound.stream"
+actions = ["consume", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-bridge"
+resource = "topic:nanobot.runtime.events"
+actions = ["consume", "admin"]

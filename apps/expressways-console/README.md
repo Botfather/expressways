@@ -22,15 +22,35 @@ Tauri-based monitoring console for the Expressways broker.
 From this directory:
 
 ```bash
-npm install
-npm run dev:tauri
+pnpm install
+pnpm dev:tauri
 ```
 
 The console reads connection settings and a capability token from the UI and calls Expressways directly through Tauri commands.
 
+The `Config Console` view supports:
+
+- grouped TOML configuration editing,
+- diff preview before apply,
+- automatic local backup snapshots,
+- rollback from backup history,
+- restart recommendations with one-click orchestration for supported services.
+
+Service orchestration helper used by the restart action:
+
+```bash
+scripts/expressways-service.sh <start|stop|restart|status> <expressways-server|nanobot-runtime>
+```
+
 ## Build
 
 ```bash
-npm run build
-npm run build:tauri
+pnpm build
+pnpm build:tauri
 ```
+
+## Dependency Policy
+
+- Use `pnpm` as the package manager for this app.
+- Commit `pnpm-lock.yaml` for deterministic installs in local and CI environments.
+- Do not commit `.pnpm-store`; it is local cache state.

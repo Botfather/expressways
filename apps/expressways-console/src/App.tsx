@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { onRegistryStreamEvent } from './api'
 import { useMonitorStore } from './store/monitorStore'
-import type { MetricHistoryPoint, StoredMessageView } from './types'
+import type { ConfigComponentView, ConfigRestartHint, MetricHistoryPoint, StoredMessageView } from './types'
 
-type TabKey = 'overview' | 'registry' | 'topics'
+type TabKey = 'overview' | 'registry' | 'topics' | 'config'
 
 type ToastState = {
   tone: 'success' | 'error'
@@ -38,6 +38,19 @@ function App() {
     topicMessages,
     topicNextOffset,
     topicLoading,
+    configSnapshot,
+    configLoading,
+    configError,
+    configSavingComponentId,
+    configBackupLoadingComponentId,
+    configRollbackComponentId,
+    configRestartingServiceIds,
+    configBackupsByComponent,
+    refreshConfig,
+    saveConfigComponent,
+    loadConfigBackups,
+    rollbackConfigComponent,
+    restartConfigServices,
   } = useMonitorStore()
 
   const [activeTab, setActiveTab] = useState<TabKey>('overview')
@@ -47,6 +60,9 @@ function App() {
   const [producerFilter, setProducerFilter] = useState('')
   const [classificationFilter, setClassificationFilter] = useState('all')
   const [payloadFilter, setPayloadFilter] = useState('')
+  const [configDrafts, setConfigDrafts] = useState<Record<string, string>>({})
+  const [visibleDiffs, setVisibleDiffs] = useState<Record<string, boolean>>({})
+  const [visibleBackups, setVisibleBackups] = useState<Record<string, boolean>>({})
   const [toast, setToast] = useState<ToastState | null>(null)
   const hasUnsavedChanges =
     draftSettings.transport !== settings.transport ||
@@ -58,7 +74,8 @@ function App() {
 
   useEffect(() => {
     void refresh()
-  }, [refresh])
+    void refreshConfig()
+  }, [refresh, refreshConfig])
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
@@ -97,6 +114,19 @@ function App() {
     return () => window.clearTimeout(timer)
   }, [toast])
 
+  useEffect(() => {
+    if (!configSnapshot) {
+      return
+    }
+    setConfigDrafts((previous) => {
+      const next: Record<string, string> = {}
+      for (const component of configSnapshot.components) {
+        next[component.id] = previous[component.id] ?? component.content
+      }
+      return next
+    })
+  }, [configSnapshot])
+
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
@@ -128,6 +158,148 @@ function App() {
       return true
     })
   }, [classificationFilter, payloadFilter, producerFilter, topicMessages])
+
+  const configGroups = useMemo(() => {
+    if (!configSnapshot) {
+      return [] as Array<[string, ConfigComponentView[]]>
+    }
+
+    const grouped = new Map<string, ConfigComponentView[]>()
+    for (const component of configSnapshot.components) {
+      const current = grouped.get(component.group) ?? []
+      current.push(component)
+      grouped.set(component.group, current)
+    }
+
+    return Array.from(grouped.entries()).map(
+      ([group, components]): [string, ConfigComponentView[]] => [
+        group,
+        [...components].sort((left, right) => left.name.localeCompare(right.name)),
+      ],
+    )
+  }, [configSnapshot])
+
+  const updateConfigDraft = (componentId: string, value: string) => {
+    setConfigDrafts((previous) => ({
+      ...previous,
+      [componentId]: value,
+    }))
+  }
+
+  const resetConfigDraft = (component: ConfigComponentView) => {
+    setConfigDrafts((previous) => ({
+      ...previous,
+      [component.id]: component.content,
+    }))
+  }
+
+  const saveConfigDraft = async (component: ConfigComponentView) => {
+    const draft = configDrafts[component.id] ?? component.content
+    const result = await saveConfigComponent(component.id, draft)
+    if (!result) {
+      setToast({ tone: 'error', message: `Failed to save ${component.name}. Check TOML syntax.` })
+      return
+    }
+    const saved = result.component
+    setConfigDrafts((previous) => ({
+      ...previous,
+      [saved.id]: saved.content,
+    }))
+
+    const restartLabel = result.restartHints.map((hint) => hint.service).join(', ')
+    const backupLabel = result.backupPath ? ` Backup: ${result.backupPath}` : ''
+    const restartSuffix = restartLabel ? ` Restart recommended: ${restartLabel}.` : ''
+    setToast({
+      tone: 'success',
+      message: `${component.name} applied.${restartSuffix}${backupLabel}`,
+    })
+
+    if (visibleBackups[component.id]) {
+      void loadConfigBackups(component.id)
+    }
+  }
+
+  const toggleDiffVisibility = (componentId: string) => {
+    setVisibleDiffs((previous) => ({
+      ...previous,
+      [componentId]: !previous[componentId],
+    }))
+  }
+
+  const toggleBackupsVisibility = (componentId: string) => {
+    setVisibleBackups((previous) => {
+      const nextVisible = !previous[componentId]
+      if (nextVisible) {
+        void loadConfigBackups(componentId)
+      }
+      return {
+        ...previous,
+        [componentId]: nextVisible,
+      }
+    })
+  }
+
+  const rollbackToBackup = async (component: ConfigComponentView, backupPath: string) => {
+    const result = await rollbackConfigComponent(component.id, backupPath)
+    if (!result) {
+      setToast({
+        tone: 'error',
+        message: `Rollback failed for ${component.name}.`,
+      })
+      return
+    }
+
+    const restored = result.component
+    setConfigDrafts((previous) => ({
+      ...previous,
+      [restored.id]: restored.content,
+    }))
+    setToast({
+      tone: 'success',
+      message: `${component.name} rolled back from backup.`,
+    })
+    void loadConfigBackups(component.id)
+  }
+
+  const runSuggestedRestarts = async (hints: ConfigRestartHint[]) => {
+    const serviceIds = Array.from(
+      new Set(
+        hints
+          .map((hint) => hint.serviceId)
+          .filter((value): value is string => typeof value === 'string' && value.length > 0),
+      ),
+    )
+    if (serviceIds.length === 0) {
+      setToast({
+        tone: 'error',
+        message: 'No actionable restart service was found for this component.',
+      })
+      return
+    }
+
+    const result = await restartConfigServices(serviceIds)
+    if (!result) {
+      setToast({
+        tone: 'error',
+        message: 'Restart orchestration failed.',
+      })
+      return
+    }
+
+    const failed = result.outcomes.filter((outcome) => !outcome.ok)
+    if (failed.length > 0) {
+      setToast({
+        tone: 'error',
+        message: `Restart completed with errors (${failed.length}/${result.outcomes.length} failed).`,
+      })
+      return
+    }
+
+    setToast({
+      tone: 'success',
+      message: `Restarted ${result.outcomes.length} service(s).`,
+    })
+  }
 
   return (
     <main className="mx-auto min-h-screen max-w-7xl px-4 py-6 md:px-8">
@@ -261,6 +433,7 @@ function App() {
           <TabButton title="Overview" active={activeTab === 'overview'} onClick={() => setActiveTab('overview')} />
           <TabButton title="Registry Stream" active={activeTab === 'registry'} onClick={() => setActiveTab('registry')} />
           <TabButton title="Topic Monitor" active={activeTab === 'topics'} onClick={() => setActiveTab('topics')} />
+          <TabButton title="Config Console" active={activeTab === 'config'} onClick={() => setActiveTab('config')} />
         </div>
 
         {error ? (
@@ -506,6 +679,238 @@ function App() {
           </Panel>
         </section>
       ) : null}
+
+      {activeTab === 'config' ? (
+        <section className="grid grid-cols-1 gap-4">
+          <Panel title="Configuration Console">
+            <div className="mb-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void refreshConfig()}
+                className="rounded-lg bg-ink px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-white"
+                disabled={configLoading}
+              >
+                {configLoading ? 'Loading...' : 'Reload Config'}
+              </button>
+              <p className="rounded-lg border border-ink/15 bg-paper px-3 py-2 font-mono text-[11px] uppercase tracking-[0.1em] text-ink/70">
+                Root: {configSnapshot?.rootPath ?? '-'}
+              </p>
+            </div>
+            <p className="text-sm text-ink/80">
+              Edit component configuration in TOML and save each component independently.
+            </p>
+            {configError ? (
+              <p className="mt-3 rounded-lg border border-signal/40 bg-signal/10 p-3 font-mono text-xs text-signal">
+                {configError}
+              </p>
+            ) : null}
+          </Panel>
+
+          {configGroups.map(([group, components]) => (
+            <Panel key={group} title={`Component Group: ${group}`}>
+              <div className="space-y-4">
+                {components.map((component) => {
+                  const draft = configDrafts[component.id] ?? component.content
+                  const dirty = draft !== component.content
+                  const saving = configSavingComponentId === component.id
+                  const loadingBackups = configBackupLoadingComponentId === component.id
+                  const rollingBack = configRollbackComponentId === component.id
+                  const backupsVisible = visibleBackups[component.id] ?? false
+                  const diffVisible = visibleDiffs[component.id] ?? false
+                  const backups = configBackupsByComponent[component.id] ?? []
+                  const diff = dirty ? buildLineDiff(component.content, draft) : []
+                  const restartableServiceIds = Array.from(
+                    new Set(
+                      component.restartHints
+                        .map((hint) => hint.serviceId)
+                        .filter((value): value is string => typeof value === 'string' && value.length > 0),
+                    ),
+                  )
+                  const restartBusy = restartableServiceIds.some((serviceId) =>
+                    configRestartingServiceIds.includes(serviceId),
+                  )
+                  return (
+                    <article key={component.id} className="rounded-2xl border border-ink/15 bg-paper/70 p-4">
+                      <div className="mb-2 flex flex-wrap items-start justify-between gap-2">
+                        <div>
+                          <p className="font-heading text-lg text-ink">{component.name}</p>
+                          <p className="text-xs text-ink/75">{component.description}</p>
+                        </div>
+                        <span
+                          className={`rounded-full border px-3 py-1 font-mono text-[11px] uppercase tracking-[0.11em] ${
+                            dirty
+                              ? 'border-signal/40 bg-signal/10 text-signal'
+                              : 'border-leaf/40 bg-leaf/10 text-leaf'
+                          }`}
+                        >
+                          {dirty ? 'Unsaved' : 'Saved'}
+                        </span>
+                      </div>
+
+                      <p className="font-mono text-[11px] uppercase tracking-[0.1em] text-ink/60">
+                        {component.filePath}
+                      </p>
+                      <p className="mt-1 font-mono text-[11px] uppercase tracking-[0.1em] text-ink/55">
+                        {component.exists ? 'existing file' : 'new file'} • last modified{' '}
+                        {formatTimestamp(component.updatedAtMs)}
+                      </p>
+
+                      {component.sections.length > 0 ? (
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {component.sections.map((section) => (
+                            <span
+                              key={`${component.id}-${section.key}`}
+                              className="rounded border border-ink/15 bg-white px-2 py-1 font-mono text-[10px] uppercase tracking-[0.1em] text-ink/70"
+                              title={section.summary}
+                            >
+                              {section.key} ({section.kind})
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      {component.parseError ? (
+                        <p className="mt-2 rounded-lg border border-signal/40 bg-signal/10 p-2 font-mono text-xs text-signal">
+                          Parse warning: {component.parseError}
+                        </p>
+                      ) : null}
+
+                      {component.restartHints.length > 0 ? (
+                        <div className="mt-2 space-y-1 rounded-lg border border-amber-400/40 bg-amber-50 p-2">
+                          <p className="font-mono text-[11px] uppercase tracking-[0.1em] text-amber-700">
+                            Restart Recommendations
+                          </p>
+                          {component.restartHints.map((hint) => (
+                            <div key={`${component.id}-${hint.service}`} className="text-xs text-amber-800">
+                              <p>{hint.service}: {hint.reason}</p>
+                              {hint.command ? (
+                                <p className="mt-1 rounded bg-white/80 px-2 py-1 font-mono text-[11px] text-amber-900">
+                                  {hint.command}
+                                </p>
+                              ) : null}
+                              {hint.serviceId ? (
+                                <button
+                                  type="button"
+                                  onClick={() => void runSuggestedRestarts([hint])}
+                                  className="mt-1 rounded border border-amber-500/40 bg-white px-2 py-1 font-mono text-[10px] uppercase tracking-[0.1em] text-amber-800"
+                                  disabled={configRestartingServiceIds.includes(hint.serviceId)}
+                                >
+                                  {configRestartingServiceIds.includes(hint.serviceId) ? 'Restarting...' : 'Restart Now'}
+                                </button>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      <textarea
+                        value={draft}
+                        onChange={(event) => updateConfigDraft(component.id, event.target.value)}
+                        className="mt-3 h-80 w-full rounded-lg border border-ink/20 bg-white px-3 py-2 font-mono text-xs text-ink"
+                        placeholder={'[component]\nkey = "value"'}
+                        spellCheck={false}
+                      />
+
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => toggleDiffVisibility(component.id)}
+                          className="rounded-lg border border-ink/20 px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-ink"
+                          disabled={!dirty}
+                        >
+                          {diffVisible ? 'Hide Diff' : 'View Diff'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => toggleBackupsVisibility(component.id)}
+                          className="rounded-lg border border-ink/20 px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-ink"
+                          disabled={loadingBackups}
+                        >
+                          {loadingBackups ? 'Loading...' : backupsVisible ? 'Hide Backups' : 'Backups'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => resetConfigDraft(component)}
+                          className="rounded-lg border border-ink/20 px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-ink"
+                          disabled={saving || rollingBack || !dirty}
+                        >
+                          Reset
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void saveConfigDraft(component)}
+                          className="rounded-lg bg-leaf px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-white"
+                          disabled={saving || rollingBack || !dirty || !component.editable}
+                        >
+                          {saving ? 'Applying...' : 'Apply Changes'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void runSuggestedRestarts(component.restartHints)}
+                          className="rounded-lg bg-amber-500 px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-white"
+                          disabled={restartBusy || restartableServiceIds.length === 0}
+                        >
+                          {restartBusy ? 'Restarting...' : 'Restart Suggested'}
+                        </button>
+                      </div>
+
+                      {diffVisible && dirty ? (
+                        <div className="mt-3 rounded-lg border border-ink/15 bg-white p-2">
+                          <p className="mb-2 font-mono text-[11px] uppercase tracking-[0.1em] text-ink/70">Diff Preview</p>
+                          <div className="max-h-56 overflow-auto rounded border border-ink/10 bg-ink/5 p-2 font-mono text-[11px]">
+                            {diff.map((line, index) => (
+                              <p
+                                key={`${component.id}-diff-${index}`}
+                                className={
+                                  line.kind === 'add'
+                                    ? 'bg-leaf/15 text-leaf'
+                                    : line.kind === 'remove'
+                                      ? 'bg-signal/15 text-signal'
+                                      : 'text-ink/75'
+                                }
+                              >
+                                {line.kind === 'add' ? '+' : line.kind === 'remove' ? '-' : ' '} {line.text}
+                              </p>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {backupsVisible ? (
+                        <div className="mt-3 rounded-lg border border-ink/15 bg-white p-2">
+                          <p className="mb-2 font-mono text-[11px] uppercase tracking-[0.1em] text-ink/70">Backups</p>
+                          {backups.length === 0 ? (
+                            <p className="text-xs text-ink/70">No backups found for this component yet.</p>
+                          ) : (
+                            <div className="space-y-2">
+                              {backups.map((backup) => (
+                                <div key={backup.backupPath} className="rounded border border-ink/10 bg-paper p-2">
+                                  <p className="font-mono text-[11px] text-ink/75">{backup.backupPath}</p>
+                                  <p className="mt-1 text-xs text-ink/70">
+                                    {formatTimestamp(backup.createdAtMs)} • {formatBytes(backup.sizeBytes)}
+                                  </p>
+                                  <button
+                                    type="button"
+                                    onClick={() => void rollbackToBackup(component, backup.backupPath)}
+                                    className="mt-2 rounded border border-signal/40 bg-white px-2 py-1 font-mono text-[10px] uppercase tracking-[0.1em] text-signal"
+                                    disabled={rollingBack || saving}
+                                  >
+                                    {rollingBack ? 'Rolling Back...' : 'Rollback to This Backup'}
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ) : null}
+                    </article>
+                  )
+                })}
+              </div>
+            </Panel>
+          ))}
+        </section>
+      ) : null}
     </main>
   )
 }
@@ -609,6 +1014,83 @@ function MessageCard({ message }: { message: StoredMessageView }) {
       <p className="mt-2 text-xs text-ink/70">{message.timestamp}</p>
     </article>
   )
+}
+
+function formatTimestamp(value: number | null): string {
+  if (!value) {
+    return '-'
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return '-'
+  }
+  return date.toLocaleString()
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return '0 B'
+  }
+  if (value < 1024) {
+    return `${value} B`
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KiB`
+  }
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`
+}
+
+type DiffLine = {
+  kind: 'context' | 'add' | 'remove'
+  text: string
+}
+
+function buildLineDiff(previousContent: string, nextContent: string): DiffLine[] {
+  const before = previousContent.split('\n')
+  const after = nextContent.split('\n')
+
+  const rows = before.length + 1
+  const cols = after.length + 1
+  const dp = Array.from({ length: rows }, () => Array<number>(cols).fill(0))
+
+  for (let i = before.length - 1; i >= 0; i -= 1) {
+    for (let j = after.length - 1; j >= 0; j -= 1) {
+      if (before[i] === after[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1])
+      }
+    }
+  }
+
+  const output: DiffLine[] = []
+  let i = 0
+  let j = 0
+  while (i < before.length && j < after.length) {
+    if (before[i] === after[j]) {
+      output.push({ kind: 'context', text: before[i] })
+      i += 1
+      j += 1
+      continue
+    }
+    if (dp[i + 1][j] >= dp[i][j + 1]) {
+      output.push({ kind: 'remove', text: before[i] })
+      i += 1
+    } else {
+      output.push({ kind: 'add', text: after[j] })
+      j += 1
+    }
+  }
+  while (i < before.length) {
+    output.push({ kind: 'remove', text: before[i] })
+    i += 1
+  }
+  while (j < after.length) {
+    output.push({ kind: 'add', text: after[j] })
+    j += 1
+  }
+
+  return output
 }
 
 export default App

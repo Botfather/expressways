@@ -1,11 +1,22 @@
 import { create } from 'zustand'
 import {
   consumeTopic,
+  fetchConfigSnapshot,
   fetchSnapshot,
+  listConfigBackups as listConfigBackupsApi,
+  restartConfigServices as restartConfigServicesApi,
+  rollbackConfigComponent as rollbackConfigComponentApi,
   startRegistryStream,
   stopRegistryStream,
+  updateConfigComponent as updateConfigComponentApi,
 } from '../api'
 import type {
+  ConfigBackupEntry,
+  ConfigBackupsResult,
+  ConfigComponentRollbackResult,
+  ConfigComponentUpdateResult,
+  ConfigConsoleSnapshot,
+  ConfigRestartServicesResult,
   ConsoleSettings,
   MetricHistoryPoint,
   MonitorSnapshot,
@@ -31,6 +42,14 @@ interface MonitorState {
   topicMessages: StoredMessageView[]
   topicNextOffset: number
   topicLoading: boolean
+  configSnapshot: ConfigConsoleSnapshot | null
+  configLoading: boolean
+  configError: string | null
+  configSavingComponentId: string | null
+  configBackupLoadingComponentId: string | null
+  configRollbackComponentId: string | null
+  configRestartingServiceIds: string[]
+  configBackupsByComponent: Record<string, ConfigBackupEntry[]>
   setDraftSettings: (patch: Partial<ConsoleSettings>) => void
   saveSettings: () => void
   setAutoRefresh: (enabled: boolean) => void
@@ -40,6 +59,17 @@ interface MonitorState {
   applyStreamEvent: (payload: RegistryStreamEventPayload) => void
   clearRegistryEvents: () => void
   consumeTopic: (topic: string, offset: number, limit: number) => Promise<void>
+  refreshConfig: () => Promise<void>
+  saveConfigComponent: (
+    componentId: string,
+    content: string,
+  ) => Promise<ConfigComponentUpdateResult | null>
+  loadConfigBackups: (componentId: string) => Promise<ConfigBackupsResult | null>
+  rollbackConfigComponent: (
+    componentId: string,
+    backupPath: string,
+  ) => Promise<ConfigComponentRollbackResult | null>
+  restartConfigServices: (serviceIds: string[]) => Promise<ConfigRestartServicesResult | null>
   refresh: () => Promise<boolean>
 }
 
@@ -100,6 +130,14 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
   topicMessages: [],
   topicNextOffset: 0,
   topicLoading: false,
+  configSnapshot: null,
+  configLoading: false,
+  configError: null,
+  configSavingComponentId: null,
+  configBackupLoadingComponentId: null,
+  configRollbackComponentId: null,
+  configRestartingServiceIds: [],
+  configBackupsByComponent: {},
 
   setDraftSettings: (patch) => {
     set((state) => ({
@@ -184,6 +222,128 @@ export const useMonitorStore = create<MonitorState>((set, get) => ({
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
       set({ loading: false, topicLoading: false, error: detail })
+    }
+  },
+
+  refreshConfig: async () => {
+    set({ configLoading: true, configError: null })
+    try {
+      const configSnapshot = await fetchConfigSnapshot()
+      set({ configSnapshot, configLoading: false })
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      set({ configLoading: false, configError: detail })
+    }
+  },
+
+  saveConfigComponent: async (componentId, content) => {
+    set({ configSavingComponentId: componentId, configError: null })
+    try {
+      const result = await updateConfigComponentApi(componentId, content)
+      set((state) => {
+        if (!state.configSnapshot) {
+          return {
+            configSavingComponentId: null,
+            configSnapshot: {
+              rootPath: '',
+              components: [result.component],
+            },
+          }
+        }
+
+        const nextComponents = state.configSnapshot.components.map((component) =>
+          component.id === result.component.id ? result.component : component,
+        )
+        const hasComponent = nextComponents.some((component) => component.id === result.component.id)
+        const components = hasComponent ? nextComponents : [...nextComponents, result.component]
+        return {
+          configSavingComponentId: null,
+          configSnapshot: {
+            ...state.configSnapshot,
+            components,
+          },
+        }
+      })
+      return result
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      set({ configSavingComponentId: null, configError: detail })
+      return null
+    }
+  },
+
+  loadConfigBackups: async (componentId) => {
+    set({ configBackupLoadingComponentId: componentId, configError: null })
+    try {
+      const result = await listConfigBackupsApi(componentId, 100)
+      set((state) => ({
+        configBackupLoadingComponentId: null,
+        configBackupsByComponent: {
+          ...state.configBackupsByComponent,
+          [componentId]: result.backups,
+        },
+      }))
+      return result
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      set({ configBackupLoadingComponentId: null, configError: detail })
+      return null
+    }
+  },
+
+  rollbackConfigComponent: async (componentId, backupPath) => {
+    set({ configRollbackComponentId: componentId, configError: null })
+    try {
+      const result = await rollbackConfigComponentApi(componentId, backupPath)
+      set((state) => {
+        const snapshot = state.configSnapshot
+        if (!snapshot) {
+          return {
+            configRollbackComponentId: null,
+            configSnapshot: {
+              rootPath: '',
+              components: [result.component],
+            },
+          }
+        }
+
+        const updatedComponents = snapshot.components.map((component) =>
+          component.id === result.component.id ? result.component : component,
+        )
+        return {
+          configRollbackComponentId: null,
+          configSnapshot: {
+            ...snapshot,
+            components: updatedComponents,
+          },
+        }
+      })
+      return result
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      set({ configRollbackComponentId: null, configError: detail })
+      return null
+    }
+  },
+
+  restartConfigServices: async (serviceIds) => {
+    const normalized = Array.from(new Set(serviceIds.map((serviceId) => serviceId.trim()).filter(Boolean)))
+    if (normalized.length === 0) {
+      return {
+        restartedAtMs: Date.now(),
+        outcomes: [],
+      }
+    }
+
+    set({ configRestartingServiceIds: normalized, configError: null })
+    try {
+      const result = await restartConfigServicesApi(normalized)
+      set({ configRestartingServiceIds: [] })
+      return result
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      set({ configRestartingServiceIds: [], configError: detail })
+      return null
     }
   },
 

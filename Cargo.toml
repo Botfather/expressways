@@ -10,6 +10,7 @@ members = [
   "crates/expressways-bench",
   "crates/expressways-client",
   "crates/expressways-interop-bridge-example",
+  "crates/expressways-nanobot-system",
   "crates/expressways-orchestrator",
   "crates/expressways-policy",
   "crates/expressways-protocol",

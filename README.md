@@ -10,7 +10,7 @@ The project is built around a simple idea:
 
 That means every meaningful operation should be authenticated, authorized, quota-aware, auditable, observable, and recoverable. Expressways starts there and only adds complexity when the simpler system is already trustworthy.
 
-The original long-range concept lives in [docs/main.md](docs/main.md). The implemented system is intentionally smaller, sharper, and more honest. The current scope is described in [docs/design/phase-1-system-design.md](docs/design/phase-1-system-design.md), [docs/design/security-compliance-baseline.md](docs/design/security-compliance-baseline.md), [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md), and [docs/adr/0001-phase-1-scope.md](docs/adr/0001-phase-1-scope.md).
+The original long-range concept lives in [docs/main.md](docs/main.md). The implemented system is intentionally smaller, sharper, and more honest. The current scope is described in [docs/design/phase-1-system-design.md](docs/design/phase-1-system-design.md), [docs/design/security-compliance-baseline.md](docs/design/security-compliance-baseline.md), [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md), [docs/design/nanobot-parity-on-expressways.md](docs/design/nanobot-parity-on-expressways.md), and [docs/adr/0001-phase-1-scope.md](docs/adr/0001-phase-1-scope.md).
 
 ## Table of Contents
 
@@ -27,6 +27,7 @@ The original long-range concept lives in [docs/main.md](docs/main.md). The imple
 - [Workspace Layout](#workspace-layout)
 - [Quick Start](#quick-start)
 - [Guided Examples](#guided-examples)
+- [Nanobot Parity Deployment](#nanobot-parity-deployment)
 - [Interop Deployment](#interop-deployment)
 - [Raw Protocol Examples](#raw-protocol-examples)
 - [Configuration Guide](#configuration-guide)
@@ -558,6 +559,7 @@ That means if you build with a subset of adopter features, you should update `ad
 - `crates/expressways-orchestrator`: task-driven supervisor and lifecycle tooling built on top of the broker.
 - `crates/expressways-bench`: benchmark harness for transport, storage, and watch paths.
 - `crates/expressways-interop-bridge-example`: webhook ingress bridge that normalizes OpenClaw or ZeroClaw messages into `TaskWorkItem` records.
+- `crates/expressways-nanobot-system`: Nanobot-style runtime kit with bootstrap, runtime loop, tool registry, session/memory persistence, cron, and outbound tailing.
 
 ### Adopter crates
 
@@ -582,6 +584,7 @@ Start with:
 - [docs/design/phase-1-system-design.md](docs/design/phase-1-system-design.md)
 - [docs/design/security-compliance-baseline.md](docs/design/security-compliance-baseline.md)
 - [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md)
+- [docs/design/nanobot-parity-on-expressways.md](docs/design/nanobot-parity-on-expressways.md)
 - [docs/adr/0001-phase-1-scope.md](docs/adr/0001-phase-1-scope.md)
 
 ### 2. Generate a development keypair
@@ -752,6 +755,118 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 ```
 
 This example agent consumes `inspect_blob` tasks and uses the new `AssignedTask` payload helpers to inspect broker-managed artifact refs, file references, inline bytes, or text payloads without custom base64 plumbing in the handler. It writes JSON artifacts to `./var/agent/blob-results/<task-id>.blob.json` with payload kind, content type, byte length, a short hex preview, UTF-8 preview when available, and source metadata such as artifact id, declared size, or SHA-256.
+
+## Nanobot Parity Deployment
+
+Use `expressways-nanobot-system` when you want Nanobot-style session/tool runtime behavior on top of Expressways governance controls.
+
+Provision topics and generate config snippets:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 create-system --token-file ./var/auth/developer.token --topic-prefix nanobot --output-dir ./var/agent/nanobot-system
+```
+
+Run the runtime:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --ensure-topics true --workspace-root /Users/tusharmohan/Documents/@labs/expressways --allow-exec-program git --allow-exec-program ls
+```
+
+Run the runtime with native OpenAI provider:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-api-key sk-1234 --provider-max-attempts 3 --provider-base-backoff-ms 200 --provider-max-backoff-ms 2000 --provider-jitter-ms 75 --provider-circuit-failure-threshold 3 --provider-circuit-cooldown-seconds 30 --workspace-root /Users/tusharmohan/Documents/@labs/expressways --allow-exec-program git --allow-exec-program ls
+```
+
+Enable provider text streaming into `nanobot.outbound.stream` (OpenAI or Anthropic):
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-api-key sk-1234 --provider-streaming true
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider anthropic --provider-model claude-3-5-sonnet-latest --provider-api-key sk-ant-1234 --provider-streaming true
+```
+
+Run the runtime with native Anthropic provider:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider anthropic --provider-model claude-3-5-sonnet-latest --provider-api-key sk-ant-1234 --workspace-root /Users/tusharmohan/Documents/@labs/expressways --allow-exec-program git --allow-exec-program ls
+```
+
+`--provider-api-key` falls back to `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for matching providers.
+`--provider-max-attempts`, `--provider-base-backoff-ms`, `--provider-max-backoff-ms`, and `--provider-jitter-ms` tune retry behavior.
+
+Enable OpenAI primary with Anthropic failover:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-api-key sk-1234 --provider-failover --fallback-provider-model claude-3-5-sonnet-latest --fallback-provider-api-key sk-ant-1234
+```
+
+Provider failures are returned to the user as a sanitized fallback response while detailed diagnostics are emitted to the runtime events topic.
+
+Provider event runbook:
+
+- `provider_error`: provider call failed; includes provider/model/base, attempts, elapsed, and error.
+- `provider_retry_recovered`: a provider call succeeded after internal retry.
+- `provider_circuit_open`: failure threshold reached; provider paused for cooldown.
+- `provider_circuit_blocked`: request skipped because the circuit is still cooling down.
+- `provider_circuit_closed`: first successful probe after cooldown closed the circuit.
+- `provider_failover_attempt`: primary failed and fallback provider was attempted.
+- `provider_failover_succeeded`: fallback provider produced a usable step.
+- `provider_failover_failed`: both primary and fallback providers failed.
+
+Summarize provider events for operators:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 summarize-provider-events --token-file ./var/auth/developer.token --runtime-events-topic nanobot.runtime.events --offset 0 --limit 200
+```
+
+Filter provider event summary to one session:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 summarize-provider-events --token-file ./var/auth/developer.token --runtime-events-topic nanobot.runtime.events --session-id chat-1 --offset 0 --limit 200
+```
+
+End-to-end smoke script for forced failover (broken primary base URL, working fallback):
+
+```bash
+ANTHROPIC_API_KEY=... ./scripts/nanobot-provider-failover-smoke.sh
+```
+
+End-to-end smoke script for streaming chunk + final response verification:
+
+```bash
+OPENAI_API_KEY=... ./scripts/nanobot-streaming-smoke.sh
+ANTHROPIC_API_KEY=... PROVIDER=anthropic ./scripts/nanobot-streaming-smoke.sh
+```
+
+Ingest and tail:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 ingest --token-file ./var/auth/developer.token --session-id chat-1 --channel local --account-id acct-local --sender-id user-1 --text "hello from nanobot parity runtime"
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 tail-outbound --token-file ./var/auth/developer.token --follow
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 consume --token-file ./var/auth/developer.token --topic nanobot.outbound.stream --offset 0 --limit 200
+```
+
+Schedule recurring triggers:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-cron --token-file ./var/auth/developer.token --text "daily heartbeat prompt" --interval-seconds 300
+```
+
+Architecture parity details and tradeoff analysis:
+
+- [docs/design/nanobot-parity-on-expressways.md](docs/design/nanobot-parity-on-expressways.md)
+
+## Expressways Console
+
+Use the Tauri console for broker monitoring plus full-stack config editing grouped by component.
+
+```bash
+cd apps/expressways-console
+pnpm install
+pnpm dev:tauri
+```
+
+The `Config Console` tab shows discovered TOML components (broker + Nanobot system files), current section summaries, and per-component apply flow with validation, diff preview, backup snapshotting, rollback controls, and one-click restart orchestration for supported services.
 
 ### Example: Benchmark the broker
 
@@ -987,7 +1102,7 @@ Controls:
 - trusted issuers,
 - principal definitions.
 
-The sample config includes bridge principals (`local:bridge-openclaw`, `local:bridge-zeroclaw`, and `local:bridge-egress`) so OpenClaw and ZeroClaw adapters can run with least-privilege service identities.
+The sample config includes bridge principals (`local:bridge-openclaw`, `local:bridge-zeroclaw`, `local:bridge-egress`, and `local:nanobot-bridge`) plus a dedicated runtime principal (`local:nanobot-runtime`) so OpenClaw, ZeroClaw, and Nanobot-style adapters can run with least-privilege service identities.
 
 ### `[quotas]`
 
