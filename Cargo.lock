@@ -1181,7 +1181,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "expressways-interop-bridge-example"
+name = "expressways-interop-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1190,6 +1190,7 @@ dependencies = [
  "clap",
  "expressways-client",
  "expressways-protocol",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",

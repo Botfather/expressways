@@ -3978,6 +3978,8 @@ mod tests {
                 principal: None,
                 preferred_agents: Vec::new(),
                 avoid_agents: Vec::new(),
+                required_agent: None,
+                affinity_key: None,
             },
             payload: TaskPayload::json(json!({
                 "path": path,

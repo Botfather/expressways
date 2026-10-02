@@ -2451,6 +2451,8 @@ mod tests {
                 principal: None,
                 preferred_agents: Vec::new(),
                 avoid_agents: Vec::new(),
+                required_agent: None,
+                affinity_key: None,
             },
             payload: TaskPayload::json(serde_json::json!({ "path": "notes.md" })),
             retry_policy: Default::default(),

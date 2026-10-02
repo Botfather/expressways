@@ -587,7 +587,7 @@ That means if you build with a subset of adopter features, you should update `ad
 
 - `crates/expressways-orchestrator`: task-driven supervisor and lifecycle tooling built on top of the broker.
 - `crates/expressways-bench`: benchmark harness for transport, storage, and watch paths.
-- `crates/expressways-interop-bridge-example`: webhook ingress bridge that normalizes OpenClaw or ZeroClaw messages into `TaskWorkItem` records.
+- `expressways-interop-bridge`: supported, versioned two-way channel bridge with artifact upload, affinity routing, and durable reply delivery.
 - `crates/expressways-nanobot-system`: Nanobot-style runtime kit with bootstrap, runtime loop, tool registry, session/memory persistence, cron, and outbound tailing.
 
 ### Adopter crates
@@ -1056,7 +1056,7 @@ Full interop contract:
 Issue bridge tokens:
 
 ```bash
-cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-openclaw --audience expressways --scope system:broker:health --scope 'topic:interop.chat.requests:admin,publish' --scope 'artifact:*:publish,consume' --output ./var/auth/bridge-openclaw.token
+cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-openclaw --audience expressways --scope system:broker:health --scope 'topic:interop.chat.requests:admin,publish' --scope 'topic:interop.chat.replies:admin,consume' --scope 'artifact:*:publish,consume' --output ./var/auth/bridge-openclaw.token
 cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-zeroclaw --audience expressways --scope system:broker:health --scope 'topic:interop.chat*:admin,publish,consume' --scope 'artifact:*:publish,consume' --output ./var/auth/bridge-zeroclaw.token
 cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-egress --audience expressways --scope system:broker:health --scope 'topic:interop.chat.replies:admin,consume' --scope 'artifact:*:consume' --output ./var/auth/bridge-egress.token
 ```
@@ -1064,10 +1064,10 @@ cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev
 Run the webhook ingress bridge:
 
 ```bash
-cargo run -p expressways-interop-bridge-example -- --transport tcp --address 127.0.0.1:7766 --listen 127.0.0.1:8891 --token-file ./var/auth/bridge-openclaw.token --ingress-bearer-file ./var/auth/bridge-ingress.secret --tasks-topic interop.chat.requests --task-type interop.chat.handoff --default-skill chat.reply
+cargo run -p expressways-interop-bridge -- --transport tcp --address 127.0.0.1:7766 --listen 127.0.0.1:8891 --token-file ./var/auth/bridge-openclaw.token --ingress-bearer-file ./var/auth/bridge-ingress.secret --egress-url https://pigeon.example/v1/expressways/replies --egress-bearer-file ./var/auth/pigeon-egress.token --state-path ./var/agent/interop-bridge-state.json --tasks-topic interop.chat.requests --task-type interop.chat.handoff --default-skill chat.reply
 ```
 
-Non-loopback bridge listeners require an ingress bearer. Prefer `--ingress-bearer-file` so the secret is not exposed in the bridge process arguments. Requests default to a 1 MiB limit (hard ceiling 16 MiB), a 10-second deadline, and 64 concurrent connections; deadlines are constrained to 100 ms through five minutes, connection counts cannot exceed the runtime semaphore ceiling, and oversized or overflowing `Content-Length` values fail before allocation. The request reader caps headers at 64 KiB and grows body storage only as bytes arrive instead of reserving the full request ceiling for every idle socket. Webhook records reject unknown fields and bound identifiers, metadata, attachments, routing labels, agent hints, retry counts, and task durations before any broker calls; duplicate or contradictory agent hints and mismatched inline attachment hashes or lengths are rejected. Use `--max-request-bytes`, `--request-timeout-ms`, and `--max-connections` only when the integration requires different bounded values. The orchestrator dashboard applies the same deadline and connection-count bounds.
+Non-loopback bridge listeners require an ingress bearer. Prefer secret files so credentials are not exposed in process arguments. JSON webhooks default to 1 MiB, while the separate raw artifact endpoint accepts up to 64 MiB without base64 inflation. The request reader caps headers at 64 KiB, rejects overflowing lengths, and grows storage only as bytes arrive. Versioned webhook records accept additive unknown fields while continuing to bound and validate known identifiers, metadata, attachments, routing, retry policy, and integrity claims. Durable egress persists its reply cursor and advances it only after a 2xx acknowledgement. See the [supported chat interoperability contract](docs/design/openclaw-zeroclaw-interop.md) for idempotency, affinity ordering, media upload, and reply semantics.
 
 Submit a sample OpenClaw-style handoff:
 
@@ -1077,13 +1077,15 @@ curl -X POST http://127.0.0.1:8891/v1/webhook/handoff \
   -H 'Content-Type: application/json' \
   -d '{
     "schema_version": "interop.chat.handoff.v1",
+    "idempotency_key": "openclaw-whatsapp-message-1001",
     "source_runtime": "openclaw",
     "target_runtime": "zeroclaw",
     "session": {
       "session_id": "chat-42",
       "channel": "whatsapp",
       "account_id": "acct-main",
-      "sender_id": "user-1001"
+      "sender_id": "user-1001",
+      "message_id": "message-1001"
     },
     "message": {
       "text": "Summarize this build failure and suggest a fix."

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://expressways.local/schemas/interop-chat-reply-v1.schema.json",
+  "title": "Expressways Interop Chat Reply v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "delivery_id",
+    "correlation_id",
+    "source_runtime",
+    "target_runtime",
+    "session",
+    "in_reply_to_task_id",
+    "message",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "interop.chat.reply.v1" },
+    "delivery_id": { "type": "string", "minLength": 1 },
+    "correlation_id": { "type": "string", "minLength": 1 },
+    "source_runtime": { "type": "string", "minLength": 1 },
+    "target_runtime": { "type": "string", "minLength": 1 },
+    "in_reply_to_task_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "metadata": { "type": "object", "additionalProperties": true },
+    "session": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["session_id", "channel", "account_id", "sender_id"],
+      "properties": {
+        "session_id": { "type": "string", "minLength": 1 },
+        "channel": { "type": "string", "minLength": 1 },
+        "account_id": { "type": "string", "minLength": 1 },
+        "sender_id": { "type": "string", "minLength": 1 },
+        "sender_display_name": { "type": "string" },
+        "message_id": { "type": "string" },
+        "reply_to_message_id": { "type": "string" }
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "text": { "type": "string" },
+        "attachments": {
+          "type": "array",
+          "items": { "$ref": "interop-chat-handoff-v1.schema.json#/$defs/attachment_ref" }
+        }
+      }
+    }
+  }
+}

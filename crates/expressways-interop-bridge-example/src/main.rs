@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,9 +12,13 @@ use clap::{Args, Parser, ValueEnum};
 use expressways_client::{Client, Endpoint};
 use expressways_protocol::{
     Classification, ControlCommand, ControlRequest, ControlResponse,
-    INTEROP_CHAT_HANDOFF_TASK_TYPE, INTEROP_CHAT_REQUESTS_TOPIC, RetentionClass, TaskPayload,
-    TaskRequirements, TaskRetryPolicy, TaskWorkItem, TopicSpec,
+    INTEROP_CHAT_HANDOFF_SCHEMA_VERSION, INTEROP_CHAT_HANDOFF_TASK_TYPE,
+    INTEROP_CHAT_REPLIES_TOPIC, INTEROP_CHAT_REPLY_SCHEMA_VERSION, INTEROP_CHAT_REQUESTS_TOPIC,
+    InteropChatReplyV1, RetentionClass, TaskPayload, TaskRequirements, TaskRetryPolicy,
+    TaskWorkItem, TopicSpec,
 };
+#[cfg(test)]
+use expressways_protocol::{InteropChatMessage, InteropChatSession};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,7 +28,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const WEBHOOK_SCHEMA_VERSION: &str = "interop.chat.handoff.v1";
+const BRIDGE_STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 1_048_576;
 const MAX_REQUEST_BYTES_LIMIT: usize = 16 * 1_048_576;
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -55,8 +61,12 @@ struct Cli {
     listen: String,
     #[arg(long, default_value = "/v1/webhook/handoff")]
     webhook_path: String,
+    #[arg(long, default_value = "/v1/artifacts")]
+    artifact_path: String,
     #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BYTES)]
     max_request_bytes: usize,
+    #[arg(long, default_value_t = MAX_ARTIFACT_BYTES)]
+    max_artifact_request_bytes: u64,
     #[arg(long)]
     ingress_bearer: Option<String>,
     #[arg(long, conflicts_with = "ingress_bearer")]
@@ -83,6 +93,20 @@ struct Cli {
     default_timeout_seconds: u64,
     #[arg(long, default_value_t = 5)]
     default_retry_delay_seconds: u64,
+    #[arg(long)]
+    egress_url: Option<String>,
+    #[arg(long, conflicts_with = "egress_bearer_file")]
+    egress_bearer: Option<String>,
+    #[arg(long)]
+    egress_bearer_file: Option<PathBuf>,
+    #[arg(long, default_value = INTEROP_CHAT_REPLIES_TOPIC)]
+    replies_topic: String,
+    #[arg(long, default_value = "./var/agent/interop-bridge-state.json")]
+    state_path: PathBuf,
+    #[arg(long, default_value_t = 1_000)]
+    egress_poll_interval_ms: u64,
+    #[arg(long, default_value_t = 100)]
+    egress_batch_size: usize,
     #[command(flatten)]
     token: TokenArgs,
 }
@@ -107,7 +131,9 @@ struct BridgeRuntime {
     capability_token: String,
     listen: String,
     webhook_path: String,
+    artifact_path: String,
     max_request_bytes: usize,
+    max_artifact_request_bytes: usize,
     ingress_bearer: Option<String>,
     max_connections: usize,
     request_timeout: Duration,
@@ -120,13 +146,21 @@ struct BridgeRuntime {
     default_max_attempts: u32,
     default_timeout_seconds: u64,
     default_retry_delay_seconds: u64,
+    egress_url: Option<String>,
+    egress_bearer: Option<String>,
+    replies_topic: String,
+    state_path: PathBuf,
+    egress_poll_interval: Duration,
+    egress_batch_size: usize,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BridgeWebhookRequest {
+    schema_version: String,
     #[serde(default)]
-    schema_version: Option<String>,
+    correlation_id: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
     source_runtime: String,
     #[serde(default)]
     target_runtime: Option<String>,
@@ -167,7 +201,6 @@ struct BridgeWebhookRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct IncomingSession {
     session_id: String,
     channel: String,
@@ -182,7 +215,6 @@ struct IncomingSession {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct IncomingMessage {
     #[serde(default)]
     text: Option<String>,
@@ -191,7 +223,6 @@ struct IncomingMessage {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct IncomingAttachment {
     #[serde(default)]
     name: Option<String>,
@@ -208,7 +239,6 @@ struct IncomingAttachment {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct IncomingRouting {
     #[serde(default)]
     agent_id: Option<String>,
@@ -218,11 +248,15 @@ struct IncomingRouting {
     skill_hint: Option<String>,
     #[serde(default)]
     labels: Vec<String>,
+    #[serde(default)]
+    affinity_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct HandoffPayload {
     schema_version: String,
+    correlation_id: String,
+    reply_topic: String,
     source_runtime: String,
     target_runtime: Option<String>,
     session: IncomingSession,
@@ -249,6 +283,8 @@ struct HandoffAttachmentRef {
 
 #[derive(Debug, Serialize)]
 struct AcceptedIngressResponse {
+    schema_version: String,
+    correlation_id: String,
     task_id: String,
     task_type: String,
     topic: String,
@@ -256,6 +292,22 @@ struct AcceptedIngressResponse {
     offset: u64,
     classification: Classification,
     uploaded_artifacts: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AcceptedArtifactResponse {
+    artifact_id: String,
+    content_type: String,
+    byte_length: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct BridgeState {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    replies_offset: u64,
 }
 
 #[derive(Debug)]
@@ -323,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(&cli.log_level)?;
     validate_server_limits(
         cli.max_request_bytes,
+        cli.max_artifact_request_bytes,
         cli.max_connections,
         cli.request_timeout_ms,
     )?;
@@ -332,12 +385,25 @@ async fn main() -> anyhow::Result<()> {
         cli.default_retry_delay_seconds,
     )?;
     let ingress_bearer = resolve_optional_secret(cli.ingress_bearer, cli.ingress_bearer_file)?;
+    let egress_bearer = resolve_optional_secret(cli.egress_bearer, cli.egress_bearer_file)?;
+    validate_egress_url(cli.egress_url.as_deref())?;
+    if cli.egress_url.is_some() {
+        load_bridge_state(&cli.state_path).with_context(|| {
+            format!(
+                "durable egress state is invalid at {}",
+                cli.state_path.display()
+            )
+        })?;
+    }
     let runtime = BridgeRuntime {
         endpoint: endpoint_from_cli(cli.transport, cli.address, cli.socket)?,
         capability_token: resolve_token(cli.token)?,
         listen: cli.listen,
         webhook_path: cli.webhook_path,
+        artifact_path: cli.artifact_path,
         max_request_bytes: cli.max_request_bytes,
+        max_artifact_request_bytes: usize::try_from(cli.max_artifact_request_bytes)
+            .context("max_artifact_request_bytes does not fit this platform")?,
         ingress_bearer,
         max_connections: cli.max_connections,
         request_timeout: Duration::from_millis(cli.request_timeout_ms),
@@ -350,6 +416,12 @@ async fn main() -> anyhow::Result<()> {
         default_max_attempts: cli.default_max_attempts,
         default_timeout_seconds: cli.default_timeout_seconds,
         default_retry_delay_seconds: cli.default_retry_delay_seconds,
+        egress_url: cli.egress_url,
+        egress_bearer,
+        replies_topic: cli.replies_topic,
+        state_path: cli.state_path,
+        egress_poll_interval: Duration::from_millis(cli.egress_poll_interval_ms.max(10)),
+        egress_batch_size: cli.egress_batch_size.clamp(1, 1_000),
     };
 
     run_server(runtime).await
@@ -357,6 +429,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn validate_server_limits(
     max_request_bytes: usize,
+    max_artifact_request_bytes: u64,
     max_connections: usize,
     request_timeout_ms: u64,
 ) -> anyhow::Result<()> {
@@ -365,6 +438,9 @@ fn validate_server_limits(
             "max_request_bytes must be between 1024 and {}",
             MAX_REQUEST_BYTES_LIMIT
         );
+    }
+    if !(1024..=MAX_ARTIFACT_BYTES).contains(&max_artifact_request_bytes) {
+        bail!("max_artifact_request_bytes must be between 1024 and {MAX_ARTIFACT_BYTES}");
     }
     if !(1..=Semaphore::MAX_PERMITS).contains(&max_connections) {
         bail!(
@@ -378,6 +454,23 @@ fn validate_server_limits(
         );
     }
     Ok(())
+}
+
+fn validate_egress_url(value: Option<&str>) -> anyhow::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let url = reqwest::Url::parse(value).context("egress_url must be an absolute URL")?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = url
+        .host_str()
+        .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"));
+    if url.scheme() == "http" && loopback {
+        return Ok(());
+    }
+    bail!("egress_url must use HTTPS, except for loopback HTTP development endpoints")
 }
 
 fn validate_default_retry_policy(
@@ -409,6 +502,10 @@ async fn run_server(runtime: BridgeRuntime) -> anyhow::Result<()> {
         runtime.ingress_bearer.as_deref(),
     )?;
     let connection_limit = Arc::new(Semaphore::new(runtime.max_connections));
+    let egress_task = runtime
+        .egress_url
+        .as_ref()
+        .map(|_| tokio::spawn(run_egress(runtime.clone())));
     info!(
         listen = %runtime.listen,
         webhook_path = %runtime.webhook_path,
@@ -443,6 +540,9 @@ async fn run_server(runtime: BridgeRuntime) -> anyhow::Result<()> {
             }
             signal = tokio::signal::ctrl_c() => {
                 signal?;
+                if let Some(task) = &egress_task {
+                    task.abort();
+                }
                 info!("interop bridge shutting down");
                 return Ok(());
             }
@@ -461,7 +561,14 @@ async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     runtime: BridgeRuntime,
 ) -> anyhow::Result<()> {
-    let response = match read_http_request(stream, runtime.max_request_bytes).await {
+    let response = match read_http_request(
+        stream,
+        runtime.max_request_bytes,
+        &runtime.artifact_path,
+        runtime.max_artifact_request_bytes,
+    )
+    .await
+    {
         Ok(request) => match process_request(runtime, request).await {
             Ok(accepted) => json_response(202, &accepted),
             Err(error) => error_json_response(error.status_code, error.message),
@@ -478,30 +585,44 @@ async fn handle_connection(
 async fn process_request(
     runtime: BridgeRuntime,
     request: HttpRequest,
-) -> Result<AcceptedIngressResponse, HttpError> {
+) -> Result<serde_json::Value, HttpError> {
     if request.method != "POST" {
         return Err(HttpError::method_not_allowed(
             "only POST requests are supported for this endpoint",
         ));
     }
-    if request.path != runtime.webhook_path {
-        return Err(HttpError::not_found(format!(
-            "unsupported path `{}`",
-            request.path
-        )));
-    }
-
     if !bearer_authorized(&request.headers, runtime.ingress_bearer.as_deref()) {
         return Err(HttpError::unauthorized(
             "missing or invalid Authorization bearer token",
         ));
     }
 
-    let webhook =
-        serde_json::from_slice::<BridgeWebhookRequest>(&request.body).map_err(|error| {
-            HttpError::bad_request(format!("failed to parse webhook json: {error}"))
-        })?;
-    submit_webhook(runtime, webhook).await
+    if request.path == runtime.webhook_path {
+        if request.body.len() > runtime.max_request_bytes {
+            return Err(HttpError::bad_request(
+                "webhook request body exceeds configured limit",
+            ));
+        }
+        let webhook =
+            serde_json::from_slice::<BridgeWebhookRequest>(&request.body).map_err(|error| {
+                HttpError::bad_request(format!("failed to parse webhook json: {error}"))
+            })?;
+        return serde_json::to_value(submit_webhook(runtime, webhook).await?)
+            .map_err(|error| HttpError::upstream(format!("failed to encode response: {error}")));
+    }
+    if request.path == runtime.artifact_path {
+        if request.body.is_empty() || request.body.len() > runtime.max_artifact_request_bytes {
+            return Err(HttpError::bad_request(
+                "artifact body must be non-empty and within the configured artifact limit",
+            ));
+        }
+        return serde_json::to_value(upload_artifact(runtime, request).await?)
+            .map_err(|error| HttpError::upstream(format!("failed to encode response: {error}")));
+    }
+    Err(HttpError::not_found(format!(
+        "unsupported path `{}`",
+        request.path
+    )))
 }
 
 async fn submit_webhook(
@@ -525,9 +646,11 @@ async fn submit_webhook(
 
     let classification = webhook
         .classification
+        .clone()
         .unwrap_or_else(|| runtime.default_classification.clone());
     let artifact_retention = webhook
         .retention_class
+        .clone()
         .unwrap_or_else(|| runtime.topic_retention_class.clone());
 
     let (attachments, uploaded_artifacts) = materialize_attachments(
@@ -539,9 +662,18 @@ async fn submit_webhook(
     )
     .await?;
 
-    let task_id = webhook
-        .task_id
-        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    let correlation_id = webhook
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| derive_correlation_id(&webhook));
+    let task_id = webhook.task_id.clone().unwrap_or_else(|| {
+        deterministic_task_id(
+            webhook
+                .idempotency_key
+                .as_deref()
+                .unwrap_or(&correlation_id),
+        )
+    });
     let task_type = webhook
         .task_type
         .unwrap_or_else(|| runtime.task_type.clone());
@@ -557,9 +689,18 @@ async fn submit_webhook(
     let received_at = webhook.received_at.unwrap_or_else(Utc::now);
     let metadata = webhook.metadata.unwrap_or_else(|| serde_json::json!({}));
     let routing = webhook.routing;
+    let required_agent = routing
+        .as_ref()
+        .and_then(|routing| routing.agent_id.clone());
+    let affinity_key = routing
+        .as_ref()
+        .and_then(|routing| routing.affinity_key.clone())
+        .or_else(|| Some(session_affinity_key(&webhook.session)));
 
     let payload = HandoffPayload {
-        schema_version: WEBHOOK_SCHEMA_VERSION.to_owned(),
+        schema_version: INTEROP_CHAT_HANDOFF_SCHEMA_VERSION.to_owned(),
+        correlation_id: correlation_id.clone(),
+        reply_topic: runtime.replies_topic.clone(),
         source_runtime: webhook.source_runtime,
         target_runtime: webhook.target_runtime,
         session: webhook.session,
@@ -582,6 +723,8 @@ async fn submit_webhook(
             principal: webhook.principal,
             preferred_agents: webhook.preferred_agents,
             avoid_agents: webhook.avoid_agents,
+            required_agent,
+            affinity_key,
         },
         payload: TaskPayload::json(serde_json::to_value(payload).map_err(|error| {
             HttpError::bad_request(format!("payload is invalid json: {error}"))
@@ -625,6 +768,8 @@ async fn submit_webhook(
                 "submitted interop task"
             );
             Ok(AcceptedIngressResponse {
+                schema_version: INTEROP_CHAT_HANDOFF_SCHEMA_VERSION.to_owned(),
+                correlation_id,
                 task_id,
                 task_type,
                 topic: runtime.tasks_topic,
@@ -643,12 +788,41 @@ async fn submit_webhook(
     }
 }
 
+fn session_affinity_key(session: &IncomingSession) -> String {
+    format!(
+        "{}:{}:{}",
+        session.channel, session.account_id, session.session_id
+    )
+}
+
+fn derive_correlation_id(webhook: &BridgeWebhookRequest) -> String {
+    let source = format!(
+        "{}:{}:{}:{}:{}",
+        webhook.source_runtime,
+        webhook.session.channel,
+        webhook.session.account_id,
+        webhook.session.session_id,
+        webhook
+            .session
+            .message_id
+            .as_deref()
+            .unwrap_or("unidentified")
+    );
+    format!("corr-{:x}", Sha256::digest(source.as_bytes()))
+}
+
+fn deterministic_task_id(idempotency_key: &str) -> String {
+    format!(
+        "interop-{}",
+        &format!("{:x}", Sha256::digest(idempotency_key.as_bytes()))[..32]
+    )
+}
+
 fn validate_webhook(webhook: &BridgeWebhookRequest) -> Result<(), HttpError> {
-    if let Some(schema_version) = webhook.schema_version.as_deref()
-        && schema_version != WEBHOOK_SCHEMA_VERSION
-    {
+    if webhook.schema_version != INTEROP_CHAT_HANDOFF_SCHEMA_VERSION {
         return Err(HttpError::bad_request(format!(
-            "unsupported schema_version `{schema_version}`; expected `{WEBHOOK_SCHEMA_VERSION}`"
+            "unsupported schema_version `{}`; expected `{INTEROP_CHAT_HANDOFF_SCHEMA_VERSION}`",
+            webhook.schema_version
         )));
     }
     validate_required_text(
@@ -656,6 +830,15 @@ fn validate_webhook(webhook: &BridgeWebhookRequest) -> Result<(), HttpError> {
         &webhook.source_runtime,
         MAX_IDENTIFIER_BYTES,
     )?;
+    if webhook.task_id.is_none()
+        && webhook.idempotency_key.is_none()
+        && webhook.correlation_id.is_none()
+        && webhook.session.message_id.is_none()
+    {
+        return Err(HttpError::bad_request(
+            "one of task_id, idempotency_key, correlation_id, or session.message_id is required",
+        ));
+    }
     validate_optional_text(
         "target_runtime",
         webhook.target_runtime.as_deref(),
@@ -716,6 +899,16 @@ fn validate_webhook(webhook: &BridgeWebhookRequest) -> Result<(), HttpError> {
         MAX_IDENTIFIER_BYTES,
     )?;
     validate_optional_text("task_id", webhook.task_id.as_deref(), MAX_IDENTIFIER_BYTES)?;
+    validate_optional_text(
+        "correlation_id",
+        webhook.correlation_id.as_deref(),
+        MAX_IDENTIFIER_BYTES,
+    )?;
+    validate_optional_text(
+        "idempotency_key",
+        webhook.idempotency_key.as_deref(),
+        MAX_IDENTIFIER_BYTES,
+    )?;
     validate_optional_text(
         "task_type",
         webhook.task_type.as_deref(),
@@ -785,6 +978,11 @@ fn validate_webhook(webhook: &BridgeWebhookRequest) -> Result<(), HttpError> {
         validate_optional_text(
             "routing.skill_hint",
             routing.skill_hint.as_deref(),
+            MAX_IDENTIFIER_BYTES,
+        )?;
+        validate_optional_text(
+            "routing.affinity_key",
+            routing.affinity_key.as_deref(),
             MAX_IDENTIFIER_BYTES,
         )?;
         validate_unique_text_list(
@@ -904,6 +1102,259 @@ fn validate_unique_text_list(
         }
     }
     Ok(())
+}
+
+async fn upload_artifact(
+    runtime: BridgeRuntime,
+    request: HttpRequest,
+) -> Result<AcceptedArtifactResponse, HttpError> {
+    let content_type = request
+        .headers
+        .get("content-type")
+        .cloned()
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    validate_required_text("Content-Type", &content_type, MAX_CONTENT_TYPE_BYTES)?;
+    let artifact_id = request.headers.get("x-artifact-id").cloned();
+    validate_optional_text(
+        "X-Artifact-Id",
+        artifact_id.as_deref(),
+        MAX_ARTIFACT_ID_BYTES,
+    )?;
+    let expected_sha256 = request.headers.get("x-content-sha256").cloned();
+    if let Some(value) = expected_sha256.as_deref()
+        && (value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(HttpError::bad_request(
+            "X-Content-Sha256 must be 64 hexadecimal characters",
+        ));
+    }
+    let actual_sha256 = format!("{:x}", Sha256::digest(&request.body));
+    if expected_sha256
+        .as_ref()
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&actual_sha256))
+    {
+        return Err(HttpError::bad_request(
+            "artifact sha256 does not match body",
+        ));
+    }
+
+    let mut client = Client::connect(runtime.endpoint.clone())
+        .await
+        .map_err(|error| HttpError::upstream(format!("failed to connect to broker: {error}")))?;
+    let (response, attachment) = client
+        .send_with_attachment(
+            ControlRequest {
+                capability_token: runtime.capability_token,
+                command: ControlCommand::PutArtifact {
+                    artifact_id,
+                    content_type,
+                    byte_length: request.body.len() as u64,
+                    sha256: Some(actual_sha256),
+                    classification: Some(runtime.default_classification),
+                    retention_class: Some(runtime.topic_retention_class),
+                },
+            },
+            Some(request.body),
+        )
+        .await
+        .map_err(|error| HttpError::upstream(format!("failed to store artifact: {error}")))?;
+    if attachment.is_some() {
+        return Err(HttpError::upstream(
+            "broker returned unexpected bytes for artifact upload",
+        ));
+    }
+    match response {
+        ControlResponse::ArtifactStored { artifact } => Ok(AcceptedArtifactResponse {
+            artifact_id: artifact.artifact_id,
+            content_type: artifact.content_type,
+            byte_length: artifact.byte_length,
+            sha256: artifact.sha256,
+        }),
+        ControlResponse::Error { code, message } => Err(HttpError::upstream(format!(
+            "broker rejected artifact upload: {code}: {message}"
+        ))),
+        other => Err(HttpError::upstream(format!(
+            "unexpected broker response while storing artifact: {other:?}"
+        ))),
+    }
+}
+
+async fn run_egress(runtime: BridgeRuntime) {
+    let Some(egress_url) = runtime.egress_url.clone() else {
+        return;
+    };
+    let http = match reqwest::Client::builder()
+        .timeout(runtime.request_timeout)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(error = %error, "failed to initialize egress HTTP client");
+            return;
+        }
+    };
+    let mut state = match load_bridge_state(&runtime.state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            warn!(error = %error, path = %runtime.state_path.display(), "failed to load durable bridge state");
+            return;
+        }
+    };
+    loop {
+        match deliver_reply_batch(&runtime, &http, &egress_url, &mut state).await {
+            Ok(delivered) if delivered > 0 => continue,
+            Ok(_) => {}
+            Err(error) => {
+                warn!(error = %error, offset = state.replies_offset, "egress delivery paused; cursor not advanced")
+            }
+        }
+        tokio::time::sleep(runtime.egress_poll_interval).await;
+    }
+}
+
+async fn deliver_reply_batch(
+    runtime: &BridgeRuntime,
+    http: &reqwest::Client,
+    egress_url: &str,
+    state: &mut BridgeState,
+) -> anyhow::Result<usize> {
+    let mut client = Client::connect(runtime.endpoint.clone())
+        .await
+        .context("connect to broker for reply egress")?;
+    ensure_topic(
+        &mut client,
+        &runtime.capability_token,
+        &runtime.replies_topic,
+        runtime.topic_retention_class.clone(),
+        runtime.topic_classification.clone(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message))?;
+    let response = client
+        .send(ControlRequest {
+            capability_token: runtime.capability_token.clone(),
+            command: ControlCommand::Consume {
+                topic: runtime.replies_topic.clone(),
+                offset: state.replies_offset,
+                limit: runtime.egress_batch_size,
+            },
+        })
+        .await
+        .context("consume reply topic")?;
+    let messages = match response {
+        ControlResponse::Messages { messages, .. } => messages,
+        ControlResponse::Error { code, message } => {
+            bail!("consume replies failed: {code}: {message}")
+        }
+        other => bail!("unexpected consume replies response: {other:?}"),
+    };
+    let mut delivered = 0;
+    for stored in messages {
+        let reply: InteropChatReplyV1 = serde_json::from_str(&stored.payload)
+            .with_context(|| format!("invalid reply envelope at offset {}", stored.offset))?;
+        validate_reply(&reply)?;
+        let mut request = http
+            .post(egress_url)
+            .header("Idempotency-Key", &reply.delivery_id)
+            .header("X-Expressways-Correlation-Id", &reply.correlation_id)
+            .json(&reply);
+        if let Some(bearer) = &runtime.egress_bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let response = request
+            .send()
+            .await
+            .context("send reply to channel endpoint")?;
+        if !response.status().is_success() {
+            bail!(
+                "channel endpoint rejected reply with HTTP {}",
+                response.status()
+            );
+        }
+        state.replies_offset = stored
+            .offset
+            .checked_add(1)
+            .context("reply offset overflow")?;
+        save_bridge_state(&runtime.state_path, state)?;
+        delivered += 1;
+        info!(delivery_id = %reply.delivery_id, offset = stored.offset, "delivered interop reply");
+    }
+    Ok(delivered)
+}
+
+fn validate_reply(reply: &InteropChatReplyV1) -> anyhow::Result<()> {
+    if reply.schema_version != INTEROP_CHAT_REPLY_SCHEMA_VERSION {
+        bail!(
+            "unsupported reply schema_version `{}`",
+            reply.schema_version
+        );
+    }
+    for (field, value) in [
+        ("delivery_id", reply.delivery_id.as_str()),
+        ("correlation_id", reply.correlation_id.as_str()),
+        ("source_runtime", reply.source_runtime.as_str()),
+        ("target_runtime", reply.target_runtime.as_str()),
+        ("in_reply_to_task_id", reply.in_reply_to_task_id.as_str()),
+    ] {
+        if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES {
+            bail!("reply {field} must contain 1..={MAX_IDENTIFIER_BYTES} bytes");
+        }
+    }
+    if reply.message.text.is_none() && reply.message.attachments.is_empty() {
+        bail!("reply message must contain text or attachments");
+    }
+    Ok(())
+}
+
+fn load_bridge_state(path: &Path) -> anyhow::Result<BridgeState> {
+    if !path.exists() {
+        return Ok(BridgeState {
+            schema_version: BRIDGE_STATE_SCHEMA_VERSION,
+            replies_offset: 0,
+        });
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 {
+        bail!("bridge state must be a regular file no larger than 64 KiB");
+    }
+    let state: BridgeState = serde_json::from_slice(&fs::read(path)?)?;
+    if state.schema_version != BRIDGE_STATE_SCHEMA_VERSION {
+        bail!(
+            "unsupported bridge state schema version {}",
+            state.schema_version
+        );
+    }
+    Ok(state)
+}
+
+fn save_bridge_state(path: &Path, state: &BridgeState) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = options.open(&temp)?;
+        file.write_all(&serde_json::to_vec_pretty(state)?)?;
+        file.sync_all()?;
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
 }
 
 async fn ensure_topic(
@@ -1056,6 +1507,8 @@ fn validate_inline_attachment_claims(
 async fn read_http_request<R>(
     stream: &mut R,
     max_request_bytes: usize,
+    artifact_path: &str,
+    max_artifact_request_bytes: usize,
 ) -> anyhow::Result<HttpRequest>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -1092,7 +1545,12 @@ where
         .context("invalid Content-Length value")?
         .unwrap_or(0);
 
-    let body_start = checked_body_start(header_end, content_length, max_request_bytes)?;
+    let body_limit = if path == artifact_path {
+        max_artifact_request_bytes
+    } else {
+        max_request_bytes
+    };
+    let body_start = checked_body_start(header_end, content_length, body_limit)?;
 
     let available = buffer.len().saturating_sub(body_start).min(content_length);
     let mut body = Vec::with_capacity(available);
@@ -1385,11 +1843,24 @@ mod tests {
 
     #[test]
     fn server_limits_and_content_length_overflow_are_rejected() {
-        assert!(validate_server_limits(1024, 1, MIN_REQUEST_TIMEOUT_MS).is_ok());
-        assert!(validate_server_limits(1023, 1, MIN_REQUEST_TIMEOUT_MS).is_err());
-        assert!(validate_server_limits(1024, usize::MAX, MIN_REQUEST_TIMEOUT_MS).is_err());
-        assert!(validate_server_limits(1024, 1, MIN_REQUEST_TIMEOUT_MS - 1).is_err());
-        assert!(validate_server_limits(1024, 1, MAX_REQUEST_TIMEOUT_MS + 1).is_err());
+        assert!(
+            validate_server_limits(1024, MAX_ARTIFACT_BYTES, 1, MIN_REQUEST_TIMEOUT_MS).is_ok()
+        );
+        assert!(
+            validate_server_limits(1023, MAX_ARTIFACT_BYTES, 1, MIN_REQUEST_TIMEOUT_MS).is_err()
+        );
+        assert!(
+            validate_server_limits(1024, MAX_ARTIFACT_BYTES, usize::MAX, MIN_REQUEST_TIMEOUT_MS)
+                .is_err()
+        );
+        assert!(
+            validate_server_limits(1024, MAX_ARTIFACT_BYTES, 1, MIN_REQUEST_TIMEOUT_MS - 1)
+                .is_err()
+        );
+        assert!(
+            validate_server_limits(1024, MAX_ARTIFACT_BYTES + 1, 1, MIN_REQUEST_TIMEOUT_MS)
+                .is_err()
+        );
 
         assert!(checked_body_start(10, usize::MAX, 1024).is_err());
         assert!(checked_body_start(10, 100, 50).is_err());
@@ -1402,6 +1873,8 @@ mod tests {
     #[test]
     fn webhook_schema_and_fanout_are_strictly_bounded() {
         let raw = serde_json::json!({
+            "schema_version": INTEROP_CHAT_HANDOFF_SCHEMA_VERSION,
+            "idempotency_key": "pigeon-message-1",
             "source_runtime": "openclaw",
             "session": {
                 "session_id": "session-1",
@@ -1417,7 +1890,7 @@ mod tests {
 
         let mut unknown = raw;
         unknown["unexpected"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<BridgeWebhookRequest>(unknown).is_err());
+        assert!(serde_json::from_value::<BridgeWebhookRequest>(unknown).is_ok());
 
         webhook.preferred_agents = vec!["agent-a".to_owned(), "agent-a".to_owned()];
         assert_eq!(
@@ -1460,14 +1933,78 @@ mod tests {
         assert!(validate_inline_attachment_claims(&inline, b"hello", hello_sha256).is_err());
     }
 
+    #[test]
+    fn identifiers_are_deterministic_and_an_identity_is_required() {
+        assert_eq!(
+            deterministic_task_id("pigeon-message-1"),
+            deterministic_task_id("pigeon-message-1")
+        );
+        let raw = serde_json::json!({
+            "schema_version": INTEROP_CHAT_HANDOFF_SCHEMA_VERSION,
+            "source_runtime": "pigeon",
+            "session": {
+                "session_id": "session-1",
+                "channel": "whatsapp",
+                "account_id": "account-1",
+                "sender_id": "sender-1"
+            },
+            "message": { "text": "hello" }
+        });
+        let webhook: BridgeWebhookRequest = serde_json::from_value(raw).expect("parse webhook");
+        assert!(validate_webhook(&webhook).is_err());
+    }
+
+    #[test]
+    fn reply_contract_and_durable_cursor_are_validated() {
+        let reply = InteropChatReplyV1 {
+            schema_version: INTEROP_CHAT_REPLY_SCHEMA_VERSION.to_owned(),
+            delivery_id: "delivery-1".to_owned(),
+            correlation_id: "correlation-1".to_owned(),
+            source_runtime: "agent".to_owned(),
+            target_runtime: "pigeon".to_owned(),
+            session: InteropChatSession {
+                session_id: "session-1".to_owned(),
+                channel: "whatsapp".to_owned(),
+                account_id: "account-1".to_owned(),
+                sender_id: "sender-1".to_owned(),
+                sender_display_name: None,
+                message_id: None,
+                reply_to_message_id: Some("message-1".to_owned()),
+            },
+            in_reply_to_task_id: "task-1".to_owned(),
+            message: InteropChatMessage {
+                text: Some("hello back".to_owned()),
+                attachments: Vec::new(),
+            },
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        validate_reply(&reply).expect("valid reply");
+
+        let path = std::env::temp_dir().join(format!("expressways-bridge-{}.json", Uuid::now_v7()));
+        let state = BridgeState {
+            schema_version: BRIDGE_STATE_SCHEMA_VERSION,
+            replies_offset: 42,
+        };
+        save_bridge_state(&path, &state).expect("save state");
+        let loaded = load_bridge_state(&path).expect("load state");
+        assert_eq!(loaded.replies_offset, 42);
+        fs::remove_file(path).expect("remove state");
+    }
+
     #[tokio::test]
     async fn request_reader_grows_with_received_data_and_bounds_headers() {
         let (mut client, mut server) = tokio::io::duplex(128 * 1024);
         let request = b"POST /v1/webhook/handoff HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
         client.write_all(request).await.expect("write request");
-        let parsed = read_http_request(&mut server, 1024)
-            .await
-            .expect("parse bounded request");
+        let parsed = read_http_request(
+            &mut server,
+            1024,
+            "/v1/artifacts",
+            MAX_ARTIFACT_BYTES as usize,
+        )
+        .await
+        .expect("parse bounded request");
         assert_eq!(parsed.body, b"hello");
 
         let (mut client, mut server) = tokio::io::duplex(128 * 1024);
@@ -1475,9 +2012,14 @@ mod tests {
             .write_all(&vec![b'x'; MAX_HTTP_HEADER_BYTES])
             .await
             .expect("write oversized header");
-        let error = read_http_request(&mut server, MAX_REQUEST_BYTES_LIMIT)
-            .await
-            .expect_err("oversized header must fail");
+        let error = read_http_request(
+            &mut server,
+            MAX_REQUEST_BYTES_LIMIT,
+            "/v1/artifacts",
+            MAX_ARTIFACT_BYTES as usize,
+        )
+        .await
+        .expect_err("oversized header must fail");
         assert!(error.to_string().contains("headers exceeded"));
     }
 }

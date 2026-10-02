@@ -361,6 +361,10 @@ enum Command {
         preferred_agents: Vec<String>,
         #[arg(long = "avoid-agent")]
         avoid_agents: Vec<String>,
+        #[arg(long)]
+        required_agent: Option<String>,
+        #[arg(long)]
+        affinity_key: Option<String>,
         #[arg(long, default_value_t = 0)]
         priority: i32,
         #[arg(long)]
@@ -1033,6 +1037,8 @@ async fn main() -> anyhow::Result<()> {
             principal,
             preferred_agents,
             avoid_agents,
+            required_agent,
+            affinity_key,
             priority,
             payload_json,
             payload_text,
@@ -1078,6 +1084,8 @@ async fn main() -> anyhow::Result<()> {
                                 principal,
                                 preferred_agents,
                                 avoid_agents,
+                                required_agent,
+                                affinity_key,
                             },
                             payload,
                             retry_policy: TaskRetryPolicy {
@@ -1275,6 +1283,8 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
             principal,
             preferred_agents,
             avoid_agents,
+            required_agent,
+            affinity_key,
             priority,
             payload_json,
             payload_text,
@@ -1309,6 +1319,8 @@ fn request_from_command(command: Command) -> anyhow::Result<ControlRequest> {
                             principal,
                             preferred_agents,
                             avoid_agents,
+                            required_agent,
+                            affinity_key,
                         },
                         payload: build_submit_task_payload(
                             payload_json,
@@ -3699,6 +3711,8 @@ mod tests {
             principal: Some("local:agent-alpha".to_owned()),
             preferred_agents: vec!["alpha".to_owned(), "beta".to_owned()],
             avoid_agents: vec!["gamma".to_owned()],
+            required_agent: Some("alpha".to_owned()),
+            affinity_key: Some("conversation-1".to_owned()),
             priority: 25,
             payload_json: Some("{\"path\":\"notes.md\"}".to_owned()),
             payload_text: None,
@@ -3764,6 +3778,8 @@ mod tests {
             principal: None,
             preferred_agents: Vec::new(),
             avoid_agents: Vec::new(),
+            required_agent: None,
+            affinity_key: None,
             priority: 0,
             payload_json: None,
             payload_text: None,
@@ -3850,6 +3866,8 @@ mod tests {
             principal: None,
             preferred_agents: Vec::new(),
             avoid_agents: Vec::new(),
+            required_agent: None,
+            affinity_key: None,
             priority: 0,
             payload_json: None,
             payload_text: None,

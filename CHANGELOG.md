@@ -7,6 +7,9 @@ All notable user-visible changes will be documented here. The format follows [Ke
 ### Added
 
 - Open-source project governance, contribution, security, operational, and protocol documentation.
+- A supported, versioned two-way chat bridge with durable at-least-once reply delivery, acknowledgements, idempotency keys, and raw artifact upload.
+- Hard agent pins and serialized sticky affinity routing for ordered conversation processing.
+- Versioned ingress, handoff, and reply schemas with forward-compatible additive fields.
 
 ### Security
 

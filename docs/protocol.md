@@ -54,3 +54,5 @@ Clients must branch on `code`, not parse `message`. Error strings may gain diagn
 ## Compatibility
 
 Version `0.x` is alpha. Additive fields may appear with defaults; command or persistence changes that cannot be made compatible require documentation, tests, and an explicit migration. Persisted documents carry schema versions and reject unknown newer versions rather than guessing.
+
+Task requirements may include `required_agent` for a hard scheduling constraint and `affinity_key` for serialized, sticky routing. Interoperability handoffs and replies use the version constants and envelope types exported by `expressways-protocol`; their JSON schemas are documented in [Supported Chat Interoperability](design/openclaw-zeroclaw-interop.md).

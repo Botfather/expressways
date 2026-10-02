@@ -15,6 +15,8 @@ pub const INTEROP_CHAT_REQUESTS_TOPIC: &str = "interop.chat.requests";
 pub const INTEROP_CHAT_RESULTS_TOPIC: &str = "interop.chat.results";
 pub const INTEROP_CHAT_REPLIES_TOPIC: &str = "interop.chat.replies";
 pub const INTEROP_CHAT_HANDOFF_TASK_TYPE: &str = "interop.chat.handoff";
+pub const INTEROP_CHAT_HANDOFF_SCHEMA_VERSION: &str = "interop.chat.handoff.v1";
+pub const INTEROP_CHAT_REPLY_SCHEMA_VERSION: &str = "interop.chat.reply.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -219,6 +221,65 @@ pub struct TaskRequirements {
     pub preferred_agents: Vec<String>,
     #[serde(default)]
     pub avoid_agents: Vec<String>,
+    /// A hard agent pin. Unlike `preferred_agents`, no other agent is eligible.
+    #[serde(default)]
+    pub required_agent: Option<String>,
+    /// Tasks sharing an affinity key are scheduled serially and retain their
+    /// most recently selected eligible agent when possible.
+    #[serde(default)]
+    pub affinity_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteropChatSession {
+    pub session_id: String,
+    pub channel: String,
+    pub account_id: String,
+    pub sender_id: String,
+    #[serde(default)]
+    pub sender_display_name: Option<String>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub reply_to_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteropChatAttachmentRef {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    pub artifact_id: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub byte_length: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct InteropChatMessage {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<InteropChatAttachmentRef>,
+}
+
+/// Final reply written to `interop.chat.replies`. Delivery receivers must
+/// deduplicate `delivery_id`; bridge delivery is at least once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InteropChatReplyV1 {
+    pub schema_version: String,
+    pub delivery_id: String,
+    pub correlation_id: String,
+    pub source_runtime: String,
+    pub target_runtime: String,
+    pub session: InteropChatSession,
+    pub in_reply_to_task_id: String,
+    pub message: InteropChatMessage,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

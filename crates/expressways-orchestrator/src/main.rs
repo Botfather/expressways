@@ -310,6 +310,8 @@ async fn main() -> anyhow::Result<()> {
                 principal,
                 preferred_agents: Vec::new(),
                 avoid_agents: Vec::new(),
+                required_agent: None,
+                affinity_key: None,
             };
             assign(
                 endpoint,

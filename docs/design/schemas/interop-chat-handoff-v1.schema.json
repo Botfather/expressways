@@ -3,9 +3,11 @@
   "$id": "https://expressways.local/schemas/interop-chat-handoff-v1.schema.json",
   "title": "Expressways Interop Chat Handoff v1",
   "type": "object",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": [
     "schema_version",
+    "correlation_id",
+    "reply_topic",
     "source_runtime",
     "session",
     "message",
@@ -20,13 +22,21 @@
       "type": "string",
       "minLength": 1
     },
+    "correlation_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reply_topic": {
+      "type": "string",
+      "const": "interop.chat.replies"
+    },
     "target_runtime": {
       "type": "string",
       "minLength": 1
     },
     "session": {
       "type": "object",
-      "additionalProperties": false,
+      "additionalProperties": true,
       "required": [
         "session_id",
         "channel",
@@ -63,7 +73,7 @@
     },
     "message": {
       "type": "object",
-      "additionalProperties": false,
+      "additionalProperties": true,
       "properties": {
         "text": {
           "type": "string"
@@ -78,7 +88,7 @@
     },
     "routing": {
       "type": "object",
-      "additionalProperties": false,
+      "additionalProperties": true,
       "properties": {
         "agent_id": {
           "type": "string"
@@ -94,6 +104,9 @@
           "items": {
             "type": "string"
           }
+        },
+        "affinity_key": {
+          "type": "string"
         }
       }
     },
@@ -109,7 +122,7 @@
   "$defs": {
     "attachment_ref": {
       "type": "object",
-      "additionalProperties": false,
+      "additionalProperties": true,
       "required": [
         "artifact_id"
       ],

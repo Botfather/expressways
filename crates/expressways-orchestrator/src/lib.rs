@@ -37,6 +37,7 @@ pub struct AgentSelection<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentSchedulingScore {
     avoid_penalty: u8,
+    affinity_penalty: u8,
     active_load: usize,
     preference_penalty: u8,
     historical_assignments: u64,
@@ -166,6 +167,8 @@ pub struct TaskRecord {
     pub attempts: u32,
     pub last_event_at: DateTime<Utc>,
     pub active_assignment: Option<TaskLease>,
+    #[serde(default)]
+    pub last_agent_id: Option<String>,
     #[serde(default)]
     pub last_assignment_reason: Option<String>,
     pub next_retry_at: Option<DateTime<Utc>>,
@@ -336,6 +339,7 @@ pub fn try_ingest_task(
             status: TaskStatus::Pending,
             attempts: 0,
             active_assignment: None,
+            last_agent_id: None,
             last_assignment_reason: None,
             next_retry_at: None,
             last_error: None,
@@ -406,7 +410,42 @@ pub fn ready_task_ids(state: &OrchestratorState, now: DateTime<Utc>) -> Vec<Stri
             .then_with(|| left.1.cmp(&right.1))
             .then_with(|| left.2.cmp(&right.2))
     });
-    tasks.into_iter().map(|(_, _, task_id)| task_id).collect()
+    let affinity_heads = state
+        .tasks
+        .values()
+        .filter(|task| {
+            !matches!(
+                task.status,
+                TaskStatus::Completed | TaskStatus::Exhausted | TaskStatus::Canceled
+            )
+        })
+        .filter_map(|task| {
+            task.work_item
+                .requirements
+                .affinity_key
+                .as_deref()
+                .map(|key| (key, task.task_offset))
+        })
+        .fold(BTreeMap::new(), |mut heads, (key, offset)| {
+            heads
+                .entry(key)
+                .and_modify(|head: &mut u64| *head = (*head).min(offset))
+                .or_insert(offset);
+            heads
+        });
+    tasks
+        .into_iter()
+        .filter_map(|(_, task_offset, task_id)| {
+            let task = state.tasks.get(&task_id)?;
+            let blocked = task
+                .work_item
+                .requirements
+                .affinity_key
+                .as_deref()
+                .is_some_and(|key| affinity_heads.get(key).copied() != Some(task_offset));
+            (!blocked).then_some(task_id)
+        })
+        .collect()
 }
 
 pub fn timed_out_task_ids(state: &OrchestratorState, now: DateTime<Utc>) -> Vec<String> {
@@ -796,6 +835,14 @@ pub fn validate_task_work_item(work_item: &TaskWorkItem) -> anyhow::Result<()> {
             "required principal",
             work_item.requirements.principal.as_deref(),
         ),
+        (
+            "required agent",
+            work_item.requirements.required_agent.as_deref(),
+        ),
+        (
+            "affinity key",
+            work_item.requirements.affinity_key.as_deref(),
+        ),
     ] {
         if let Some(value) = value {
             validate_state_identifier(kind, value)?;
@@ -815,6 +862,11 @@ pub fn validate_task_work_item(work_item: &TaskWorkItem) -> anyhow::Result<()> {
         .find(|agent| avoided.contains(agent))
     {
         bail!("task agent `{conflict}` cannot be both preferred and avoided");
+    }
+    if let Some(required) = work_item.requirements.required_agent.as_ref()
+        && avoided.contains(required)
+    {
+        bail!("required task agent `{required}` cannot also be avoided");
     }
 
     if !(1..=MAX_TASK_ATTEMPTS).contains(&work_item.retry_policy.max_attempts) {
@@ -1005,6 +1057,7 @@ fn apply_task_event_inner(
                     attempt: event.attempt,
                 });
                 task.last_assignment_reason = event.reason.clone();
+                task.last_agent_id = Some(agent_id.clone());
                 task.next_retry_at = None;
                 task.last_error = None;
                 assigned_agent = Some(agent_id.clone());
@@ -1122,7 +1175,11 @@ fn matches_current_assignment(task: &TaskRecord, event: &TaskEvent) -> bool {
 }
 
 fn matches_requirements(agent: &AgentCard, requirements: &AssignmentRequirements) -> bool {
-    matches_optional(&requirements.principal, &agent.principal)
+    requirements
+        .required_agent
+        .as_ref()
+        .is_none_or(|required| required == &agent.agent_id)
+        && matches_optional(&requirements.principal, &agent.principal)
         && matches_skill(requirements.skill.as_deref(), &agent.skills)
         && matches_topic(
             requirements.topic.as_deref(),
@@ -1157,6 +1214,9 @@ fn agent_scheduling_score(
         .unwrap_or_default();
     AgentSchedulingScore {
         avoid_penalty: affinity_avoid_penalty(requirements, &agent.agent_id),
+        affinity_penalty: affinity_agent(state, requirements)
+            .is_some_and(|affinity_agent| affinity_agent != agent.agent_id)
+            as u8,
         active_load: active_assignment_count(state, &agent.agent_id),
         preference_penalty: affinity_preference_penalty(requirements, &agent.agent_id),
         historical_assignments: stats.assignment_count,
@@ -1167,9 +1227,10 @@ fn agent_scheduling_score(
 fn scheduling_score_key<'a>(
     score: &AgentSchedulingScore,
     agent: &'a AgentCard,
-) -> (u8, usize, u8, u64, Option<DateTime<Utc>>, &'a str) {
+) -> (u8, u8, usize, u8, u64, Option<DateTime<Utc>>, &'a str) {
     (
         score.avoid_penalty,
+        score.affinity_penalty,
         score.active_load,
         score.preference_penalty,
         score.historical_assignments,
@@ -1198,15 +1259,34 @@ fn format_assignment_reason(
         .unwrap_or_else(|| "never".to_owned());
 
     format!(
-        "scheduler selected agent `{}` with priority={}, preferred_match={}, avoid_match={}, active_load={}, historical_assignments={}, last_assigned_at={}",
+        "scheduler selected agent `{}` with priority={}, preferred_match={}, avoid_match={}, affinity_match={}, active_load={}, historical_assignments={}, last_assigned_at={}",
         agent.agent_id,
         task_priority,
         preferred_match,
         avoided_match,
+        score.affinity_penalty == 0,
         score.active_load,
         score.historical_assignments,
         last_assigned_at
     )
+}
+
+fn affinity_agent<'a>(
+    state: &'a OrchestratorState,
+    requirements: &AssignmentRequirements,
+) -> Option<&'a str> {
+    let affinity_key = requirements.affinity_key.as_deref()?;
+    state
+        .tasks
+        .values()
+        .filter(|task| task.work_item.requirements.affinity_key.as_deref() == Some(affinity_key))
+        .filter_map(|task| {
+            task.last_agent_id
+                .as_deref()
+                .map(|agent_id| (task.task_offset, agent_id))
+        })
+        .max_by_key(|(offset, _)| *offset)
+        .map(|(_, agent_id)| agent_id)
 }
 
 fn affinity_preference_penalty(requirements: &AssignmentRequirements, agent_id: &str) -> u8 {
@@ -1437,6 +1517,8 @@ mod tests {
                 principal: None,
                 preferred_agents: preferred_agents.into_iter().map(str::to_owned).collect(),
                 avoid_agents: avoid_agents.into_iter().map(str::to_owned).collect(),
+                required_agent: None,
+                affinity_key: None,
             },
             payload: TaskPayload::json(json!({ "path": "notes.md" })),
             retry_policy: TaskRetryPolicy {
@@ -1603,6 +1685,8 @@ mod tests {
             principal: None,
             preferred_agents: Vec::new(),
             avoid_agents: Vec::new(),
+            required_agent: None,
+            affinity_key: None,
         };
 
         let first = select_agent(&state, &requirements, Utc::now())
@@ -1662,6 +1746,8 @@ mod tests {
             principal: None,
             preferred_agents: Vec::new(),
             avoid_agents: Vec::new(),
+            required_agent: None,
+            affinity_key: None,
         };
 
         let selected = select_agent(&state, &requirements, Utc::now()).expect("selected agent");
@@ -1687,6 +1773,8 @@ mod tests {
             principal: None,
             preferred_agents: vec!["gamma".to_owned()],
             avoid_agents: vec!["alpha".to_owned()],
+            required_agent: None,
+            affinity_key: None,
         };
         let selected = select_agent(&state, &preferred, Utc::now()).expect("preferred agent");
         assert_eq!(selected.agent_id, "gamma");
@@ -1697,6 +1785,8 @@ mod tests {
             principal: None,
             preferred_agents: Vec::new(),
             avoid_agents: vec!["alpha".to_owned()],
+            required_agent: None,
+            affinity_key: None,
         };
         let selected = select_agent(&state, &avoid_only, Utc::now()).expect("non-avoided agent");
         assert_ne!(selected.agent_id, "alpha");
@@ -1732,6 +1822,114 @@ mod tests {
         assert!(selection.reason.contains("preferred_match=true"));
         assert!(selection.reason.contains("avoid_match=false"));
         assert!(selection.reason.contains("active_load=0"));
+    }
+
+    #[test]
+    fn affinity_serializes_tasks_and_keeps_the_selected_agent() {
+        let mut state = OrchestratorState::default();
+        let alpha = card("alpha", "summarize");
+        let beta = card("beta", "summarize");
+        apply_snapshot(&mut state, vec![alpha.clone(), beta], 4);
+        let mut first = task("task-1", "summarize", 3);
+        first.requirements.affinity_key = Some("pigeon:chat-1".to_owned());
+        let mut second = task("task-2", "summarize", 3);
+        second.requirements.affinity_key = Some("pigeon:chat-1".to_owned());
+        assert!(ingest_task(&mut state, first, 0));
+        assert!(ingest_task(&mut state, second, 1));
+
+        assert_eq!(ready_task_ids(&state, Utc::now()), vec!["task-1"]);
+        let assignment =
+            plan_assignment_event(&state, "task-1", &alpha, Utc::now()).expect("assignment");
+        assert_eq!(
+            record_local_task_event(&mut state, assignment.clone()),
+            TaskEventApplyOutcome::Applied
+        );
+        assert!(ready_task_ids(&state, Utc::now()).is_empty());
+
+        let completed = TaskEvent {
+            event_id: Uuid::now_v7(),
+            task_id: "task-1".to_owned(),
+            task_offset: Some(0),
+            assignment_id: assignment.assignment_id,
+            agent_id: assignment.agent_id,
+            status: TaskStatus::Completed,
+            attempt: assignment.attempt,
+            reason: None,
+            emitted_at: Utc::now(),
+        };
+        assert_eq!(
+            apply_task_event_message(&mut state, completed),
+            TaskEventApplyOutcome::Applied
+        );
+        assert_eq!(ready_task_ids(&state, Utc::now()), vec!["task-2"]);
+        let requirements = &state.tasks["task-2"].work_item.requirements;
+        assert_eq!(
+            select_agent(&state, requirements, Utc::now())
+                .expect("sticky agent")
+                .agent_id,
+            "alpha"
+        );
+    }
+
+    #[test]
+    fn required_agent_is_a_hard_constraint() {
+        let mut state = OrchestratorState::default();
+        apply_snapshot(
+            &mut state,
+            vec![card("alpha", "summarize"), card("beta", "summarize")],
+            4,
+        );
+        let requirements = AssignmentRequirements {
+            skill: Some("summarize".to_owned()),
+            required_agent: Some("beta".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_agent(&state, &requirements, Utc::now())
+                .expect("required agent")
+                .agent_id,
+            "beta"
+        );
+    }
+
+    #[test]
+    fn affinity_head_blocks_later_tasks_while_retry_is_pending() {
+        let mut state = OrchestratorState::default();
+        let alpha = card("alpha", "summarize");
+        apply_snapshot(&mut state, vec![alpha.clone()], 1);
+        let mut first = task("task-1", "summarize", 3);
+        first.requirements.affinity_key = Some("pigeon:chat-1".to_owned());
+        let mut second = task("task-2", "summarize", 3);
+        second.requirements.affinity_key = Some("pigeon:chat-1".to_owned());
+        assert!(ingest_task(&mut state, first, 0));
+        assert!(ingest_task(&mut state, second, 1));
+        let assignment =
+            plan_assignment_event(&state, "task-1", &alpha, Utc::now()).expect("assignment");
+        assert_eq!(
+            record_local_task_event(&mut state, assignment.clone()),
+            TaskEventApplyOutcome::Applied
+        );
+        let failed = TaskEvent {
+            event_id: Uuid::now_v7(),
+            task_id: "task-1".to_owned(),
+            task_offset: Some(0),
+            assignment_id: assignment.assignment_id,
+            agent_id: assignment.agent_id,
+            status: TaskStatus::Failed,
+            attempt: assignment.attempt,
+            reason: Some("retry me".to_owned()),
+            emitted_at: Utc::now(),
+        };
+        assert_eq!(
+            apply_task_event_message(&mut state, failed),
+            TaskEventApplyOutcome::Applied
+        );
+        let retry = plan_retry_event(&state, "task-1", Utc::now(), None).expect("retry");
+        assert_eq!(
+            record_local_task_event(&mut state, retry),
+            TaskEventApplyOutcome::Applied
+        );
+        assert!(ready_task_ids(&state, Utc::now()).is_empty());
     }
 
     #[test]

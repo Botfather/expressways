@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://expressways.local/schemas/interop-chat-ingress-v1.schema.json",
+  "title": "Expressways Interop Chat Ingress v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "source_runtime", "session", "message"],
+  "anyOf": [
+    { "required": ["task_id"] },
+    { "required": ["idempotency_key"] },
+    { "required": ["correlation_id"] },
+    {
+      "properties": {
+        "session": { "required": ["message_id"] }
+      }
+    }
+  ],
+  "properties": {
+    "schema_version": { "const": "interop.chat.handoff.v1" },
+    "source_runtime": { "type": "string", "minLength": 1 },
+    "target_runtime": { "type": "string", "minLength": 1 },
+    "task_id": { "type": "string", "minLength": 1 },
+    "idempotency_key": { "type": "string", "minLength": 1 },
+    "correlation_id": { "type": "string", "minLength": 1 },
+    "session": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["session_id", "channel", "account_id", "sender_id"],
+      "properties": {
+        "session_id": { "type": "string", "minLength": 1 },
+        "channel": { "type": "string", "minLength": 1 },
+        "account_id": { "type": "string", "minLength": 1 },
+        "sender_id": { "type": "string", "minLength": 1 },
+        "sender_display_name": { "type": "string" },
+        "message_id": { "type": "string", "minLength": 1 },
+        "reply_to_message_id": { "type": "string" }
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "text": { "type": "string" },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "name": { "type": "string" },
+              "content_type": { "type": "string" },
+              "artifact_id": { "type": "string", "minLength": 1 },
+              "inline_base64": { "type": "string" },
+              "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+              "byte_length": { "type": "integer", "minimum": 0 }
+            },
+            "oneOf": [
+              { "required": ["artifact_id"], "not": { "required": ["inline_base64"] } },
+              { "required": ["inline_base64"], "not": { "required": ["artifact_id"] } }
+            ]
+          }
+        }
+      },
+      "anyOf": [
+        { "required": ["text"] },
+        { "required": ["attachments"] }
+      ]
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "agent_id": { "type": "string" },
+        "workspace": { "type": "string" },
+        "skill_hint": { "type": "string" },
+        "affinity_key": { "type": "string" },
+        "labels": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "metadata": { "type": "object", "additionalProperties": true }
+  }
+}
