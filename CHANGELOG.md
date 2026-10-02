@@ -14,6 +14,7 @@ All notable user-visible changes will be documented here. The format follows [Ke
 - Resumable, authenticated topic event streaming over Server-Sent Events with bounded stream capacity and cursor recovery.
 - A bounded `watch_topic` broker operation so idle event streams avoid repeated network requests and audit records.
 - HTTP agent registration, heartbeat, removal, discovery, and resumable registry event streaming for non-Rust harnesses.
+- A versioned OpenAPI 3.1 contract and isolated live HTTP conformance suite with restart durability checks.
 
 ### Security
 

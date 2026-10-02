@@ -51,6 +51,9 @@ jobs:
       - name: Test Workspace
         run: cargo test --workspace --all-features
 
+      - name: Test HTTP Gateway Conformance
+        run: bash scripts/test-http-gateway-conformance.sh
+
       - name: Check Rust Advisories, Licenses, and Sources
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

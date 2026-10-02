@@ -1,0 +1,438 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Expressways Local HTTP API",
+    "version": "0.1.0",
+    "description": "Authenticated loopback API for the Expressways local agent backbone. Every operation forwards the caller's bearer capability to the broker."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8790",
+      "description": "Default loopback gateway"
+    }
+  ],
+  "security": [
+    {
+      "expresswaysCapability": []
+    }
+  ],
+  "paths": {
+    "/v1/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Get authenticated broker health",
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonControlResponse" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/topics/{topic}/messages": {
+      "parameters": [
+        { "$ref": "#/components/parameters/Topic" }
+      ],
+      "post": {
+        "operationId": "publishTopicMessage",
+        "summary": "Publish a topic message",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PublishRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonControlResponse" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "operationId": "consumeTopicMessages",
+        "summary": "Consume a bounded topic batch",
+        "parameters": [
+          { "$ref": "#/components/parameters/Offset" },
+          { "$ref": "#/components/parameters/Limit" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonControlResponse" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/topics/{topic}/events": {
+      "get": {
+        "operationId": "streamTopicEvents",
+        "summary": "Stream resumable topic messages over SSE",
+        "parameters": [
+          { "$ref": "#/components/parameters/Topic" },
+          { "$ref": "#/components/parameters/OptionalOffset" },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/WaitTimeout" },
+          { "$ref": "#/components/parameters/LastEventId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE message, keepalive, and terminal error events",
+            "content": {
+              "text/event-stream": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/tasks": {
+      "post": {
+        "operationId": "submitTask",
+        "summary": "Publish a task work item",
+        "parameters": [
+          { "$ref": "#/components/parameters/ClassificationHeader" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TaskWorkItem" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonControlResponse" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/agents": {
+      "get": {
+        "operationId": "listAgents",
+        "summary": "List matching agent cards",
+        "parameters": [
+          { "$ref": "#/components/parameters/Skill" },
+          { "$ref": "#/components/parameters/AgentTopic" },
+          { "$ref": "#/components/parameters/Principal" },
+          { "$ref": "#/components/parameters/IncludeStale" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonControlResponse" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "operationId": "registerAgent",
+        "summary": "Register or replace an agent card owned by the caller",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AgentRegistration" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonControlResponse" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/agents/events": {
+      "get": {
+        "operationId": "streamAgentEvents",
+        "summary": "Stream resumable discovery-registry events over SSE",
+        "parameters": [
+          { "$ref": "#/components/parameters/Skill" },
+          { "$ref": "#/components/parameters/AgentTopic" },
+          { "$ref": "#/components/parameters/Principal" },
+          { "$ref": "#/components/parameters/IncludeStale" },
+          { "$ref": "#/components/parameters/Cursor" },
+          { "$ref": "#/components/parameters/MaxEvents" },
+          { "$ref": "#/components/parameters/WaitTimeout" },
+          { "$ref": "#/components/parameters/LastEventId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE registry_event, cursor, keepalive, and terminal error events",
+            "content": {
+              "text/event-stream": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "410": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}/heartbeat": {
+      "post": {
+        "operationId": "heartbeatAgent",
+        "summary": "Refresh an agent card's liveness",
+        "parameters": [
+          { "$ref": "#/components/parameters/AgentId" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonControlResponse" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/agents/{agent_id}": {
+      "delete": {
+        "operationId": "removeAgent",
+        "summary": "Remove an agent card subject to ownership policy",
+        "parameters": [
+          { "$ref": "#/components/parameters/AgentId" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonControlResponse" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/artifacts": {
+      "post": {
+        "operationId": "putArtifact",
+        "summary": "Upload a raw binary artifact",
+        "parameters": [
+          { "$ref": "#/components/parameters/ArtifactIdHeader" },
+          { "$ref": "#/components/parameters/Sha256Header" },
+          { "$ref": "#/components/parameters/ClassificationHeader" },
+          { "$ref": "#/components/parameters/RetentionHeader" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": { "type": "string", "format": "binary" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/JsonControlResponse" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/artifacts/{artifact_id}": {
+      "get": {
+        "operationId": "getArtifact",
+        "summary": "Download raw artifact bytes with integrity headers",
+        "parameters": [
+          { "$ref": "#/components/parameters/ArtifactId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Raw artifact bytes",
+            "headers": {
+              "X-Artifact-Id": { "schema": { "type": "string" } },
+              "X-Content-Sha256": { "schema": { "$ref": "#/components/schemas/Sha256" } },
+              "X-Classification": { "schema": { "$ref": "#/components/schemas/Classification" } },
+              "X-Retention-Class": { "schema": { "$ref": "#/components/schemas/RetentionClass" } }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": { "type": "string", "format": "binary" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "expresswaysCapability": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "Expressways signed capability"
+      }
+    },
+    "parameters": {
+      "Topic": { "name": "topic", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 512 } },
+      "ArtifactId": { "name": "artifact_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 512 } },
+      "AgentId": { "name": "agent_id", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 512 } },
+      "Offset": { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0, "default": 0 } },
+      "OptionalOffset": { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+      "Limit": { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 100 } },
+      "Cursor": { "name": "cursor", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+      "MaxEvents": { "name": "max_events", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 } },
+      "WaitTimeout": { "name": "wait_timeout_ms", "in": "query", "schema": { "type": "integer", "minimum": 1000, "maximum": 25000, "default": 25000 } },
+      "Skill": { "name": "skill", "in": "query", "schema": { "type": "string" } },
+      "AgentTopic": { "name": "topic", "in": "query", "schema": { "type": "string" } },
+      "Principal": { "name": "principal", "in": "query", "schema": { "type": "string" } },
+      "IncludeStale": { "name": "include_stale", "in": "query", "schema": { "type": "boolean", "default": false } },
+      "LastEventId": { "name": "Last-Event-ID", "in": "header", "schema": { "type": "string" } },
+      "ArtifactIdHeader": { "name": "X-Artifact-Id", "in": "header", "schema": { "type": "string" } },
+      "Sha256Header": { "name": "X-Content-Sha256", "in": "header", "schema": { "$ref": "#/components/schemas/Sha256" } },
+      "ClassificationHeader": { "name": "X-Classification", "in": "header", "schema": { "$ref": "#/components/schemas/Classification" } },
+      "RetentionHeader": { "name": "X-Retention-Class", "in": "header", "schema": { "$ref": "#/components/schemas/RetentionClass" } }
+    },
+    "responses": {
+      "JsonControlResponse": {
+        "description": "Tagged broker response",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ControlResponse" }
+          }
+        }
+      },
+      "Error": {
+        "description": "Gateway or broker error",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorEnvelope" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Classification": { "type": "string", "enum": ["public", "internal", "confidential", "restricted"] },
+      "RetentionClass": { "type": "string", "enum": ["ephemeral", "operational", "regulated"] },
+      "Sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+      "PublishRequest": {
+        "type": "object",
+        "required": ["payload"],
+        "additionalProperties": false,
+        "properties": {
+          "payload": {},
+          "classification": { "$ref": "#/components/schemas/Classification" }
+        }
+      },
+      "TaskRequirements": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "skill": { "type": ["string", "null"] },
+          "topic": { "type": ["string", "null"] },
+          "principal": { "type": ["string", "null"] },
+          "preferred_agents": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "avoid_agents": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "required_agent": { "type": ["string", "null"] },
+          "affinity_key": { "type": ["string", "null"] }
+        }
+      },
+      "TaskRetryPolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "max_attempts": { "type": "integer", "minimum": 1, "default": 3 },
+          "timeout_seconds": { "type": "integer", "minimum": 1, "default": 300 },
+          "retry_delay_seconds": { "type": "integer", "minimum": 0, "default": 5 }
+        }
+      },
+      "TaskWorkItem": {
+        "type": "object",
+        "required": ["task_id", "task_type", "payload", "submitted_at"],
+        "additionalProperties": false,
+        "properties": {
+          "task_id": { "type": "string" },
+          "task_type": { "type": "string" },
+          "priority": { "type": "integer", "default": 0 },
+          "requirements": { "$ref": "#/components/schemas/TaskRequirements" },
+          "payload": { "description": "JSON value or an Expressways typed payload envelope" },
+          "retry_policy": { "$ref": "#/components/schemas/TaskRetryPolicy" },
+          "submitted_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "AgentEndpoint": {
+        "type": "object",
+        "required": ["transport", "address"],
+        "additionalProperties": false,
+        "properties": {
+          "transport": { "type": "string" },
+          "address": { "type": "string" }
+        }
+      },
+      "AgentSchemaRef": {
+        "type": "object",
+        "required": ["name", "version"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "version": { "type": "string" }
+        }
+      },
+      "AgentRegistration": {
+        "type": "object",
+        "required": ["agent_id", "display_name", "version", "summary", "endpoint"],
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": { "type": "string" },
+          "display_name": { "type": "string" },
+          "version": { "type": "string" },
+          "summary": { "type": "string" },
+          "skills": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "subscriptions": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "publications": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "schemas": { "type": "array", "items": { "$ref": "#/components/schemas/AgentSchemaRef" }, "default": [] },
+          "endpoint": { "$ref": "#/components/schemas/AgentEndpoint" },
+          "classification": { "$ref": "#/components/schemas/Classification" },
+          "retention_class": { "$ref": "#/components/schemas/RetentionClass" },
+          "ttl_seconds": { "type": ["integer", "null"], "minimum": 1 }
+        }
+      },
+      "ControlResponse": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": ["error"],
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "additionalProperties": false,
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

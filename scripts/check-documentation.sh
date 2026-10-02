@@ -39,4 +39,8 @@ if git grep -n -I -E 'docs/main\.md|docs/plans/' -- '*.md'; then
   status=1
 fi
 
+if ! bash scripts/check-openapi.sh; then
+  status=1
+fi
+
 exit "$status"

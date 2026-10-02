@@ -4,6 +4,8 @@
 
 `expressways-http-gateway` gives local harnesses and applications a supported HTTP/JSON interface without moving authentication, authorization, quota, or audit decisions out of the broker. Every request must carry an Expressways capability as an HTTP bearer token. The gateway forwards that same capability with the broker operation.
 
+The machine-readable contract is [OpenAPI 3.1](schemas/expressways-http-v1.openapi.json). CI validates its structure and unique operation IDs, and the live conformance suite exercises the documented authentication, topic, task, artifact, discovery, SSE, and restart behavior.
+
 The gateway binds to `127.0.0.1:8790` by default and refuses non-loopback listeners. It does not implement TLS or a separate user/session system. For remote access, place an explicitly reviewed authenticated TLS proxy in front rather than exposing the process directly.
 
 ## Run
@@ -20,6 +22,12 @@ Equivalent command:
 cargo run -p expressways-http-gateway -- \
   --listen 127.0.0.1:8790 \
   --broker-address 127.0.0.1:7766
+```
+
+Run the isolated live contract and restart checks with:
+
+```bash
+make test-http-conformance
 ```
 
 The default JSON body limit is 1 MiB. Raw artifact uploads have a separate 64 MiB limit. Both can be reduced with command-line options and cannot be raised above 64 MiB. Broker operations time out after 30 seconds by default (five-minute ceiling), and at most 128 are allowed concurrently (4,096 ceiling), preventing stalled local clients or broker connections from creating unbounded work.
