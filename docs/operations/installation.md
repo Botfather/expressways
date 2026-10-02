@@ -93,8 +93,18 @@ On Windows PowerShell:
 
 The registration points at this exact extracted bundle. Moving it manually
 leaves the native startup definition pointing at the old path.
-Uninstalling the startup definition stops the stack but deliberately preserves
-configuration, audit records, credentials, and runtime data.
+The registered process supervises the complete stack: it repairs an exited
+child, checks broker health with the packaged CLI and local capability, and
+performs an ordered restart after three consecutive failures. The native
+service manager restarts the supervisor itself after an unexpected exit.
+`SUPERVISOR_INTERVAL_SECONDS` (default `5`), `HEALTH_FAILURE_THRESHOLD`
+(default `3`), and `HEALTH_CHECK_ENABLED` (default `true`) control this
+behavior when set in the registered service environment. Disabling health
+checks still repairs exited processes but removes detection of a wedged broker.
+
+Uninstalling first disables the startup definition, then stops the supervisor
+and child processes, while deliberately preserving configuration, audit
+records, credentials, and runtime data.
 
 ## Transactional Bundle Upgrades
 

@@ -641,7 +641,9 @@ make generate-admin-token
 ```
 
 Packaged bundles can register the standard stack for automatic, least-privilege
-per-user startup after credentials are generated:
+per-user startup after credentials are generated. The native service runs a
+supervisor that repairs an exited child and restarts the ordered stack after
+three consecutive authenticated broker-health failures:
 
 ```bash
 scripts/install-user-service.sh install   # macOS LaunchAgent or Linux systemd user unit
@@ -651,7 +653,10 @@ scripts/install-user-service.sh install   # macOS LaunchAgent or Linux systemd u
 .\scripts\install-user-service.ps1 install  # Windows logon task
 ```
 
-Both uninstallers stop the managed stack and preserve `var/` deliberately.
+Both uninstallers stop the supervisor and managed stack and preserve `var/`
+deliberately. Set `SUPERVISOR_INTERVAL_SECONDS`, `HEALTH_FAILURE_THRESHOLD`,
+or `HEALTH_CHECK_ENABLED=false` in the service environment only when the
+defaults need deliberate operator tuning.
 See [installation](docs/operations/installation.md) for status and removal
 commands.
 

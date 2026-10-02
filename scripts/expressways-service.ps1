@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("start", "stop", "restart", "status", "start-all", "stop-all", "restart-all", "status-all")]
+    [ValidateSet("start", "stop", "restart", "status", "start-all", "stop-all", "restart-all", "status-all", "supervise")]
     [string]$Action,
 
     [Parameter(Position = 1)]
@@ -19,6 +19,9 @@ $ConfigPath = if ($env:CONFIG_PATH) { $env:CONFIG_PATH } else { Join-Path $Root 
 $BrokerAddress = if ($env:BROKER_ADDRESS) { $env:BROKER_ADDRESS } else { "127.0.0.1:7766" }
 $HttpListen = if ($env:HTTP_LISTEN) { $env:HTTP_LISTEN } else { "127.0.0.1:8790" }
 $TokenFile = if ($env:TOKEN_FILE) { $env:TOKEN_FILE } else { Join-Path $Root "var\auth\developer.token" }
+$SupervisorIntervalSeconds = if ($env:SUPERVISOR_INTERVAL_SECONDS) { [double]$env:SUPERVISOR_INTERVAL_SECONDS } else { 5 }
+$HealthFailureThreshold = if ($env:HEALTH_FAILURE_THRESHOLD) { [int]$env:HEALTH_FAILURE_THRESHOLD } else { 3 }
+$HealthCheckEnabled = $env:HEALTH_CHECK_ENABLED -ne "false"
 $Services = @("expressways-server", "expressways-http-gateway", "expressways-orchestrator", "nanobot-runtime")
 
 New-Item -ItemType Directory -Force -Path $PidDir, $LogDir | Out-Null
@@ -102,8 +105,49 @@ function Invoke-One([string]$Verb, [string]$Name) {
     }
 }
 
+function Test-BrokerHealth {
+    if (-not $HealthCheckEnabled) { return $true }
+    if (-not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) { return $false }
+    $Ctl = Join-Path $Root "bin\expresswaysctl.exe"
+    if (-not (Test-Path -LiteralPath $Ctl -PathType Leaf)) { return $false }
+    & $Ctl --transport tcp --address $BrokerAddress health --token-file $TokenFile *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+function Start-Supervisor {
+    foreach ($Name in $Services) { Start-ManagedService $Name }
+    $HealthFailures = 0
+    try {
+        while ($true) {
+            foreach ($Name in $Services) {
+                if (-not (Get-ManagedProcess $Name)) {
+                    Write-Warning "Supervisor detected stopped service $Name; recovering it."
+                    Start-ManagedService $Name
+                }
+            }
+            if (Test-BrokerHealth) {
+                $HealthFailures = 0
+            } else {
+                $HealthFailures++
+                Write-Warning "Supervisor broker health failure $HealthFailures/$HealthFailureThreshold."
+                if ($HealthFailures -ge $HealthFailureThreshold) {
+                    Write-Warning "Supervisor restarting the stack after sustained broker health failure."
+                    foreach ($Name in @($Services[3], $Services[2], $Services[1], $Services[0])) { Stop-ManagedService $Name }
+                    foreach ($Name in $Services) { Start-ManagedService $Name }
+                    $HealthFailures = 0
+                }
+            }
+            Start-Sleep -Seconds $SupervisorIntervalSeconds
+        }
+    } finally {
+        foreach ($Name in @($Services[3], $Services[2], $Services[1], $Services[0])) { Stop-ManagedService $Name }
+    }
+}
+
 $StatusFailures = 0
-if ($Action.EndsWith("-all")) {
+if ($Action -eq "supervise") {
+    Start-Supervisor
+} elseif ($Action.EndsWith("-all")) {
     $Verb = $Action.Substring(0, $Action.Length - 4)
     $Ordered = if ($Verb -eq "stop") { @($Services[3], $Services[2], $Services[1], $Services[0]) } else { $Services }
     foreach ($Name in $Ordered) { Invoke-One $Verb $Name }

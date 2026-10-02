@@ -58,10 +58,12 @@ render_macos() {
   <array>
     <string>/bin/bash</string>
     <string>${escaped_script}</string>
-    <string>start-all</string>
+    <string>supervise</string>
   </array>
   <key>WorkingDirectory</key><string>${escaped_root}</string>
   <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${escaped_root}/var/agent/service-control/launch-agent.log</string>
   <key>StandardErrorPath</key><string>${escaped_root}/var/agent/service-control/launch-agent.err.log</string>
@@ -82,11 +84,12 @@ Description=Expressways local agent backbone
 After=network.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 WorkingDirectory="${escaped_root}"
-ExecStart=/bin/bash "${escaped_script}" start-all
+ExecStart=/bin/bash "${escaped_script}" supervise
 ExecStop=/bin/bash "${escaped_script}" stop-all
+Restart=on-failure
+RestartSec=5
 TimeoutStartSec=90
 TimeoutStopSec=90
 
@@ -134,12 +137,12 @@ case "$ACTION" in
     ;;
   uninstall)
     OUTPUT="$(default_path)"
-    "$SERVICE_SCRIPT" stop-all || true
     if [[ "$PLATFORM" == "macos" ]]; then
       launchctl bootout "gui/$(id -u)/dev.expressways.backbone" >/dev/null 2>&1 || true
     else
       systemctl --user disable --now expressways-backbone.service >/dev/null 2>&1 || true
     fi
+    "$SERVICE_SCRIPT" stop-all || true
     rm -f "$OUTPUT"
     if [[ "$PLATFORM" == "linux" ]]; then systemctl --user daemon-reload; fi
     echo "Removed Expressways per-user startup service. Runtime data was preserved."

@@ -13,6 +13,9 @@ CONFIG_PATH="${CONFIG_PATH:-./configs/expressways.example.toml}"
 BROKER_ADDRESS="${BROKER_ADDRESS:-127.0.0.1:7766}"
 HTTP_LISTEN="${HTTP_LISTEN:-127.0.0.1:8790}"
 TOKEN_FILE="${TOKEN_FILE:-./var/auth/developer.token}"
+SUPERVISOR_INTERVAL_SECONDS="${SUPERVISOR_INTERVAL_SECONDS:-5}"
+HEALTH_FAILURE_THRESHOLD="${HEALTH_FAILURE_THRESHOLD:-3}"
+HEALTH_CHECK_ENABLED="${HEALTH_CHECK_ENABLED:-true}"
 mkdir -p "$PID_DIR" "$LOG_DIR"
 
 SERVICES=(expressways-server expressways-http-gateway expressways-orchestrator nanobot-runtime)
@@ -253,6 +256,57 @@ restart_service() {
   start_service "$service"
 }
 
+broker_healthy() {
+  [[ "$HEALTH_CHECK_ENABLED" == "true" ]] || return 0
+  [[ -f "$TOKEN_FILE" ]] || return 1
+  if [[ -x "$ROOT_DIR/bin/expresswaysctl" ]]; then
+    "$ROOT_DIR/bin/expresswaysctl" --transport tcp --address "$BROKER_ADDRESS" \
+      health --token-file "$TOKEN_FILE" >/dev/null 2>&1
+  else
+    cargo run -q -p expressways-client --bin expresswaysctl -- \
+      --transport tcp --address "$BROKER_ADDRESS" health --token-file "$TOKEN_FILE" \
+      >/dev/null 2>&1
+  fi
+}
+
+supervise_services() {
+  local stopping="false"
+  supervisor_shutdown() {
+    [[ "$stopping" == "true" ]] && return
+    stopping="true"
+    trap - INT TERM EXIT
+    run_all stop || true
+    exit 0
+  }
+  trap supervisor_shutdown INT TERM EXIT
+
+  run_all start
+  local health_failures=0
+  while true; do
+    local service
+    for service in "${SERVICES[@]}"; do
+      if ! is_running "$service"; then
+        echo "Supervisor detected stopped service $service; recovering it."
+        start_service "$service"
+      fi
+    done
+
+    if broker_healthy; then
+      health_failures=0
+    else
+      health_failures=$((health_failures + 1))
+      echo "Supervisor broker health failure $health_failures/$HEALTH_FAILURE_THRESHOLD."
+      if (( health_failures >= HEALTH_FAILURE_THRESHOLD )); then
+        echo "Supervisor restarting the stack after sustained broker health failure."
+        run_all stop || true
+        run_all start
+        health_failures=0
+      fi
+    fi
+    sleep "$SUPERVISOR_INTERVAL_SECONDS"
+  done
+}
+
 run_all() {
   local action="$1"
   local failures=0
@@ -282,6 +336,9 @@ case "$ACTION" in
   status-all)
     run_all status
     ;;
+  supervise)
+    supervise_services
+    ;;
   start)
     start_service "$SERVICE"
     ;;
@@ -297,6 +354,7 @@ case "$ACTION" in
   *)
     echo "Usage: scripts/expressways-service.sh <start|stop|restart|status> <expressways-server|expressways-http-gateway|expressways-orchestrator|nanobot-runtime>"
     echo "       scripts/expressways-service.sh <start-all|stop-all|restart-all|status-all>"
+    echo "       scripts/expressways-service.sh supervise"
     exit 1
     ;;
 esac

@@ -108,7 +108,13 @@ jobs:
       - name: Render Native Per-user Service Definition (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/install-user-service.ps1 render "$env:RUNNER_TEMP\expressways.xml"
+        run: |
+          $definition = "$env:RUNNER_TEMP\expressways.xml"
+          ./scripts/install-user-service.ps1 render $definition
+          $xml = Get-Content -LiteralPath $definition -Raw
+          if ($xml -notmatch 'supervise') { throw 'Windows service definition does not run the supervisor' }
+          if ($xml -notmatch '<RestartOnFailure>') { throw 'Windows service definition does not restart the supervisor' }
+          if ($xml -notmatch '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>') { throw 'Windows supervisor has a finite task execution limit' }
 
       - name: Test Native Bundle Upgrade Transaction (Windows)
         if: runner.os == 'Windows'
