@@ -1,0 +1,52 @@
+[workspace]
+members = [
+  "apps/expressways-console/src-tauri",
+  "crates/expressways-adopter-api",
+  "crates/expressways-adopter-audit-integrity",
+  "crates/expressways-adopter-registry-guard",
+  "crates/expressways-adopter-storage-guard",
+  "crates/expressways-audit",
+  "crates/expressways-auth",
+  "crates/expressways-bench",
+  "crates/expressways-client",
+  "crates/expressways-interop-bridge-example",
+  "crates/expressways-nanobot-system",
+  "crates/expressways-orchestrator",
+  "crates/expressways-policy",
+  "crates/expressways-protocol",
+  "crates/expressways-server",
+  "crates/expressways-storage",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Expressways contributors"]
+edition = "2024"
+homepage = "https://github.com/Botfather/expressways"
+license = "MIT"
+publish = false
+repository = "https://github.com/Botfather/expressways"
+rust-version = "1.93"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+base64 = "0.22.1"
+bincode = { version = "2.0.1", features = ["serde"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.53", features = ["derive"] }
+ed25519-dalek = "2.2.0"
+futures-util = { version = "0.3.31", features = ["sink"] }
+hex = "0.4.3"
+libc = "0.2.183"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.17", features = ["codec"] }
+toml = "0.9.8"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.18.1", features = ["serde", "v7"] }

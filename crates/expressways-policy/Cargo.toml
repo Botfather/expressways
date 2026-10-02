@@ -1,0 +1,16 @@
+[package]
+name = "expressways-policy"
+authors.workspace = true
+description = "Default-deny server-side authorization policy engine for Expressways"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+expressways-protocol = { path = "../expressways-protocol" }
+serde.workspace = true
+thiserror.workspace = true

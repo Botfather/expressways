@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Expressways Ollama Demo</title>
+    <style>
+      :root {
+        --bg: #f5f7f4;
+        --card: #ffffff;
+        --ink: #1e2a21;
+        --muted: #5a6a5d;
+        --accent: #0d8a5f;
+        --accent-soft: #d7f4e8;
+        --border: #d8e2d9;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 15% 10%, #e4f3ea 0%, rgba(228, 243, 234, 0) 45%),
+          radial-gradient(circle at 88% 90%, #f6ead8 0%, rgba(246, 234, 216, 0) 40%),
+          var(--bg);
+      }
+
+      .wrap {
+        width: min(920px, 92vw);
+        margin: 3rem auto;
+        display: grid;
+        gap: 1rem;
+      }
+
+      .panel {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        box-shadow: 0 16px 40px rgba(16, 34, 24, 0.08);
+        overflow: hidden;
+      }
+
+      .hero {
+        padding: 1.2rem 1.25rem;
+        background: linear-gradient(120deg, #e7f5ed, #fcf7eb);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .hero h1 {
+        margin: 0;
+        font-family: "IBM Plex Serif", "Georgia", serif;
+        font-size: clamp(1.4rem, 3vw, 2rem);
+      }
+
+      .hero p {
+        margin: 0.5rem 0 0;
+        color: var(--muted);
+      }
+
+      form {
+        display: grid;
+        gap: 0.9rem;
+        padding: 1rem 1.25rem 1.2rem;
+      }
+
+      .row {
+        display: grid;
+        gap: 0.75rem;
+        grid-template-columns: 1fr;
+      }
+
+      @media (min-width: 760px) {
+        .row {
+          grid-template-columns: 1fr 220px;
+        }
+      }
+
+      label {
+        display: grid;
+        gap: 0.35rem;
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+
+      textarea,
+      input {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        font: inherit;
+        color: var(--ink);
+        background: #fff;
+        padding: 0.75rem 0.8rem;
+      }
+
+      textarea {
+        min-height: 140px;
+        resize: vertical;
+      }
+
+      button {
+        justify-self: start;
+        border: 0;
+        border-radius: 999px;
+        background: var(--accent);
+        color: #fff;
+        font: inherit;
+        padding: 0.65rem 1rem;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      .status {
+        padding: 0.85rem 1.25rem;
+        border-top: 1px solid var(--border);
+        background: #f8fbf8;
+        color: var(--muted);
+      }
+
+      .logs {
+        padding: 1rem 1.25rem 1.25rem;
+        display: grid;
+        gap: 0.8rem;
+      }
+
+      .event,
+      .answer {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 0.75rem 0.85rem;
+        background: #fff;
+      }
+
+      .answer {
+        background: var(--accent-soft);
+        border-color: #b6e7d2;
+      }
+
+      .event pre,
+      .answer pre {
+        margin: 0.4rem 0 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+        font-size: 0.86rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      <section class="panel">
+        <header class="hero">
+          <h1>Expressways + Ollama Browser Demo</h1>
+          <p>Submit a prompt to /chat and stream task + result events from /events/:taskId.</p>
+        </header>
+
+        <form id="chat-form">
+          <div class="row">
+            <label>
+              Prompt
+              <textarea id="prompt" placeholder="Ask something..." required></textarea>
+            </label>
+            <label>
+              Model
+              <input id="model" value="llama3.2" />
+            </label>
+          </div>
+          <button id="submit" type="submit">Send Prompt</button>
+        </form>
+
+        <div id="status" class="status">Idle</div>
+        <div id="logs" class="logs"></div>
+      </section>
+    </main>
+
+    <script>
+      const form = document.getElementById('chat-form')
+      const promptInput = document.getElementById('prompt')
+      const modelInput = document.getElementById('model')
+      const submitButton = document.getElementById('submit')
+      const statusEl = document.getElementById('status')
+      const logsEl = document.getElementById('logs')
+
+      let source = null
+
+      function pushBlock(kind, title, payload) {
+        const block = document.createElement('article')
+        block.className = kind
+        const heading = document.createElement('strong')
+        heading.textContent = title
+        const pre = document.createElement('pre')
+        pre.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2)
+        block.appendChild(heading)
+        block.appendChild(pre)
+        logsEl.prepend(block)
+      }
+
+      function setStatus(message) {
+        statusEl.textContent = message
+      }
+
+      async function submitPrompt(prompt, model) {
+        const response = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ prompt, model }),
+        })
+
+        if (!response.ok) {
+          const body = await response.text()
+          throw new Error(`submit failed (${response.status}): ${body}`)
+        }
+
+        return response.json()
+      }
+
+      function connectEvents(taskId) {
+        if (source) {
+          source.close()
+        }
+
+        source = new EventSource(`/events/${encodeURIComponent(taskId)}`)
+
+        source.addEventListener('ready', (event) => {
+          setStatus(`Connected for task ${taskId}`)
+          pushBlock('event', 'ready', JSON.parse(event.data))
+        })
+
+        source.addEventListener('task_event', (event) => {
+          const payload = JSON.parse(event.data)
+          const status = payload?.event?.status || 'unknown'
+          setStatus(`Task ${taskId}: ${status}`)
+          pushBlock('event', `task_event (${status})`, payload)
+        })
+
+        source.addEventListener('result', (event) => {
+          const payload = JSON.parse(event.data)
+          const resultText = payload?.result?.response || payload?.artifact?.response || '(no response body)'
+          pushBlock('answer', 'result', resultText)
+          pushBlock('event', 'result_payload', payload)
+        })
+
+        source.addEventListener('end', (event) => {
+          const payload = JSON.parse(event.data)
+          setStatus(`Task ${taskId} ended with status ${payload.status}`)
+          pushBlock('event', 'end', payload)
+          source.close()
+          source = null
+          submitButton.disabled = false
+        })
+
+        source.addEventListener('error', (event) => {
+          setStatus(`Stream error for task ${taskId}`)
+          pushBlock('event', 'error', event.data ? JSON.parse(event.data) : { message: 'stream error' })
+          if (source) {
+            source.close()
+            source = null
+          }
+          submitButton.disabled = false
+        })
+      }
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault()
+        const prompt = promptInput.value.trim()
+        const model = modelInput.value.trim()
+
+        if (!prompt) {
+          setStatus('Prompt is required')
+          return
+        }
+
+        submitButton.disabled = true
+        setStatus('Submitting task...')
+
+        try {
+          const submission = await submitPrompt(prompt, model)
+          pushBlock('event', 'submitted', submission)
+          setStatus(`Task ${submission.taskId} submitted`)
+          connectEvents(submission.taskId)
+        } catch (error) {
+          setStatus(error.message)
+          pushBlock('event', 'submit_error', { message: error.message })
+          submitButton.disabled = false
+        }
+      })
+    </script>
+  </body>
+</html>

@@ -1,0 +1,288 @@
+[schema]
+version = 1
+
+[server]
+node_name = "dev-node"
+transport = "tcp"
+listen_addr = "127.0.0.1:7766"
+socket_path = "./tmp/expressways.sock"
+data_dir = "./var/data"
+log_level = "info"
+max_connections = 256
+max_frame_bytes = 8388608
+connection_idle_timeout_ms = 30000
+
+[storage]
+segment_max_bytes = 1048576
+retention_class = "operational"
+default_classification = "internal"
+ephemeral_retention_bytes = 4194304
+operational_retention_bytes = 16777216
+regulated_retention_bytes = 67108864
+max_total_bytes = 134217728
+reclaim_target_bytes = 117440512
+
+[audit]
+path = "./var/audit/audit.jsonl"
+
+[resilience]
+allow_degraded_startup = true
+allow_degraded_runtime = true
+audit_retry_attempts = 3
+audit_retry_backoff_ms = 50
+listener_retry_delay_ms = 250
+
+[adopters]
+# These ids must match adopter packages compiled into the current server binary.
+# If you build the server with a subset of adopter features, update this list to match.
+enabled = ["audit_integrity", "storage_guard", "registry_guard"]
+probe_interval_seconds = 30
+require_installed = true
+
+[adopters.packages.audit_integrity]
+verify_chain = true
+precreate_file = true
+
+[adopters.packages.storage_guard]
+probe_filename = ".expressways-storage-guard"
+
+[adopters.packages.registry_guard]
+bootstrap_missing = true
+
+[registry]
+backend = "file"
+path = "./var/registry/agents.json"
+default_ttl_seconds = 300
+event_history_limit = 1024
+stream_send_timeout_ms = 1000
+stream_idle_keepalive_limit = 12
+
+[auth]
+audience = "expressways"
+revocation_path = "./var/auth/revocations.json"
+
+[[auth.issuers]]
+key_id = "dev"
+public_key_path = "./var/auth/issuer.public"
+status = "active"
+
+[[auth.principals]]
+id = "local:developer"
+kind = "developer"
+display_name = "Local Developer"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "operator"
+
+[[auth.principals]]
+id = "local:agent-orchestrator"
+kind = "agent"
+display_name = "Local Agent Orchestrator"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "agent"
+
+[[auth.principals]]
+id = "local:bridge-openclaw"
+kind = "service"
+display_name = "OpenClaw Bridge Ingress"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "bridge"
+
+[[auth.principals]]
+id = "local:bridge-zeroclaw"
+kind = "service"
+display_name = "ZeroClaw Bridge Runtime"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "bridge"
+
+[[auth.principals]]
+id = "local:bridge-egress"
+kind = "service"
+display_name = "Interop Reply Egress Bridge"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "bridge"
+
+[[auth.principals]]
+id = "local:nanobot-runtime"
+kind = "agent"
+display_name = "Nanobot Runtime"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "nanobot_runtime"
+
+[[auth.principals]]
+id = "local:nanobot-bridge"
+kind = "service"
+display_name = "Nanobot Channel Bridge"
+status = "active"
+allowed_key_ids = ["dev"]
+quota_profile = "nanobot_bridge"
+
+[quotas]
+
+[[quotas.profiles]]
+name = "operator"
+publish_payload_max_bytes = 16384
+publish_requests_per_window = 20
+publish_window_seconds = 1
+consume_max_limit = 100
+consume_requests_per_window = 20
+consume_window_seconds = 1
+backpressure_mode = "reject"
+backpressure_delay_ms = 0
+
+[[quotas.profiles]]
+name = "agent"
+publish_payload_max_bytes = 4096
+publish_requests_per_window = 10
+publish_window_seconds = 1
+consume_max_limit = 25
+consume_requests_per_window = 10
+consume_window_seconds = 1
+backpressure_mode = "delay"
+backpressure_delay_ms = 150
+
+[[quotas.profiles]]
+name = "bridge"
+publish_payload_max_bytes = 65536
+publish_requests_per_window = 50
+publish_window_seconds = 1
+consume_max_limit = 200
+consume_requests_per_window = 50
+consume_window_seconds = 1
+backpressure_mode = "delay"
+backpressure_delay_ms = 50
+
+[[quotas.profiles]]
+name = "nanobot_runtime"
+publish_payload_max_bytes = 65536
+publish_requests_per_window = 30
+publish_window_seconds = 1
+consume_max_limit = 100
+consume_requests_per_window = 30
+consume_window_seconds = 1
+backpressure_mode = "delay"
+backpressure_delay_ms = 50
+
+[[quotas.profiles]]
+name = "nanobot_bridge"
+publish_payload_max_bytes = 65536
+publish_requests_per_window = 60
+publish_window_seconds = 1
+consume_max_limit = 200
+consume_requests_per_window = 60
+consume_window_seconds = 1
+backpressure_mode = "delay"
+backpressure_delay_ms = 50
+
+[policy]
+default_decision = "deny"
+
+[[policy.rules]]
+principal = "local:developer"
+resource = "system:broker"
+actions = ["health", "admin"]
+
+[[policy.rules]]
+principal = "local:developer"
+resource = "topic:*"
+actions = ["publish", "consume", "admin"]
+
+[[policy.rules]]
+principal = "local:developer"
+resource = "artifact:*"
+actions = ["publish", "consume", "admin"]
+
+[[policy.rules]]
+principal = "local:developer"
+resource = "registry:agents*"
+actions = ["admin"]
+
+[[policy.rules]]
+principal = "local:agent-orchestrator"
+resource = "topic:task*"
+actions = ["publish", "consume", "admin"]
+
+[[policy.rules]]
+principal = "local:agent-orchestrator"
+resource = "registry:agents*"
+actions = ["admin"]
+
+[[policy.rules]]
+principal = "local:bridge-openclaw"
+resource = "topic:interop.chat.requests"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:bridge-openclaw"
+resource = "artifact:*"
+actions = ["publish", "consume"]
+
+[[policy.rules]]
+principal = "local:bridge-zeroclaw"
+resource = "topic:interop.chat*"
+actions = ["publish", "consume", "admin"]
+
+[[policy.rules]]
+principal = "local:bridge-zeroclaw"
+resource = "artifact:*"
+actions = ["publish", "consume"]
+
+[[policy.rules]]
+principal = "local:bridge-egress"
+resource = "topic:interop.chat.replies"
+actions = ["consume", "admin"]
+
+[[policy.rules]]
+principal = "local:bridge-egress"
+resource = "artifact:*"
+actions = ["consume"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "topic:nanobot.inbound"
+actions = ["consume", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "topic:nanobot.outbound"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "topic:nanobot.outbound.stream"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "topic:nanobot.runtime.events"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-runtime"
+resource = "registry:agents*"
+actions = ["admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-bridge"
+resource = "topic:nanobot.inbound"
+actions = ["publish", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-bridge"
+resource = "topic:nanobot.outbound"
+actions = ["consume", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-bridge"
+resource = "topic:nanobot.outbound.stream"
+actions = ["consume", "admin"]
+
+[[policy.rules]]
+principal = "local:nanobot-bridge"
+resource = "topic:nanobot.runtime.events"
+actions = ["consume", "admin"]

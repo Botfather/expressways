@@ -1,0 +1,17 @@
+[package]
+name = "expressways-adopter-storage-guard"
+authors.workspace = true
+description = "Storage-path guard adopter for Expressways"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+expressways-adopter-api = { path = "../expressways-adopter-api" }
+serde.workspace = true
+toml.workspace = true
+uuid.workspace = true

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title description">
+  <title id="title">Expressways logo</title>
+  <desc id="description">Three parallel lanes with a forward arrow.</desc>
+  <rect width="512" height="512" rx="112" fill="#14231a"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M120 160h272M120 256h184M120 352h272" stroke="#75d6a2" stroke-width="48"/>
+    <path d="m304 208 88 48-88 48" stroke="#f5c66f" stroke-width="40"/>
+  </g>
+</svg>

@@ -1,0 +1,341 @@
+export type TransportKind = 'tcp' | 'unix'
+
+export interface ConsoleSettings {
+  transport: TransportKind
+  address: string
+  socketPath: string
+  token: string
+}
+
+export interface HealthView {
+  node_name: string
+  status: string
+}
+
+export interface AuthStateView {
+  audience: string
+  issuers: Array<{ key_id: string; status: string }>
+  principals: Array<{
+    id: string
+    kind: string
+    display_name: string
+    status: string
+    allowed_key_ids: string[]
+    quota_profile: string
+  }>
+  revocations: {
+    revoked_tokens: string[]
+    revoked_principals: string[]
+    revoked_key_ids: string[]
+  }
+}
+
+export interface AdopterStatusView {
+  id: string
+  package: string
+  description: string
+  enabled: boolean
+  status: string
+  detail: string
+  capabilities: string[]
+  last_run_at: string | null
+}
+
+export interface BrokerMetricsView {
+  uptime_seconds: number
+  total_requests: number
+  health_requests: number
+  admin_requests: number
+  auth_failures: number
+  policy_denials: number
+  quota_denials: number
+  storage_failures: number
+  audit_failures: number
+  publish: {
+    requests: number
+    successes: number
+    failures: number
+    average_latency_ms: number
+    max_latency_ms: number
+  }
+  consume: {
+    requests: number
+    successes: number
+    failures: number
+    average_latency_ms: number
+    max_latency_ms: number
+  }
+  storage: {
+    topic_count: number
+    segment_count: number
+    total_bytes: number
+    reclaimed_segments: number
+    reclaimed_bytes: number
+    recovered_segments: number
+    truncated_bytes: number
+  }
+  audit: {
+    event_count: number
+    last_hash: string | null
+  }
+  streams: {
+    open_streams: number
+    opened_streams: number
+    closed_streams: number
+    keepalives_sent: number
+    event_frames_sent: number
+    events_delivered: number
+    delivery_failures: number
+    slow_consumer_drops: number
+    idle_timeouts: number
+    watch_stream: {
+      requests: number
+      successes: number
+      failures: number
+      average_latency_ms: number
+      max_latency_ms: number
+    }
+  }
+  resilience: {
+    service_mode: string
+    degraded_components: string[]
+  }
+}
+
+export interface AgentCardView {
+  agent_id: string
+  principal: string
+  display_name: string
+  version: string
+  summary: string
+  skills: string[]
+  subscriptions: string[]
+  publications: string[]
+  schemas: Array<{ name: string; version: string }>
+  endpoint: { transport: string; address: string }
+  classification: string
+  retention_class: string
+  ttl_seconds: number
+  updated_at: string
+  last_seen_at: string
+  expires_at: string
+}
+
+export interface MonitorSnapshot {
+  health: HealthView
+  metrics: BrokerMetricsView
+  adopters: AdopterStatusView[]
+  auth: AuthStateView
+  agents: AgentCardView[]
+  cursor: number
+}
+
+export interface MetricHistoryPoint {
+  timestamp: number
+  totalRequests: number
+  authFailures: number
+  publishLatencyMs: number
+  consumeLatencyMs: number
+}
+
+export interface RegistryEventView {
+  sequence: number
+  timestamp: string
+  kind: 'registered' | 'heartbeated' | 'removed' | 'cleaned_up'
+  card: AgentCardView
+}
+
+export interface RegistryStreamEventPayload {
+  kind: 'opened' | 'events' | 'keepalive' | 'closed' | 'error'
+  cursor: number | null
+  events: RegistryEventView[]
+  message: string | null
+}
+
+export interface StoredMessageView {
+  message_id: string
+  topic: string
+  offset: number
+  timestamp: string
+  producer: string
+  classification: string
+  payload: string
+}
+
+export interface TopicConsumeResult {
+  topic: string
+  messages: StoredMessageView[]
+  next_offset: number
+}
+
+export interface AdvancedControlExecuteResult {
+  commandType: string
+  guarded: boolean
+  responseType: string
+  response: unknown
+  attachmentBase64: string | null
+  attachmentBytes: number
+  executedAtMs: number
+}
+
+export type ConfigFormFieldKind =
+  | 'string'
+  | 'integer'
+  | 'float'
+  | 'boolean'
+  | 'string_array'
+
+export interface ConfigFormValidationView {
+  required: boolean
+  min: number | null
+  max: number | null
+  allowedValues: string[] | null
+}
+
+export interface ConfigFormFieldView {
+  key: string
+  label: string
+  kind: ConfigFormFieldKind
+  value: string | number | boolean | string[]
+  description: string | null
+  validation: ConfigFormValidationView | null
+}
+
+export interface ConfigTableArrayView {
+  key: string
+  label: string
+  description: string | null
+  entryFields: ConfigFormFieldView[]
+  entries: Array<Record<string, unknown>>
+}
+
+export interface ConfigSectionView {
+  key: string
+  kind: string
+  summary: string
+  formFields: ConfigFormFieldView[]
+  tableArrays: ConfigTableArrayView[]
+}
+
+export interface ConfigRestartHint {
+  serviceId: string | null
+  service: string
+  reason: string
+  command: string | null
+}
+
+export interface ConfigComponentView {
+  id: string
+  name: string
+  group: string
+  description: string
+  filePath: string
+  exists: boolean
+  editable: boolean
+  updatedAtMs: number | null
+  parseError: string | null
+  sections: ConfigSectionView[]
+  restartHints: ConfigRestartHint[]
+  content: string
+}
+
+export interface ConfigConsoleSnapshot {
+  rootPath: string
+  components: ConfigComponentView[]
+}
+
+export interface ConfigComponentUpdateResult {
+  component: ConfigComponentView
+  backupPath: string | null
+  appliedAtMs: number
+  restartHints: ConfigRestartHint[]
+}
+
+export interface ConfigBackupEntry {
+  backupPath: string
+  createdAtMs: number | null
+  sizeBytes: number
+}
+
+export interface ConfigBackupsResult {
+  componentId: string
+  backups: ConfigBackupEntry[]
+}
+
+export interface ConfigDiffSummaryView {
+  addedLines: number
+  removedLines: number
+  changedLines: number
+}
+
+export interface ConfigAuditEntryView {
+  entryId: string
+  recordedAtMs: number
+  actor: string
+  category: string
+  action: string
+  componentId: string | null
+  sectionKey: string | null
+  serviceId: string | null
+  commandType: string | null
+  success: boolean | null
+  statusCode: number | null
+  summary: string
+  diff: ConfigDiffSummaryView | null
+}
+
+export interface ConfigAuditEntriesResult {
+  entries: ConfigAuditEntryView[]
+}
+
+export interface ConfigComponentRollbackResult {
+  component: ConfigComponentView
+  rollbackSource: string
+  backupPath: string | null
+  appliedAtMs: number
+  restartHints: ConfigRestartHint[]
+}
+
+export interface ConfigRestartServiceOutcome {
+  serviceId: string
+  ok: boolean
+  statusCode: number | null
+  message: string
+  stdout: string
+  stderr: string
+}
+
+export interface ConfigRestartServicesResult {
+  restartedAtMs: number
+  outcomes: ConfigRestartServiceOutcome[]
+}
+
+export type ServiceControlAction = 'start' | 'stop' | 'restart' | 'status'
+
+export interface ServiceControlResult {
+  serviceId: string
+  action: ServiceControlAction
+  ok: boolean
+  statusCode: number | null
+  message: string
+  stdout: string
+  stderr: string
+  executedAtMs: number
+}
+
+export type OperatorAction =
+  | 'bootstrap_local'
+  | 'generate_admin_token'
+  | 'verify_first_run'
+  | 'export_support_bundle'
+
+export interface OperatorActionResult {
+  action: OperatorAction
+  target: string
+  ok: boolean
+  statusCode: number | null
+  message: string
+  stdout: string
+  stderr: string
+  executedAtMs: number
+}
