@@ -50,9 +50,10 @@ The repository currently provides:
 - a supported chat interoperability bridge with durable two-way delivery and binary artifact upload;
 - local operator surfaces through the CLI, dashboard, and desktop console.
 
-## Missing product surfaces
+## Verified product surfaces
 
-The full backbone vision is not complete until these surfaces are implemented and verified:
+The product boundary above is implemented through the following supported and
+continuously verified surfaces:
 
 ### HTTP gateway completion
 
