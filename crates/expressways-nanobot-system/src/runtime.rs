@@ -3,10 +3,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chrono::Utc;
-use expressways_client::{Client, Endpoint};
+use expressways_client::{
+    AgentWorker, AssignedTask, Client, Endpoint, TaskExecutionContext, WorkerRunOutcome,
+    load_agent_worker_state, save_agent_worker_state,
+};
 use expressways_protocol::{
-    AgentEndpoint, AgentRegistration, Classification, ControlCommand, ControlRequest,
-    ControlResponse, RetentionClass, TopicSpec,
+    AgentEndpoint, AgentRegistration, AgentSchemaRef, Classification, ControlCommand,
+    ControlRequest, ControlResponse, INTEROP_CHAT_HANDOFF_SCHEMA_VERSION,
+    INTEROP_CHAT_HANDOFF_TASK_TYPE, InteropChatHandoffV1, InteropChatMessage, InteropChatReplyV1,
+    RetentionClass, TopicSpec,
 };
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
@@ -14,8 +19,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::model::{
-    NanobotInboundEnvelope, NanobotMessageRef, NanobotOutboundEnvelope, NanobotRuntimeEvent,
-    NanobotStreamChunkEnvelope, SessionRole, SessionTurn,
+    NanobotAttachmentRef, NanobotInboundEnvelope, NanobotMessageRef, NanobotOutboundEnvelope,
+    NanobotRuntimeEvent, NanobotSessionRef, NanobotStreamChunkEnvelope, SYSTEM_SCHEMA_VERSION,
+    SessionRole, SessionTurn,
 };
 use crate::provider::{
     Provider, ProviderBackend, ProviderInvocationStats, ProviderRequest, ProviderStep,
@@ -208,6 +214,15 @@ pub struct RuntimeConfig {
     pub provider_circuit_cooldown: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct InteropWorkerConfig {
+    pub runtime: RuntimeConfig,
+    pub worker_state_path: PathBuf,
+    pub tasks_topic: String,
+    pub task_events_topic: String,
+    pub replies_topic: String,
+}
+
 pub async fn run_runtime(config: RuntimeConfig) -> anyhow::Result<()> {
     if config.ensure_topics {
         ensure_topic(
@@ -310,6 +325,7 @@ pub async fn run_runtime(config: RuntimeConfig) -> anyhow::Result<()> {
                 &tools,
                 &mut provider_runtime_state,
                 message.payload,
+                true,
             )
             .await
             {
@@ -342,6 +358,231 @@ pub async fn run_runtime(config: RuntimeConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs the Nanobot provider/tool loop as a durable orchestrated chat worker.
+/// The worker acknowledges a task only after the correlated reply is accepted
+/// by the broker, so a crash cannot silently lose an acknowledged response.
+pub async fn run_interop_worker(config: InteropWorkerConfig) -> anyhow::Result<()> {
+    if config.runtime.ensure_topics {
+        ensure_topic(
+            &config.runtime.endpoint,
+            &config.runtime.capability_token,
+            &config.replies_topic,
+            RetentionClass::Operational,
+            Classification::Internal,
+        )
+        .await?;
+        ensure_topic(
+            &config.runtime.endpoint,
+            &config.runtime.capability_token,
+            &config.runtime.runtime_events_topic,
+            RetentionClass::Operational,
+            Classification::Internal,
+        )
+        .await?;
+    }
+
+    let sessions = SessionStore::new(&config.runtime.session_dir)?;
+    let memory = MemoryStore::new(&config.runtime.memory_dir)?;
+    let tools = ToolRegistry;
+    let mut provider_runtime_state = ProviderRuntimeState::default();
+    let worker_state = load_agent_worker_state(&config.worker_state_path)?;
+
+    register_interop_agent(&config).await?;
+    let shutdown = CancellationToken::new();
+    let signal_handle = if config.runtime.once {
+        None
+    } else {
+        Some(tokio::spawn(wait_for_shutdown(shutdown.clone())))
+    };
+    let heartbeat_handle = tokio::spawn(run_heartbeat_loop(
+        config.runtime.endpoint.clone(),
+        config.runtime.capability_token.clone(),
+        config.runtime.agent_id.clone(),
+        shutdown.clone(),
+        config.runtime.heartbeat_interval,
+    ));
+    let mut worker = AgentWorker::new(
+        config.runtime.endpoint.clone(),
+        config.runtime.capability_token.clone(),
+        config.runtime.agent_id.clone(),
+    )
+    .with_topics(config.tasks_topic.clone(), config.task_events_topic.clone())
+    .with_batch_limit(config.runtime.batch_limit.max(1))
+    .with_state(worker_state);
+
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        let outcome = worker
+            .run_once_with_context(|assignment, context| {
+                process_interop_assignment(
+                    &config,
+                    &sessions,
+                    &memory,
+                    &tools,
+                    &mut provider_runtime_state,
+                    assignment,
+                    context,
+                )
+            })
+            .await;
+        save_agent_worker_state(&config.worker_state_path, worker.state())?;
+
+        match outcome {
+            Ok(WorkerRunOutcome::Idle) => {
+                if config.runtime.once {
+                    break;
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(config.runtime.poll_interval.max(Duration::from_millis(1))) => {}
+                }
+            }
+            Ok(other) => {
+                info!(outcome = ?other, "interop task iteration completed");
+                if config.runtime.once {
+                    break;
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "interop worker iteration failed");
+                if config.runtime.once {
+                    return Err(error.into());
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(config.runtime.poll_interval.max(Duration::from_millis(1))) => {}
+                }
+            }
+        }
+    }
+
+    shutdown.cancel();
+    await_task("heartbeat", heartbeat_handle).await;
+    if let Some(signal_handle) = signal_handle {
+        signal_handle.abort();
+        await_task("signal", signal_handle).await;
+    }
+    if let Err(error) = remove_agent(
+        &config.runtime.endpoint,
+        &config.runtime.capability_token,
+        &config.runtime.agent_id,
+    )
+    .await
+    {
+        warn!(error = %error, "failed to remove interop runtime registration");
+    }
+
+    Ok(())
+}
+
+async fn process_interop_assignment(
+    config: &InteropWorkerConfig,
+    sessions: &SessionStore,
+    memory: &MemoryStore,
+    tools: &ToolRegistry,
+    provider_runtime_state: &mut ProviderRuntimeState,
+    assignment: AssignedTask,
+    context: TaskExecutionContext,
+) -> Result<(), String> {
+    if assignment.task.task_type != INTEROP_CHAT_HANDOFF_TASK_TYPE {
+        return Err(format!(
+            "unsupported task_type `{}`",
+            assignment.task.task_type
+        ));
+    }
+    if context.is_cancelled() {
+        return Err("task was cancelled before provider execution".to_owned());
+    }
+    let handoff: InteropChatHandoffV1 = assignment
+        .decode_payload_json()
+        .map_err(|error| format!("invalid interop handoff payload: {error}"))?;
+    if handoff.schema_version != INTEROP_CHAT_HANDOFF_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported handoff schema_version `{}`",
+            handoff.schema_version
+        ));
+    }
+
+    let inbound = NanobotInboundEnvelope {
+        schema_version: SYSTEM_SCHEMA_VERSION.to_owned(),
+        source_runtime: handoff.source_runtime.clone(),
+        instance_id: config.runtime.instance_id.clone(),
+        session: NanobotSessionRef {
+            session_id: handoff.session.session_id.clone(),
+            channel: handoff.session.channel.clone(),
+            account_id: handoff.session.account_id.clone(),
+            sender_id: handoff.session.sender_id.clone(),
+            sender_display_name: handoff.session.sender_display_name.clone(),
+        },
+        message: NanobotMessageRef {
+            message_id: handoff.session.message_id.clone(),
+            role: Some("user".to_owned()),
+            text: handoff.message.text.clone(),
+            attachments: handoff
+                .message
+                .attachments
+                .iter()
+                .map(|attachment| NanobotAttachmentRef {
+                    name: attachment.name.clone(),
+                    content_type: attachment.content_type.clone(),
+                    artifact_id: Some(attachment.artifact_id.clone()),
+                    sha256: attachment.sha256.clone(),
+                    byte_length: attachment.byte_length,
+                })
+                .collect(),
+        },
+        metadata: serde_json::json!({
+            "correlation_id": handoff.correlation_id,
+            "interop_metadata": handoff.metadata,
+            "routing": handoff.routing,
+        }),
+        received_at: handoff.received_at,
+    };
+    let outbound = process_inbound_message(
+        &config.runtime,
+        sessions,
+        memory,
+        tools,
+        provider_runtime_state,
+        serde_json::to_string(&inbound).map_err(|error| error.to_string())?,
+        false,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if context.is_cancelled() {
+        return Err("task was cancelled before reply publication".to_owned());
+    }
+
+    let reply = InteropChatReplyV1 {
+        schema_version: expressways_protocol::INTEROP_CHAT_REPLY_SCHEMA_VERSION.to_owned(),
+        delivery_id: format!("interop-reply:{}", assignment.task.task_id),
+        correlation_id: handoff.correlation_id,
+        source_runtime: config.runtime.source_runtime.clone(),
+        target_runtime: handoff.source_runtime,
+        session: handoff.session,
+        in_reply_to_task_id: assignment.task.task_id,
+        message: InteropChatMessage {
+            text: outbound.message.text,
+            attachments: Vec::new(),
+        },
+        metadata: outbound.metadata,
+        created_at: Utc::now(),
+    };
+    publish_json(
+        &config.runtime.endpoint,
+        &config.runtime.capability_token,
+        &handoff.reply_topic,
+        Classification::Internal,
+        &reply,
+    )
+    .await
+    .map_err(|error| format!("failed to publish correlated interop reply: {error}"))?;
+    Ok(())
+}
+
 async fn process_inbound_message(
     config: &RuntimeConfig,
     sessions: &SessionStore,
@@ -349,7 +590,8 @@ async fn process_inbound_message(
     tools: &ToolRegistry,
     provider_runtime_state: &mut ProviderRuntimeState,
     payload: String,
-) -> anyhow::Result<()> {
+    publish_nanobot_outbound: bool,
+) -> anyhow::Result<NanobotOutboundEnvelope> {
     let envelope = serde_json::from_str::<NanobotInboundEnvelope>(&payload)
         .context("failed to parse nanobot inbound payload")?
         .normalized();
@@ -594,15 +836,17 @@ async fn process_inbound_message(
         generated_at: Utc::now(),
     };
 
-    publish_json(
-        &config.endpoint,
-        &config.capability_token,
-        &config.outbound_topic,
-        Classification::Internal,
-        &outbound,
-    )
-    .await
-    .map_err(anyhow::Error::msg)?;
+    if publish_nanobot_outbound {
+        publish_json(
+            &config.endpoint,
+            &config.capability_token,
+            &config.outbound_topic,
+            Classification::Internal,
+            &outbound,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    }
 
     emit_runtime_event(
         config,
@@ -616,7 +860,7 @@ async fn process_inbound_message(
     )
     .await?;
 
-    Ok(())
+    Ok(outbound)
 }
 
 fn provider_identity(provider: &ProviderBackend) -> Option<(&'static str, &str, &str)> {
@@ -1141,6 +1385,60 @@ async fn register_agent(config: &RuntimeConfig) -> anyhow::Result<()> {
             anyhow::bail!("agent registration failed: {code}: {message}")
         }
         other => anyhow::bail!("unexpected response during registration: {other:?}"),
+    }
+}
+
+async fn register_interop_agent(config: &InteropWorkerConfig) -> anyhow::Result<()> {
+    let runtime = &config.runtime;
+    let mut client = Client::connect(runtime.endpoint.clone()).await?;
+    let response = client
+        .send(ControlRequest {
+            capability_token: runtime.capability_token.clone(),
+            command: ControlCommand::RegisterAgent {
+                registration: AgentRegistration {
+                    agent_id: runtime.agent_id.clone(),
+                    display_name: runtime.display_name.clone(),
+                    version: runtime.version.clone(),
+                    summary: runtime.summary.clone(),
+                    skills: vec![
+                        "interop-chat".to_owned(),
+                        "nanobot-chat".to_owned(),
+                        "nanobot-tools".to_owned(),
+                        "nanobot-memory".to_owned(),
+                    ],
+                    subscriptions: vec![config.tasks_topic.clone()],
+                    publications: vec![
+                        config.replies_topic.clone(),
+                        runtime.runtime_events_topic.clone(),
+                    ],
+                    schemas: vec![
+                        AgentSchemaRef {
+                            name: "interop.chat.handoff".to_owned(),
+                            version: INTEROP_CHAT_HANDOFF_SCHEMA_VERSION.to_owned(),
+                        },
+                        AgentSchemaRef {
+                            name: "interop.chat.reply".to_owned(),
+                            version: expressways_protocol::INTEROP_CHAT_REPLY_SCHEMA_VERSION
+                                .to_owned(),
+                        },
+                    ],
+                    endpoint: AgentEndpoint {
+                        transport: runtime.endpoint_transport.clone(),
+                        address: runtime.endpoint_address.clone(),
+                    },
+                    classification: runtime.classification.clone(),
+                    retention_class: runtime.retention_class.clone(),
+                    ttl_seconds: Some(runtime.ttl_seconds.max(30)),
+                },
+            },
+        })
+        .await?;
+    match response {
+        ControlResponse::AgentRegistered { .. } => Ok(()),
+        ControlResponse::Error { code, message } => {
+            anyhow::bail!("interop agent registration failed: {code}: {message}")
+        }
+        other => anyhow::bail!("unexpected interop registration response: {other:?}"),
     }
 }
 

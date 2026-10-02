@@ -265,6 +265,43 @@ pub struct InteropChatMessage {
     pub attachments: Vec<InteropChatAttachmentRef>,
 }
 
+/// Optional channel-to-agent routing hints carried by an interop handoff.
+/// `agent_id` is enforced as a hard pin by the orchestrator; the remaining
+/// fields are advisory context for runtimes and adapters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct InteropChatRouting {
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub skill_hint: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub affinity_key: Option<String>,
+}
+
+/// Versioned task payload submitted by a supported chat adapter. Keeping this
+/// contract in the shared protocol crate prevents bridges and agent runtimes
+/// from silently drifting apart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InteropChatHandoffV1 {
+    pub schema_version: String,
+    pub correlation_id: String,
+    pub reply_topic: String,
+    pub source_runtime: String,
+    #[serde(default)]
+    pub target_runtime: Option<String>,
+    pub session: InteropChatSession,
+    pub message: InteropChatMessage,
+    #[serde(default)]
+    pub routing: Option<InteropChatRouting>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub received_at: DateTime<Utc>,
+}
+
 /// Final reply written to `interop.chat.replies`. Delivery receivers must
 /// deduplicate `delivery_id`; bridge delivery is at least once.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1249,6 +1286,50 @@ mod tests {
         );
         assert_eq!(artifact_ref_json["artifact_id"], "artifact-1");
         assert_eq!(artifact_ref.content_type(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn interop_handoff_contract_round_trips_artifact_refs_and_routing() {
+        let received_at = Utc::now();
+        let handoff = InteropChatHandoffV1 {
+            schema_version: INTEROP_CHAT_HANDOFF_SCHEMA_VERSION.to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            reply_topic: INTEROP_CHAT_REPLIES_TOPIC.to_owned(),
+            source_runtime: "pigeon".to_owned(),
+            target_runtime: Some("nanobot".to_owned()),
+            session: InteropChatSession {
+                session_id: "chat-1".to_owned(),
+                channel: "whatsapp".to_owned(),
+                account_id: "acct-1".to_owned(),
+                sender_id: "user-1".to_owned(),
+                sender_display_name: None,
+                message_id: Some("msg-1".to_owned()),
+                reply_to_message_id: None,
+            },
+            message: InteropChatMessage {
+                text: Some("inspect this".to_owned()),
+                attachments: vec![InteropChatAttachmentRef {
+                    name: Some("clip.mp4".to_owned()),
+                    content_type: Some("video/mp4".to_owned()),
+                    artifact_id: "artifact-1".to_owned(),
+                    sha256: Some("abc123".to_owned()),
+                    byte_length: Some(2_000_000),
+                }],
+            },
+            routing: Some(InteropChatRouting {
+                agent_id: Some("nanobot".to_owned()),
+                affinity_key: Some("whatsapp:chat-1".to_owned()),
+                ..InteropChatRouting::default()
+            }),
+            metadata: serde_json::json!({ "tenant": "local" }),
+            received_at,
+        };
+
+        let encoded = serde_json::to_vec(&handoff).expect("serialize handoff");
+        let decoded: InteropChatHandoffV1 =
+            serde_json::from_slice(&encoded).expect("deserialize handoff");
+        assert_eq!(decoded, handoff);
+        assert_eq!(decoded.message.attachments[0].byte_length, Some(2_000_000));
     }
 
     #[test]

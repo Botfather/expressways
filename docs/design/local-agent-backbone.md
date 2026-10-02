@@ -44,6 +44,9 @@ The repository currently provides:
 - a Rust client, CLI, worker helper, sample agents, and Ollama integration;
 - an authenticated loopback HTTP gateway for health, topic I/O, task submission, discovery, and artifact transfer;
 - a Nanobot-style runtime with OpenAI and Anthropic providers, tool execution, state, and streaming;
+- an orchestrated Nanobot interop mode that consumes versioned chat handoffs,
+  preserves session affinity, and durably publishes correlated replies before
+  acknowledging work;
 - a supported chat interoperability bridge with durable two-way delivery and binary artifact upload;
 - local operator surfaces through the CLI, dashboard, and desktop console.
 

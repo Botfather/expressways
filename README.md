@@ -923,6 +923,16 @@ Run the runtime:
 cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --ensure-topics true --workspace-root "$(pwd)" --allow-exec-program git --allow-exec-program ls
 ```
 
+To run the same provider, memory, and tool loop as an orchestrated chat agent,
+add `--interop-worker`. The runtime consumes durable `interop.chat.handoff`
+assignments and publishes versioned, correlated replies only before reporting
+the assignment complete. The task ID determines a stable delivery ID, so a
+bridge can safely deduplicate retries after a crash:
+
+```bash
+OPENAI_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-interop --state-dir ./var/agent/nanobot-interop --interop-worker --provider openai --provider-model gpt-4o-mini --workspace-root "$(pwd)" --allow-exec-program git
+```
+
 Nanobot file access and process execution are default-deny: at least one canonical `--workspace-root` is required for `read_file`, and `exec` accepts only exact program names supplied with `--allow-exec-program`. An empty executable allowlist disables `exec`. Subprocesses receive only a minimal `PATH`/locale environment, output capture is capped at 1 MiB per stream, and timed-out processes are terminated instead of continuing in the background.
 
 Run the runtime with native OpenAI provider:

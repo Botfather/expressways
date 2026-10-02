@@ -13,11 +13,10 @@ use expressways_protocol::{
     Classification, ControlCommand, ControlRequest, ControlResponse,
     INTEROP_CHAT_HANDOFF_SCHEMA_VERSION, INTEROP_CHAT_HANDOFF_TASK_TYPE,
     INTEROP_CHAT_REPLIES_TOPIC, INTEROP_CHAT_REPLY_SCHEMA_VERSION, INTEROP_CHAT_REQUESTS_TOPIC,
-    InteropChatReplyV1, RetentionClass, TaskPayload, TaskRequirements, TaskRetryPolicy,
-    TaskWorkItem, TopicSpec,
+    InteropChatAttachmentRef, InteropChatHandoffV1, InteropChatMessage, InteropChatReplyV1,
+    InteropChatRouting, InteropChatSession, RetentionClass, TaskPayload, TaskRequirements,
+    TaskRetryPolicy, TaskWorkItem, TopicSpec,
 };
-#[cfg(test)]
-use expressways_protocol::{InteropChatMessage, InteropChatSession};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -248,35 +247,6 @@ struct IncomingRouting {
     labels: Vec<String>,
     #[serde(default)]
     affinity_key: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct HandoffPayload {
-    schema_version: String,
-    correlation_id: String,
-    reply_topic: String,
-    source_runtime: String,
-    target_runtime: Option<String>,
-    session: IncomingSession,
-    message: HandoffMessage,
-    routing: Option<IncomingRouting>,
-    metadata: serde_json::Value,
-    received_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-struct HandoffMessage {
-    text: Option<String>,
-    attachments: Vec<HandoffAttachmentRef>,
-}
-
-#[derive(Debug, Serialize)]
-struct HandoffAttachmentRef {
-    name: Option<String>,
-    content_type: Option<String>,
-    artifact_id: String,
-    sha256: Option<String>,
-    byte_length: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -691,18 +661,32 @@ async fn submit_webhook(
         .and_then(|routing| routing.affinity_key.clone())
         .or_else(|| Some(session_affinity_key(&webhook.session)));
 
-    let payload = HandoffPayload {
+    let payload = InteropChatHandoffV1 {
         schema_version: INTEROP_CHAT_HANDOFF_SCHEMA_VERSION.to_owned(),
         correlation_id: correlation_id.clone(),
         reply_topic: runtime.replies_topic.clone(),
         source_runtime: webhook.source_runtime,
         target_runtime: webhook.target_runtime,
-        session: webhook.session,
-        message: HandoffMessage {
+        session: InteropChatSession {
+            session_id: webhook.session.session_id,
+            channel: webhook.session.channel,
+            account_id: webhook.session.account_id,
+            sender_id: webhook.session.sender_id,
+            sender_display_name: webhook.session.sender_display_name,
+            message_id: webhook.session.message_id,
+            reply_to_message_id: webhook.session.reply_to_message_id,
+        },
+        message: InteropChatMessage {
             text: webhook.message.text,
             attachments,
         },
-        routing,
+        routing: routing.map(|routing| InteropChatRouting {
+            agent_id: routing.agent_id,
+            workspace: routing.workspace,
+            skill_hint: routing.skill_hint,
+            labels: routing.labels,
+            affinity_key: routing.affinity_key,
+        }),
         metadata,
         received_at,
     };
@@ -1344,13 +1328,13 @@ async fn materialize_attachments(
     attachments: &[IncomingAttachment],
     classification: Classification,
     retention_class: RetentionClass,
-) -> Result<(Vec<HandoffAttachmentRef>, Vec<String>), HttpError> {
+) -> Result<(Vec<InteropChatAttachmentRef>, Vec<String>), HttpError> {
     let mut refs = Vec::with_capacity(attachments.len());
     let mut uploaded = Vec::new();
 
     for attachment in attachments {
         if let Some(artifact_id) = attachment.artifact_id.clone() {
-            refs.push(HandoffAttachmentRef {
+            refs.push(InteropChatAttachmentRef {
                 name: attachment.name.clone(),
                 content_type: attachment.content_type.clone(),
                 artifact_id,
@@ -1404,7 +1388,7 @@ async fn materialize_attachments(
         match response {
             ControlResponse::ArtifactStored { artifact } => {
                 uploaded.push(artifact.artifact_id.clone());
-                refs.push(HandoffAttachmentRef {
+                refs.push(InteropChatAttachmentRef {
                     name: attachment.name.clone(),
                     content_type: Some(content_type),
                     artifact_id: artifact.artifact_id,

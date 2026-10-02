@@ -16,10 +16,13 @@ use expressways_nanobot_system::model::{
 use expressways_nanobot_system::provider::{
     AnthropicConfig, OpenAiConfig, ProviderBackend, ProviderRetryConfig,
 };
-use expressways_nanobot_system::runtime::{RuntimeConfig, run_runtime};
+use expressways_nanobot_system::runtime::{
+    InteropWorkerConfig, RuntimeConfig, run_interop_worker, run_runtime,
+};
 use expressways_nanobot_system::tools::publish_json;
 use expressways_protocol::{
-    Classification, ControlCommand, ControlRequest, ControlResponse, RetentionClass,
+    Classification, ControlCommand, ControlRequest, ControlResponse, INTEROP_CHAT_REPLIES_TOPIC,
+    INTEROP_CHAT_REQUESTS_TOPIC, RetentionClass, TASK_EVENTS_TOPIC,
 };
 use reqwest::Client as HttpClient;
 use serde::Serialize;
@@ -114,6 +117,16 @@ enum Command {
         outbound_stream_topic: String,
         #[arg(long, default_value = DEFAULT_RUNTIME_EVENTS_TOPIC)]
         runtime_events_topic: String,
+        /// Consume orchestrated interop.chat.handoff tasks and publish
+        /// correlated interop.chat.reply.v1 responses.
+        #[arg(long, default_value_t = false)]
+        interop_worker: bool,
+        #[arg(long, default_value = INTEROP_CHAT_REQUESTS_TOPIC)]
+        tasks_topic: String,
+        #[arg(long, default_value = TASK_EVENTS_TOPIC)]
+        task_events_topic: String,
+        #[arg(long, default_value = INTEROP_CHAT_REPLIES_TOPIC)]
+        replies_topic: String,
         #[arg(long, default_value_t = 50)]
         batch_limit: usize,
         #[arg(long, default_value_t = 500)]
@@ -314,6 +327,10 @@ async fn main() -> anyhow::Result<()> {
             outbound_topic,
             outbound_stream_topic,
             runtime_events_topic,
+            interop_worker,
+            tasks_topic,
+            task_events_topic,
+            replies_topic,
             batch_limit,
             poll_interval_ms,
             heartbeat_interval_seconds,
@@ -525,7 +542,8 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
-            run_runtime(RuntimeConfig {
+            let worker_state_path = state_dir.join("interop-worker-state.json");
+            let runtime = RuntimeConfig {
                 endpoint,
                 capability_token,
                 agent_id,
@@ -564,8 +582,19 @@ async fn main() -> anyhow::Result<()> {
                 provider_circuit_cooldown: Duration::from_secs(
                     provider_circuit_cooldown_seconds.max(1),
                 ),
-            })
-            .await
+            };
+            if interop_worker {
+                run_interop_worker(InteropWorkerConfig {
+                    runtime,
+                    worker_state_path,
+                    tasks_topic,
+                    task_events_topic,
+                    replies_topic,
+                })
+                .await
+            } else {
+                run_runtime(runtime).await
+            }
         }
         Command::Ingest {
             token,
