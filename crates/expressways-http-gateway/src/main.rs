@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,6 +10,7 @@ use axum::body::{Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -15,13 +18,14 @@ use clap::Parser;
 use expressways_client::{Client, Endpoint, normalize_capability_token};
 use expressways_protocol::{
     AgentQuery, Classification, ControlCommand, ControlRequest, ControlResponse, RetentionClass,
-    TASKS_TOPIC, TaskWorkItem,
+    StoredMessage, TASKS_TOPIC, TaskWorkItem,
 };
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -30,7 +34,10 @@ const DEFAULT_JSON_LIMIT: usize = 1024 * 1024;
 const DEFAULT_ARTIFACT_LIMIT: usize = 64 * 1024 * 1024;
 const MAX_CONSUME_LIMIT: usize = 10_000;
 const MAX_CONCURRENT_REQUESTS: usize = 4096;
+const MAX_CONCURRENT_STREAMS: usize = 1024;
 const MAX_REQUEST_TIMEOUT_MS: u64 = 300_000;
+const MIN_STREAM_WAIT_TIMEOUT_MS: u64 = 1_000;
+const MAX_STREAM_WAIT_TIMEOUT_MS: u64 = 25_000;
 
 #[derive(Debug, Parser)]
 #[command(about = "Authenticated loopback HTTP gateway for Expressways")]
@@ -45,7 +52,9 @@ struct Cli {
     max_artifact_bytes: usize,
     #[arg(long, default_value_t = 128)]
     max_concurrent_requests: usize,
-    #[arg(long, default_value_t = 15_000)]
+    #[arg(long, default_value_t = 64)]
+    max_concurrent_streams: usize,
+    #[arg(long, default_value_t = 30_000)]
     request_timeout_ms: u64,
 }
 
@@ -55,6 +64,7 @@ struct AppState {
     max_artifact_bytes: usize,
     request_timeout: Duration,
     request_slots: Arc<Semaphore>,
+    stream_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +82,28 @@ struct ConsumeQuery {
     offset: u64,
     #[serde(default = "default_consume_limit")]
     limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopicEventsQuery {
+    offset: Option<u64>,
+    #[serde(default = "default_consume_limit")]
+    limit: usize,
+    #[serde(default = "default_stream_wait_timeout_ms")]
+    wait_timeout_ms: u64,
+}
+
+struct TopicStreamState {
+    app: AppState,
+    token: String,
+    topic: String,
+    offset: u64,
+    limit: usize,
+    wait_timeout_ms: u64,
+    pending: VecDeque<StoredMessage>,
+    terminal: bool,
+    _permit: OwnedSemaphorePermit,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,11 +176,13 @@ async fn main() -> anyhow::Result<()> {
         max_artifact_bytes: cli.max_artifact_bytes,
         request_timeout: Duration::from_millis(cli.request_timeout_ms),
         request_slots: Arc::new(Semaphore::new(cli.max_concurrent_requests)),
+        stream_slots: Arc::new(Semaphore::new(cli.max_concurrent_streams)),
     };
     let artifact_limit = cli.max_artifact_bytes;
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/topics/{topic}/messages", post(publish).get(consume))
+        .route("/v1/topics/{topic}/events", get(stream_topic))
         .route("/v1/tasks", post(submit_task))
         .route("/v1/agents", get(list_agents))
         .route(
@@ -184,6 +218,9 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
     }
     if cli.max_concurrent_requests == 0 || cli.max_concurrent_requests > MAX_CONCURRENT_REQUESTS {
         bail!("max_concurrent_requests must be between 1 and {MAX_CONCURRENT_REQUESTS}");
+    }
+    if cli.max_concurrent_streams == 0 || cli.max_concurrent_streams > MAX_CONCURRENT_STREAMS {
+        bail!("max_concurrent_streams must be between 1 and {MAX_CONCURRENT_STREAMS}");
     }
     if cli.request_timeout_ms == 0 || cli.request_timeout_ms > MAX_REQUEST_TIMEOUT_MS {
         bail!("request_timeout_ms must be between 1 and {MAX_REQUEST_TIMEOUT_MS}");
@@ -230,12 +267,7 @@ async fn consume(
     headers: HeaderMap,
 ) -> Result<Json<ControlResponse>, GatewayError> {
     validate_path_identifier("topic", &topic)?;
-    if query.limit == 0 || query.limit > MAX_CONSUME_LIMIT {
-        return Err(GatewayError::bad_request(
-            "invalid_limit",
-            format!("limit must be between 1 and {MAX_CONSUME_LIMIT}"),
-        ));
-    }
+    validate_consume_limit(query.limit)?;
     proxy_json(
         &state,
         &headers,
@@ -246,6 +278,193 @@ async fn consume(
         },
     )
     .await
+}
+
+async fn stream_topic(
+    State(state): State<AppState>,
+    Path(topic): Path<String>,
+    Query(query): Query<TopicEventsQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, GatewayError> {
+    validate_path_identifier("topic", &topic)?;
+    validate_consume_limit(query.limit)?;
+    if !(MIN_STREAM_WAIT_TIMEOUT_MS..=MAX_STREAM_WAIT_TIMEOUT_MS).contains(&query.wait_timeout_ms) {
+        return Err(GatewayError::bad_request(
+            "invalid_wait_timeout",
+            format!(
+                "wait_timeout_ms must be between {MIN_STREAM_WAIT_TIMEOUT_MS} and {MAX_STREAM_WAIT_TIMEOUT_MS}"
+            ),
+        ));
+    }
+    let offset = resolve_stream_offset(query.offset, &headers)?;
+    let token = bearer_token(&headers)?;
+    let permit = state
+        .stream_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            GatewayError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream_capacity_exceeded",
+                "the HTTP gateway has reached its concurrent event stream limit",
+            )
+        })?;
+
+    // Authenticate, authorize, and seed the stream before sending HTTP 200.
+    let (response, attachment) = send(
+        &state,
+        token.clone(),
+        ControlCommand::Consume {
+            topic: topic.clone(),
+            offset,
+            limit: query.limit,
+        },
+        None,
+    )
+    .await?;
+    if attachment.is_some() {
+        return Err(upstream_protocol_error(
+            "unexpected broker response attachment",
+        ));
+    }
+    let (messages, next_offset) = extract_messages(response, &topic)?;
+    let stream_state = TopicStreamState {
+        app: state,
+        token,
+        topic,
+        offset: next_offset,
+        limit: query.limit,
+        wait_timeout_ms: query.wait_timeout_ms,
+        pending: messages.into(),
+        terminal: false,
+        _permit: permit,
+    };
+    let stream = futures_util::stream::unfold(stream_state, next_topic_event);
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
+}
+
+async fn next_topic_event(
+    mut stream: TopicStreamState,
+) -> Option<(Result<Event, Infallible>, TopicStreamState)> {
+    if stream.terminal {
+        return None;
+    }
+    loop {
+        if let Some(message) = stream.pending.pop_front() {
+            let event = match serde_json::to_string(&message) {
+                Ok(data) => Event::default()
+                    .event("message")
+                    .id(message.offset.to_string())
+                    .data(data),
+                Err(error) => {
+                    stream.terminal = true;
+                    sse_error_event("serialization_failed", &error.to_string())
+                }
+            };
+            return Some((Ok(event), stream));
+        }
+
+        let result = send(
+            &stream.app,
+            stream.token.clone(),
+            ControlCommand::WatchTopic {
+                topic: stream.topic.clone(),
+                offset: stream.offset,
+                limit: stream.limit,
+                wait_timeout_ms: stream.wait_timeout_ms,
+            },
+            None,
+        )
+        .await;
+        match result {
+            Ok((response, None)) => match extract_messages(response, &stream.topic) {
+                Ok((messages, next_offset)) => {
+                    stream.offset = next_offset;
+                    stream.pending.extend(messages);
+                }
+                Err(error) => {
+                    stream.terminal = true;
+                    let event = sse_error_event(&error.code, &error.message);
+                    return Some((Ok(event), stream));
+                }
+            },
+            Ok((_, Some(_))) => {
+                stream.terminal = true;
+                let event = sse_error_event(
+                    "broker_protocol_error",
+                    "unexpected broker response attachment",
+                );
+                return Some((Ok(event), stream));
+            }
+            Err(error) => {
+                stream.terminal = true;
+                let event = sse_error_event(&error.code, &error.message);
+                return Some((Ok(event), stream));
+            }
+        }
+    }
+}
+
+fn extract_messages(
+    response: ControlResponse,
+    expected_topic: &str,
+) -> Result<(Vec<StoredMessage>, u64), GatewayError> {
+    match response {
+        ControlResponse::Messages {
+            topic,
+            messages,
+            next_offset,
+        } if topic == expected_topic => Ok((messages, next_offset)),
+        ControlResponse::Messages { .. } => Err(upstream_protocol_error(
+            "broker returned messages for an unexpected topic",
+        )),
+        ControlResponse::Error { code, message } => Err(broker_error(code, message)),
+        _ => Err(upstream_protocol_error(
+            "broker returned an unexpected consume response",
+        )),
+    }
+}
+
+fn resolve_stream_offset(
+    requested_offset: Option<u64>,
+    headers: &HeaderMap,
+) -> Result<u64, GatewayError> {
+    if let Some(offset) = requested_offset {
+        return Ok(offset);
+    }
+    let Some(last_event_id) = unique_optional_header(headers, "last-event-id")? else {
+        return Ok(0);
+    };
+    let last_offset = last_event_id.parse::<u64>().map_err(|_| {
+        GatewayError::bad_request(
+            "invalid_last_event_id",
+            "Last-Event-ID must be an unsigned topic offset",
+        )
+    })?;
+    last_offset.checked_add(1).ok_or_else(|| {
+        GatewayError::bad_request(
+            "invalid_last_event_id",
+            "Last-Event-ID cannot advance beyond the offset range",
+        )
+    })
+}
+
+fn sse_error_event(code: &str, message: &str) -> Event {
+    let data = serde_json::to_string(&GatewayErrorBody {
+        error: GatewayErrorDetail {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        },
+    })
+    .unwrap_or_else(|_| {
+        "{\"error\":{\"code\":\"serialization_failed\",\"message\":\"failed to encode stream error\"}}"
+            .to_owned()
+    });
+    Event::default().event("error").data(data)
 }
 
 async fn submit_task(
@@ -560,6 +779,16 @@ fn validate_path_identifier(label: &str, value: &str) -> Result<(), GatewayError
     Ok(())
 }
 
+fn validate_consume_limit(limit: usize) -> Result<(), GatewayError> {
+    if limit == 0 || limit > MAX_CONSUME_LIMIT {
+        return Err(GatewayError::bad_request(
+            "invalid_limit",
+            format!("limit must be between 1 and {MAX_CONSUME_LIMIT}"),
+        ));
+    }
+    Ok(())
+}
+
 fn insert_header(
     headers: &mut HeaderMap,
     name: HeaderName,
@@ -604,6 +833,10 @@ async fn security_headers(request: Request, next: Next) -> Response {
 
 fn default_consume_limit() -> usize {
     100
+}
+
+fn default_stream_wait_timeout_ms() -> u64 {
+    25_000
 }
 
 async fn shutdown_signal() {
@@ -685,7 +918,8 @@ mod tests {
             max_json_bytes: DEFAULT_JSON_LIMIT,
             max_artifact_bytes: DEFAULT_ARTIFACT_LIMIT,
             max_concurrent_requests: 128,
-            request_timeout_ms: 15_000,
+            max_concurrent_streams: 64,
+            request_timeout_ms: 30_000,
         };
         assert!(validate_cli(&cli).is_err());
     }
@@ -721,6 +955,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stream_resume_prefers_explicit_offset_and_advances_last_event_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", HeaderValue::from_static("41"));
+        assert_eq!(resolve_stream_offset(None, &headers).expect("resume"), 42);
+        assert_eq!(
+            resolve_stream_offset(Some(7), &headers).expect("explicit offset"),
+            7
+        );
+        headers.insert("last-event-id", HeaderValue::from_static("invalid"));
+        assert!(resolve_stream_offset(None, &headers).is_err());
+    }
+
+    #[test]
+    fn stream_rejects_mismatched_broker_topics() {
+        let error = extract_messages(
+            ControlResponse::Messages {
+                topic: "other".to_owned(),
+                messages: Vec::new(),
+                next_offset: 0,
+            },
+            "expected",
+        )
+        .expect_err("topic mismatch");
+        assert_eq!(error.code, "broker_protocol_error");
+    }
+
     #[tokio::test]
     async fn health_forwards_the_callers_capability_to_the_broker() {
         let (broker, observed) = fake_broker(ControlResponse::Health {
@@ -732,6 +993,7 @@ mod tests {
             max_artifact_bytes: DEFAULT_ARTIFACT_LIMIT,
             request_timeout: Duration::from_secs(1),
             request_slots: Arc::new(Semaphore::new(1)),
+            stream_slots: Arc::new(Semaphore::new(1)),
         };
         let response = health(State(state), bearer_headers())
             .await
@@ -758,6 +1020,7 @@ mod tests {
             max_artifact_bytes: DEFAULT_ARTIFACT_LIMIT,
             request_timeout: Duration::from_millis(5),
             request_slots: Arc::new(Semaphore::new(1)),
+            stream_slots: Arc::new(Semaphore::new(1)),
         };
         let error = health(State(state), bearer_headers())
             .await
@@ -788,6 +1051,7 @@ mod tests {
             max_artifact_bytes: DEFAULT_ARTIFACT_LIMIT,
             request_timeout: Duration::from_secs(1),
             request_slots: Arc::new(Semaphore::new(1)),
+            stream_slots: Arc::new(Semaphore::new(1)),
         };
         let mut headers = bearer_headers();
         headers.insert(

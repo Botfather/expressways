@@ -23,6 +23,7 @@ Command and response tags use `snake_case`. Unknown or malformed commands fail c
 | `get_auth_state`, `get_metrics`, `get_adopters` | Operator visibility | `admin` on `system:broker` |
 | `create_topic` | Create a topic contract | `admin` on `topic:<name>` |
 | `publish`, `consume` | Append or read topic messages | `publish`/`consume` on `topic:<name>` |
+| `watch_topic` | Wait for a topic message with a bounded timeout | `consume` on `topic:<name>` |
 | `register_agent`, `heartbeat_agent`, `list_agents` | Discovery registry lifecycle | `admin` on `registry:agents*` |
 | `watch_agents`, `open_agent_watch_stream` | Paginated or streaming registry changes | `admin` on `registry:agents*` |
 | `cleanup_stale_agents`, `remove_agent` | Registry administration | `admin` on `registry:agents*` |
@@ -48,6 +49,7 @@ Clients must branch on `code`, not parse `message`. Error strings may gain diagn
 ## Cursors
 
 - A consume `next_offset` is immediately after the final returned message, or the requested offset for an empty result. It is not a topic high-water mark.
+- `watch_topic` uses the same cursor rule, authenticates and audits once per bounded wait, and returns an empty batch when its timeout expires.
 - A registry cursor advances through the last event examined and never skips matching events omitted by pagination.
 - `watch_cursor_expired` requires a fresh registry snapshot before streaming resumes.
 

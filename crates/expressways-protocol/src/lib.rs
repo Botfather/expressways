@@ -886,6 +886,15 @@ pub enum ControlCommand {
         offset: u64,
         limit: usize,
     },
+    /// Waits for at least one message at `offset`, or returns an empty batch
+    /// after the bounded timeout. Authorization, quota, and audit run once for
+    /// the complete wait rather than once per storage probe.
+    WatchTopic {
+        topic: String,
+        offset: u64,
+        limit: usize,
+        wait_timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

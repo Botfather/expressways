@@ -17,6 +17,7 @@ chrono.workspace = true
 clap.workspace = true
 expressways-client = { path = "../expressways-client" }
 expressways-protocol = { path = "../expressways-protocol" }
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

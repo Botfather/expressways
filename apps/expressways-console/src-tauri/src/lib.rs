@@ -3772,6 +3772,7 @@ fn command_name(command: &ControlCommand) -> &'static str {
         ControlCommand::StatArtifact { .. } => "stat_artifact",
         ControlCommand::Publish { .. } => "publish",
         ControlCommand::Consume { .. } => "consume",
+        ControlCommand::WatchTopic { .. } => "watch_topic",
     }
 }
 

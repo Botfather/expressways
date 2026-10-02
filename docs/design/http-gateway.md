@@ -22,7 +22,7 @@ cargo run -p expressways-http-gateway -- \
   --broker-address 127.0.0.1:7766
 ```
 
-The default JSON body limit is 1 MiB. Raw artifact uploads have a separate 64 MiB limit. Both can be reduced with command-line options and cannot be raised above 64 MiB. Broker operations time out after 15 seconds by default (five-minute ceiling), and at most 128 are allowed concurrently (4,096 ceiling), preventing stalled local clients or broker connections from creating unbounded work.
+The default JSON body limit is 1 MiB. Raw artifact uploads have a separate 64 MiB limit. Both can be reduced with command-line options and cannot be raised above 64 MiB. Broker operations time out after 30 seconds by default (five-minute ceiling), and at most 128 are allowed concurrently (4,096 ceiling), preventing stalled local clients or broker connections from creating unbounded work.
 
 ## Authentication
 
@@ -41,12 +41,21 @@ The capability must grant the action and resource used by the route, and the bro
 | `GET /v1/health` | `health` | `health` on `system:broker` |
 | `POST /v1/topics/{topic}/messages` | `publish` | `publish` on `topic:{topic}` |
 | `GET /v1/topics/{topic}/messages?offset=0&limit=100` | `consume` | `consume` on `topic:{topic}` |
+| `GET /v1/topics/{topic}/events?offset=0` | resumable SSE consume loop | `consume` on `topic:{topic}` |
 | `POST /v1/tasks` | `publish` to `tasks` | `publish` on `topic:tasks` |
 | `GET /v1/agents` | `list_agents` | `admin` on `registry:agents` |
 | `POST /v1/artifacts` | `put_artifact` | artifact publish scope |
 | `GET /v1/artifacts/{artifact_id}` | `get_artifact` | consume on that artifact |
 
 Agent query parameters are `skill`, `topic`, `principal`, and `include_stale`. Consume limits must be between 1 and 10,000; the broker may enforce a smaller principal-specific quota.
+
+## Stream topic events
+
+`GET /v1/topics/{topic}/events` returns `text/event-stream`. Each stored message is emitted as a `message` event whose JSON data is the complete `StoredMessage`; the SSE event ID is its topic offset. Clients can reconnect with `Last-Event-ID`, which resumes at the following offset, or pass an explicit `offset` query parameter. Explicit offsets take precedence.
+
+Optional parameters are `limit` (default `100`) and `wait_timeout_ms` (default `25000`, bounded from `1000` through `25000`). The gateway authenticates and authorizes an initial broker consume before returning HTTP 200. It then uses the broker's bounded `watch_topic` operation, sends SSE keepalives every 15 seconds, caps concurrent streams at 64 by default, and emits one terminal `error` event if broker delivery fails. Broker policy and consume quotas apply to every bounded wait.
+
+The broker performs storage probes inside one authenticated, quota-checked, audited long-poll operation. Empty probes do not create additional audit records or network requests.
 
 ## Publish
 

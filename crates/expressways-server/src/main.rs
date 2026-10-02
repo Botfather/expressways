@@ -1189,6 +1189,7 @@ async fn process_request_with_attachment(
         ControlCommand::Health => Action::Health,
         ControlCommand::Publish { .. } | ControlCommand::PutArtifact { .. } => Action::Publish,
         ControlCommand::Consume { .. }
+        | ControlCommand::WatchTopic { .. }
         | ControlCommand::GetArtifact { .. }
         | ControlCommand::StatArtifact { .. } => Action::Consume,
         ControlCommand::GetAuthState
@@ -1332,6 +1333,23 @@ async fn process_request_with_attachment(
             limit,
         } => (
             handle_consume(state, request.capability_token, topic, offset, limit).await,
+            None,
+        ),
+        ControlCommand::WatchTopic {
+            topic,
+            offset,
+            limit,
+            wait_timeout_ms,
+        } => (
+            handle_watch_topic(
+                state,
+                request.capability_token,
+                topic,
+                offset,
+                limit,
+                wait_timeout_ms,
+            )
+            .await,
             None,
         ),
     }
@@ -2520,6 +2538,36 @@ async fn handle_consume(
     offset: u64,
     limit: usize,
 ) -> ControlResponse {
+    handle_consume_with_wait(state, capability_token, topic, offset, limit, None).await
+}
+
+async fn handle_watch_topic(
+    state: &BrokerState,
+    capability_token: String,
+    topic: String,
+    offset: u64,
+    limit: usize,
+    wait_timeout_ms: u64,
+) -> ControlResponse {
+    handle_consume_with_wait(
+        state,
+        capability_token,
+        topic,
+        offset,
+        limit,
+        Some(Duration::from_millis(wait_timeout_ms)),
+    )
+    .await
+}
+
+async fn handle_consume_with_wait(
+    state: &BrokerState,
+    capability_token: String,
+    topic: String,
+    offset: u64,
+    limit: usize,
+    wait_timeout: Option<Duration>,
+) -> ControlResponse {
     let started_at = Instant::now();
     let resource = topic_resource(&topic);
     let identity = match authenticate_and_authorize(
@@ -2543,24 +2591,62 @@ async fn handle_consume(
         &identity,
         Action::Consume,
         &resource,
-        Some(format!("consume from {topic} starting at {offset}")),
+        Some(match wait_timeout {
+            Some(wait) => format!(
+                "watch {topic} from {offset} for up to {} ms",
+                wait.as_millis()
+            ),
+            None => format!("consume from {topic} starting at {offset}"),
+        }),
     )
     .await
     {
         return response;
     }
 
-    let topic_for_read = topic.clone();
+    const MAX_TOPIC_WAIT: Duration = Duration::from_secs(60);
+    if wait_timeout.is_some_and(|wait| wait.is_zero() || wait > MAX_TOPIC_WAIT) {
+        state
+            .metrics
+            .record_consume_result(false, started_at.elapsed());
+        let message = "wait_timeout_ms must be between 1 and 60000".to_owned();
+        let _ = finalize_failure(
+            state,
+            &identity,
+            Action::Consume,
+            &resource,
+            Some(message.clone()),
+        )
+        .await;
+        return ControlResponse::error("invalid_wait_timeout", message);
+    }
+
     let response_budget = state
         .max_frame_bytes
         .saturating_sub(topic.len().saturating_add(512));
-    let result = with_storage(state, move |storage| {
-        let messages =
-            storage.read_from_bounded(&topic_for_read, offset, limit, response_budget)?;
-        let next_offset = next_consume_offset(offset, &messages);
-        Ok((messages, next_offset))
-    })
-    .await;
+    let wait_started = Instant::now();
+    let result = loop {
+        let topic_for_read = topic.clone();
+        let read = with_storage(state, move |storage| {
+            let messages =
+                storage.read_from_bounded(&topic_for_read, offset, limit, response_budget)?;
+            let next_offset = next_consume_offset(offset, &messages);
+            Ok((messages, next_offset))
+        })
+        .await;
+        match read {
+            Ok((messages, next_offset))
+                if messages.is_empty()
+                    && wait_timeout.is_some_and(|wait| wait_started.elapsed() < wait) =>
+            {
+                let remaining = wait_timeout
+                    .unwrap_or_default()
+                    .saturating_sub(wait_started.elapsed());
+                tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+            }
+            result => break result,
+        }
+    };
 
     match result {
         Ok((messages, next_offset)) => {
@@ -4783,6 +4869,143 @@ mod tests {
         let audit = fs::read_to_string(&config.audit.path).expect("read audit");
         assert!(audit.contains("\"decision\":\"deny\""));
         assert!(audit.contains("quota_profile=agent"));
+    }
+
+    #[tokio::test]
+    async fn topic_watch_waits_without_reauditing_storage_probes() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "topic:*".to_owned(),
+                actions: vec![Action::Admin, Action::Publish, Action::Consume],
+            }],
+        );
+        create_topic(&state, &token, "watch-test").await;
+        let audit_before = fs::read_to_string(&config.audit.path)
+            .expect("read audit")
+            .lines()
+            .count();
+        let started = Instant::now();
+        let response = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token.clone(),
+                command: ControlCommand::WatchTopic {
+                    topic: "watch-test".to_owned(),
+                    offset: 0,
+                    limit: 10,
+                    wait_timeout_ms: 120,
+                },
+            },
+        )
+        .await;
+        assert!(started.elapsed() >= StdDuration::from_millis(100));
+        assert!(matches!(
+            response,
+            ControlResponse::Messages { ref messages, next_offset: 0, .. } if messages.is_empty()
+        ));
+        let audit_after = fs::read_to_string(&config.audit.path)
+            .expect("read audit")
+            .lines()
+            .count();
+        assert_eq!(audit_after - audit_before, 2);
+
+        let invalid_auth = process_request(
+            &state,
+            ControlRequest {
+                capability_token: "not-a-capability".to_owned(),
+                command: ControlCommand::WatchTopic {
+                    topic: "watch-test".to_owned(),
+                    offset: 0,
+                    limit: 10,
+                    wait_timeout_ms: 0,
+                },
+            },
+        )
+        .await;
+        assert!(matches!(
+            invalid_auth,
+            ControlResponse::Error { ref code, .. } if code == "invalid_capability"
+        ));
+
+        let invalid_timeout = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::WatchTopic {
+                    topic: "watch-test".to_owned(),
+                    offset: 0,
+                    limit: 10,
+                    wait_timeout_ms: 0,
+                },
+            },
+        )
+        .await;
+        assert!(matches!(
+            invalid_timeout,
+            ControlResponse::Error { ref code, .. } if code == "invalid_wait_timeout"
+        ));
+    }
+
+    #[tokio::test]
+    async fn topic_watch_returns_when_a_message_arrives() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "topic:*".to_owned(),
+                actions: vec![Action::Admin, Action::Publish, Action::Consume],
+            }],
+        );
+        create_topic(&state, &token, "watch-arrival").await;
+
+        let watcher_state = Arc::clone(&state);
+        let watcher_token = token.clone();
+        let watcher = tokio::spawn(async move {
+            process_request(
+                &watcher_state,
+                ControlRequest {
+                    capability_token: watcher_token,
+                    command: ControlCommand::WatchTopic {
+                        topic: "watch-arrival".to_owned(),
+                        offset: 0,
+                        limit: 10,
+                        wait_timeout_ms: 2_000,
+                    },
+                },
+            )
+            .await
+        });
+        sleep(StdDuration::from_millis(100)).await;
+        let published = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::Publish {
+                    topic: "watch-arrival".to_owned(),
+                    classification: Some(Classification::Internal),
+                    payload: "arrived".to_owned(),
+                },
+            },
+        )
+        .await;
+        assert!(matches!(published, ControlResponse::PublishAccepted { .. }));
+
+        let response = watcher.await.expect("watch task");
+        assert!(matches!(
+            response,
+            ControlResponse::Messages { ref messages, next_offset: 1, .. }
+                if messages.len() == 1 && messages[0].payload == "arrived"
+        ));
     }
 
     #[tokio::test]

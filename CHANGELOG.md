@@ -11,6 +11,8 @@ All notable user-visible changes will be documented here. The format follows [Ke
 - Hard agent pins and serialized sticky affinity routing for ordered conversation processing.
 - Versioned ingress, handoff, and reply schemas with forward-compatible additive fields.
 - An authenticated loopback HTTP gateway for broker health, topic I/O, tasks, agent discovery, and integrity-checked artifact transfer.
+- Resumable, authenticated topic event streaming over Server-Sent Events with bounded stream capacity and cursor recovery.
+- A bounded `watch_topic` broker operation so idle event streams avoid repeated network requests and audit records.
 
 ### Security
 

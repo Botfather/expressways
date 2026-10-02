@@ -53,7 +53,7 @@ The full backbone vision is not complete until these surfaces are implemented an
 
 ### HTTP gateway completion
 
-The initial supported HTTP API exposes broker health, publish/consume, tasks, discovery, and artifact transfer for harnesses that cannot use the Rust wire client. It forwards caller capabilities to the broker so policy, quota, audit, and principal attribution remain authoritative, and refuses non-loopback binding. Completion still requires event streaming, discovery mutations, an OpenAPI document, and conformance tests against a live broker deployment.
+The initial supported HTTP API exposes broker health, publish/consume, resumable topic SSE backed by bounded broker long polling, tasks, discovery, and artifact transfer for harnesses that cannot use the Rust wire client. It forwards caller capabilities to the broker so policy, quota, audit, and principal attribution remain authoritative, and refuses non-loopback binding. Completion still requires discovery mutations, an OpenAPI document, and conformance tests against a live broker deployment.
 
 ### Desktop lifecycle
 

@@ -1242,6 +1242,7 @@ dependencies = [
  "clap",
  "expressways-client",
  "expressways-protocol",
+ "futures-util",
  "serde",
  "serde_json",
  "sha2",
