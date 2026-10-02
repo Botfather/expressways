@@ -23,6 +23,7 @@ Expressways is alpha software. Documents under `design` and `adr` describe the i
 - [OpenClaw and ZeroClaw interop](design/openclaw-zeroclaw-interop.md)
 - [Nanobot parity](design/nanobot-parity-on-expressways.md)
 - [Performance methodology](design/performance-pathfinding.md)
+- [Deferred HITL approval-gate RFC](design/rfc-0002-hitl-task-approval-gates.md)
 
 ## Decisions and Historical Context
 
