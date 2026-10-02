@@ -42,6 +42,7 @@ The repository currently provides:
 - agent registration, liveness, discovery watches, and an event-driven task orchestrator;
 - task priority, retry, cancellation, hard agent selection, and per-conversation affinity ordering;
 - a Rust client, CLI, worker helper, sample agents, and Ollama integration;
+- an authenticated loopback HTTP gateway for health, topic I/O, task submission, discovery, and artifact transfer;
 - a Nanobot-style runtime with OpenAI and Anthropic providers, tool execution, state, and streaming;
 - a supported chat interoperability bridge with durable two-way delivery and binary artifact upload;
 - local operator surfaces through the CLI, dashboard, and desktop console.
@@ -50,9 +51,9 @@ The repository currently provides:
 
 The full backbone vision is not complete until these surfaces are implemented and verified:
 
-### General HTTP gateway
+### HTTP gateway completion
 
-A supported, versioned HTTP API must expose broker health, publish/consume, tasks, discovery, and artifact transfer for harnesses that cannot use the Rust wire client. It must forward caller capabilities to the broker so policy, quota, audit, and principal attribution remain authoritative. Loopback should be the safe default; non-loopback listeners require TLS termination and explicit authentication controls.
+The initial supported HTTP API exposes broker health, publish/consume, tasks, discovery, and artifact transfer for harnesses that cannot use the Rust wire client. It forwards caller capabilities to the broker so policy, quota, audit, and principal attribution remain authoritative, and refuses non-loopback binding. Completion still requires event streaming, discovery mutations, an OpenAPI document, and conformance tests against a live broker deployment.
 
 ### Desktop lifecycle
 
@@ -69,4 +70,3 @@ A single documented local profile must start the broker, orchestrator, one runti
 ## Scale boundary
 
 The intended unit is one device and one broker authority. Multiple agents and adapters may share that broker. Cross-device federation, clustering, and consensus are separate future decisions; they must not weaken the local security or recovery model merely to make the system sound distributed.
-

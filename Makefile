@@ -1,4 +1,4 @@
-.PHONY: backup-runtime benchmark bootstrap-local check check-docs check-hygiene export-support-bundle generate-admin-token generate-token help prepare-local-dirs rehearse-clean-machine rehearse-config-rollback-reliability rehearse-dr-restore-clean-env rehearse-key-rotation rehearse-m3-live-suite rehearse-reliability-denials rehearse-rollback restore-runtime run-expressways run-orchestrator run-dashboard run-stack run-ollama-agent run-gateway run-ollama-stack summarize-pilot-runs summarize-rollback-reliability-trend validate-support-bundle verify-first-run
+.PHONY: backup-runtime benchmark bootstrap-local check check-docs check-hygiene export-support-bundle generate-admin-token generate-token help prepare-local-dirs rehearse-clean-machine rehearse-config-rollback-reliability rehearse-dr-restore-clean-env rehearse-key-rotation rehearse-m3-live-suite rehearse-reliability-denials rehearse-rollback restore-runtime run-expressways run-orchestrator run-dashboard run-stack run-ollama-agent run-gateway run-http-api run-ollama-stack summarize-pilot-runs summarize-rollback-reliability-trend validate-support-bundle verify-first-run
 
 EXPRESSWAYS_CONFIG ?= configs/expressways.example.toml
 BROKER_ADDRESS ?= 127.0.0.1:7766
@@ -27,6 +27,7 @@ OLLAMA_MODEL ?= llama3.2
 OLLAMA_URL ?= http://127.0.0.1:11434
 OLLAMA_RESULTS_TOPIC ?= ollama_results
 GATEWAY_PORT ?= 8899
+HTTP_GATEWAY_LISTEN ?= 127.0.0.1:8790
 ORCHESTRATOR_RETRY_DELAY_MS ?= 500
 ORCHESTRATOR_CONSUME_LIMIT ?= 25
 ORCHESTRATOR_POLL_INTERVAL_MS ?= 1000
@@ -42,6 +43,7 @@ help:
 	@echo "  make run-stack         Start broker, supervisor, and dashboard together"
 	@echo "  make run-ollama-agent  Start the Ollama AgentWorker bridge"
 	@echo "  make run-gateway       Start the browser SSE gateway"
+	@echo "  make run-http-api      Start the authenticated local HTTP API gateway"
 	@echo "  make run-ollama-stack  Start broker, orchestrator, Ollama worker, and gateway"
 	@echo "  make bootstrap-local   Generate local issuer and guarded admin token"
 	@echo "  make generate-admin-token Generate a local admin-scope capability token (default principal: $(ADMIN_PRINCIPAL))"
@@ -93,6 +95,9 @@ run-ollama-agent: prepare-local-dirs
 run-gateway: prepare-local-dirs
 	@cd apps/expressways-gateway && npm ci
 	@cd apps/expressways-gateway && PORT=$(GATEWAY_PORT) EXPRESSWAYS_TRANSPORT=tcp EXPRESSWAYS_ADDRESS=$(BROKER_ADDRESS) EXPRESSWAYS_TOKEN_FILE=$(TOKEN_FILE) EXPRESSWAYS_TASK_EVENTS_TOPIC=$(TASK_EVENTS_TOPIC) EXPRESSWAYS_RESULTS_TOPIC=$(OLLAMA_RESULTS_TOPIC) npm start
+
+run-http-api: prepare-local-dirs
+	cargo run -p expressways-http-gateway -- --listen $(HTTP_GATEWAY_LISTEN) --broker-address $(BROKER_ADDRESS)
 
 run-stack: prepare-local-dirs
 	@set -eu; \

@@ -18,6 +18,7 @@ Expressways is alpha software. Documents under `design` and `adr` describe the i
 - [Security, compliance, and audit baseline](design/security-compliance-baseline.md)
 - [Discovery registry](design/discovery-registry.md)
 - [Event-driven orchestrator](design/event-driven-orchestrator.md)
+- [Authenticated local HTTP gateway](design/http-gateway.md)
 - [OpenClaw and ZeroClaw interop](design/openclaw-zeroclaw-interop.md)
 - [Nanobot parity](design/nanobot-parity-on-expressways.md)
 - [Performance methodology](design/performance-pathfinding.md)

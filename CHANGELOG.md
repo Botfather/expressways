@@ -10,6 +10,7 @@ All notable user-visible changes will be documented here. The format follows [Ke
 - A supported, versioned two-way chat bridge with durable at-least-once reply delivery, acknowledgements, idempotency keys, and raw artifact upload.
 - Hard agent pins and serialized sticky affinity routing for ordered conversation processing.
 - Versioned ingress, handoff, and reply schemas with forward-compatible additive fields.
+- An authenticated loopback HTTP gateway for broker health, topic I/O, tasks, agent discovery, and integrity-checked artifact transfer.
 
 ### Security
 

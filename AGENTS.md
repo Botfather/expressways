@@ -37,6 +37,8 @@ Current Phase 1 priorities:
   The broker runtime, request handling, registry, resilience, adopters, and streaming.
 - `crates/expressways-client`
   Client SDK and `expresswaysctl`.
+- `crates/expressways-http-gateway`
+  Authenticated loopback HTTP API for harnesses and local applications.
 - `crates/expressways-protocol`
   Shared domain types, requests, responses, metrics views, and stream frames.
 - `crates/expressways-auth`

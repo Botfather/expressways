@@ -85,6 +85,7 @@ Expressways is a Rust workspace for a local broker and its supporting tooling.
 Today it includes:
 
 - a broker daemon with local TCP transport and optional Unix sockets on Unix hosts,
+- an authenticated loopback HTTP API for harnesses and local applications,
 - append-only segmented topic storage with sidecar indexes,
 - signed capability-based identity and issuer/principal registries,
 - policy checks and per-principal quota enforcement,
@@ -582,6 +583,7 @@ That means if you build with a subset of adopter features, you should update `ad
 - `crates/expressways-storage`: segmented storage, indexes, retention enforcement, disk-pressure controls, and recovery.
 - `crates/expressways-server`: broker runtime, request handling, registry, resilience, adopters, and stream handling.
 - `crates/expressways-client`: SDK, `expresswaysctl` CLI, and an `AgentWorker` helper for task-executing agents.
+- `crates/expressways-http-gateway`: supported loopback HTTP API that forwards caller capabilities to the broker.
 
 ### Optional operational crates
 
@@ -613,6 +615,7 @@ That means if you build with a subset of adopter features, you should update `ad
 Start with:
 
 - [docs/design/phase-1-system-design.md](docs/design/phase-1-system-design.md)
+- [docs/design/http-gateway.md](docs/design/http-gateway.md)
 - [docs/design/security-compliance-baseline.md](docs/design/security-compliance-baseline.md)
 - [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md)
 - [docs/design/nanobot-parity-on-expressways.md](docs/design/nanobot-parity-on-expressways.md)
