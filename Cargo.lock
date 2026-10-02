@@ -1094,6 +1094,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "expressways-adapter-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "expressways-client",
+ "expressways-protocol",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "expressways-adopter-api"
 version = "0.1.0"
 dependencies = [
@@ -1259,6 +1275,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "expressways-adapter-sdk",
  "expressways-client",
  "expressways-protocol",
  "reqwest 0.12.28",

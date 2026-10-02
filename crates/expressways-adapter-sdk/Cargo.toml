@@ -1,7 +1,7 @@
 [package]
-name = "expressways-interop-bridge"
+name = "expressways-adapter-sdk"
 authors.workspace = true
-description = "Supported durable two-way bridge for Expressways chat interoperability"
+description = "Durability, idempotency, and artifact helpers for Expressways adapters"
 edition.workspace = true
 homepage.workspace = true
 license.workspace = true
@@ -11,18 +11,15 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-expressways-adapter-sdk = { path = "../expressways-adapter-sdk" }
 expressways-client = { path = "../expressways-client" }
 expressways-protocol = { path = "../expressways-protocol" }
 anyhow.workspace = true
-base64.workspace = true
-chrono.workspace = true
-clap.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 uuid.workspace = true
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+chrono.workspace = true
+tokio.workspace = true

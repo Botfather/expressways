@@ -583,6 +583,7 @@ That means if you build with a subset of adopter features, you should update `ad
 - `crates/expressways-storage`: segmented storage, indexes, retention enforcement, disk-pressure controls, and recovery.
 - `crates/expressways-server`: broker runtime, request handling, registry, resilience, adopters, and stream handling.
 - `crates/expressways-client`: SDK, `expresswaysctl` CLI, and an `AgentWorker` helper for task-executing agents.
+- `crates/expressways-adapter-sdk`: durable cursor, stable idempotency, and verified artifact helpers for channel and harness adapters.
 - `crates/expressways-http-gateway`: supported loopback HTTP API that forwards caller capabilities to the broker.
 
 ### Optional operational crates

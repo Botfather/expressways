@@ -16,6 +16,7 @@ All notable user-visible changes will be documented here. The format follows [Ke
 - HTTP agent registration, heartbeat, removal, discovery, and resumable registry event streaming for non-Rust harnesses.
 - A versioned OpenAPI 3.1 contract and isolated live HTTP conformance suite with restart durability checks.
 - Cross-platform backbone release bundles with Windows coverage, all core runtime binaries, and native stack lifecycle helpers.
+- A shared adapter SDK for monotonic durable cursors, deterministic replay identities, and verified raw artifact transfer.
 
 ### Security
 

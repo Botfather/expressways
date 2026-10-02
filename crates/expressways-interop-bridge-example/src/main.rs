@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +7,7 @@ use anyhow::{Context, bail};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, ValueEnum};
+use expressways_adapter_sdk::{CursorStore, stable_id};
 use expressways_client::{Client, Endpoint};
 use expressways_protocol::{
     Classification, ControlCommand, ControlRequest, ControlResponse,
@@ -28,7 +27,6 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const BRIDGE_STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 1_048_576;
 const MAX_REQUEST_BYTES_LIMIT: usize = 16 * 1_048_576;
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -302,14 +300,6 @@ struct AcceptedArtifactResponse {
     sha256: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-struct BridgeState {
-    #[serde(default)]
-    schema_version: u32,
-    #[serde(default)]
-    replies_offset: u64,
-}
-
 #[derive(Debug)]
 struct HttpRequest {
     method: String,
@@ -388,7 +378,11 @@ async fn main() -> anyhow::Result<()> {
     let egress_bearer = resolve_optional_secret(cli.egress_bearer, cli.egress_bearer_file)?;
     validate_egress_url(cli.egress_url.as_deref())?;
     if cli.egress_url.is_some() {
-        load_bridge_state(&cli.state_path).with_context(|| {
+        CursorStore::open_with_legacy_field(
+            &cli.state_path,
+            Some(("replies_offset", &cli.replies_topic)),
+        )
+        .with_context(|| {
             format!(
                 "durable egress state is invalid at {}",
                 cli.state_path.display()
@@ -812,10 +806,8 @@ fn derive_correlation_id(webhook: &BridgeWebhookRequest) -> String {
 }
 
 fn deterministic_task_id(idempotency_key: &str) -> String {
-    format!(
-        "interop-{}",
-        &format!("{:x}", Sha256::digest(idempotency_key.as_bytes()))[..32]
-    )
+    stable_id("interop", idempotency_key)
+        .expect("validated idempotency key and fixed prefix produce a stable id")
 }
 
 fn validate_webhook(webhook: &BridgeWebhookRequest) -> Result<(), HttpError> {
@@ -1193,7 +1185,10 @@ async fn run_egress(runtime: BridgeRuntime) {
             return;
         }
     };
-    let mut state = match load_bridge_state(&runtime.state_path) {
+    let mut state = match CursorStore::open_with_legacy_field(
+        &runtime.state_path,
+        Some(("replies_offset", &runtime.replies_topic)),
+    ) {
         Ok(state) => state,
         Err(error) => {
             warn!(error = %error, path = %runtime.state_path.display(), "failed to load durable bridge state");
@@ -1205,7 +1200,10 @@ async fn run_egress(runtime: BridgeRuntime) {
             Ok(delivered) if delivered > 0 => continue,
             Ok(_) => {}
             Err(error) => {
-                warn!(error = %error, offset = state.replies_offset, "egress delivery paused; cursor not advanced")
+                let offset = state
+                    .next_offset(&runtime.replies_topic)
+                    .unwrap_or_default();
+                warn!(error = %error, offset, "egress delivery paused; cursor not advanced")
             }
         }
         tokio::time::sleep(runtime.egress_poll_interval).await;
@@ -1216,7 +1214,7 @@ async fn deliver_reply_batch(
     runtime: &BridgeRuntime,
     http: &reqwest::Client,
     egress_url: &str,
-    state: &mut BridgeState,
+    state: &mut CursorStore,
 ) -> anyhow::Result<usize> {
     let mut client = Client::connect(runtime.endpoint.clone())
         .await
@@ -1235,7 +1233,7 @@ async fn deliver_reply_batch(
             capability_token: runtime.capability_token.clone(),
             command: ControlCommand::Consume {
                 topic: runtime.replies_topic.clone(),
-                offset: state.replies_offset,
+                offset: state.next_offset(&runtime.replies_topic)?,
                 limit: runtime.egress_batch_size,
             },
         })
@@ -1271,11 +1269,11 @@ async fn deliver_reply_batch(
                 response.status()
             );
         }
-        state.replies_offset = stored
+        let next_offset = stored
             .offset
             .checked_add(1)
             .context("reply offset overflow")?;
-        save_bridge_state(&runtime.state_path, state)?;
+        state.checkpoint(&runtime.replies_topic, next_offset)?;
         delivered += 1;
         info!(delivery_id = %reply.delivery_id, offset = stored.offset, "delivered interop reply");
     }
@@ -1304,57 +1302,6 @@ fn validate_reply(reply: &InteropChatReplyV1) -> anyhow::Result<()> {
         bail!("reply message must contain text or attachments");
     }
     Ok(())
-}
-
-fn load_bridge_state(path: &Path) -> anyhow::Result<BridgeState> {
-    if !path.exists() {
-        return Ok(BridgeState {
-            schema_version: BRIDGE_STATE_SCHEMA_VERSION,
-            replies_offset: 0,
-        });
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 {
-        bail!("bridge state must be a regular file no larger than 64 KiB");
-    }
-    let state: BridgeState = serde_json::from_slice(&fs::read(path)?)?;
-    if state.schema_version != BRIDGE_STATE_SCHEMA_VERSION {
-        bail!(
-            "unsupported bridge state schema version {}",
-            state.schema_version
-        );
-    }
-    Ok(state)
-}
-
-fn save_bridge_state(path: &Path, state: &BridgeState) -> anyhow::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let temp = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| -> anyhow::Result<()> {
-        let mut file = options.open(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(state)?)?;
-        file.sync_all()?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        fs::rename(&temp, path)?;
-        #[cfg(unix)]
-        File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
 }
 
 async fn ensure_topic(
@@ -1982,14 +1929,18 @@ mod tests {
         validate_reply(&reply).expect("valid reply");
 
         let path = std::env::temp_dir().join(format!("expressways-bridge-{}.json", Uuid::now_v7()));
-        let state = BridgeState {
-            schema_version: BRIDGE_STATE_SCHEMA_VERSION,
-            replies_offset: 42,
-        };
-        save_bridge_state(&path, &state).expect("save state");
-        let loaded = load_bridge_state(&path).expect("load state");
-        assert_eq!(loaded.replies_offset, 42);
-        fs::remove_file(path).expect("remove state");
+        let mut state = CursorStore::open(&path).expect("create cursor store");
+        state
+            .checkpoint(INTEROP_CHAT_REPLIES_TOPIC, 42)
+            .expect("save cursor");
+        let loaded = CursorStore::open(&path).expect("load cursor store");
+        assert_eq!(
+            loaded
+                .next_offset(INTEROP_CHAT_REPLIES_TOPIC)
+                .expect("load reply cursor"),
+            42
+        );
+        std::fs::remove_file(path).expect("remove state");
     }
 
     #[tokio::test]

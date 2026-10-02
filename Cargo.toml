@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "apps/expressways-console/src-tauri",
+  "crates/expressways-adapter-sdk",
   "crates/expressways-adopter-api",
   "crates/expressways-adopter-audit-integrity",
   "crates/expressways-adopter-registry-guard",
