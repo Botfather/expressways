@@ -93,3 +93,5 @@ A 2xx response is the delivery acknowledgement. Any other response or transport 
 - Per-conversation ordering is enforced through affinity serialization.
 - Egress is durable and at least once, not exactly once.
 - A corrupt or unsupported reply blocks cursor advancement and is visible in structured logs; operators must correct or explicitly supersede it.
+
+Run `make test-adapter-conformance` to verify these guarantees against an isolated live broker, bridge, orchestrator, and intentionally failing destination. The test covers authentication, replay identity, affinity ordering, raw 2 MiB media, explicit backpressure, at-least-once retry, and restart recovery.

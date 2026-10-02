@@ -17,6 +17,8 @@ All notable user-visible changes will be documented here. The format follows [Ke
 - A versioned OpenAPI 3.1 contract and isolated live HTTP conformance suite with restart durability checks.
 - Cross-platform backbone release bundles with Windows coverage, all core runtime binaries, and native stack lifecycle helpers.
 - A shared adapter SDK for monotonic durable cursors, deterministic replay identities, and verified raw artifact transfer.
+- A live adapter conformance suite covering authentication, replay, affinity ordering, raw media, backpressure, destination retry, and restart recovery.
+- A corrected heavy-media configuration contract with 64 MiB publish quotas and bounded frame headroom for artifact envelopes.
 
 ### Security
 

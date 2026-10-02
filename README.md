@@ -1222,7 +1222,7 @@ Controls:
 - broker data directory,
 - log level,
 - maximum concurrent client connections,
-- maximum request/response frame size (`max_frame_bytes`, 256 bytes through 64 MiB), enforced before request decoding and again before response transmission. Connection counts are validated against the runtime semaphore ceiling, and clients that send no complete request frame within `connection_idle_timeout_ms` (100 ms through one hour; 30 seconds by default) are disconnected so idle sockets cannot permanently exhaust the connection pool.
+- maximum request/response frame size (`max_frame_bytes`, 256 bytes through 65 MiB), enforced before request decoding and again before response transmission. The extra MiB above the 64 MiB artifact ceiling is reserved for the bounded control envelope and capability. Connection counts are validated against the runtime semaphore ceiling, and clients that send no complete request frame within `connection_idle_timeout_ms` (100 ms through one hour; 30 seconds by default) are disconnected so idle sockets cannot permanently exhaust the connection pool.
 
 ### `[storage]`
 

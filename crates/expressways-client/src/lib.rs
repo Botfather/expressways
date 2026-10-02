@@ -29,7 +29,8 @@ use uuid::Uuid;
 pub const MAX_CAPABILITY_TOKEN_FILE_BYTES: u64 = 64 * 1024;
 pub const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 pub const MAX_AGENT_WORKER_STATE_BYTES: u64 = 1024 * 1024;
-pub const MAX_CLIENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Supports a 64 MiB artifact plus its bounded control envelope.
+pub const MAX_CLIENT_FRAME_BYTES: usize = 65 * 1024 * 1024;
 
 pub fn normalize_capability_token(token: &str) -> anyhow::Result<String> {
     let token = token.trim();

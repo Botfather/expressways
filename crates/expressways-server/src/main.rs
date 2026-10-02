@@ -45,7 +45,9 @@ use crate::registry::AgentRegistry;
 use crate::registry_events::{RegistryEventError, RegistryEventHub};
 
 const MIN_FRAME_BYTES: usize = 256;
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+// Raw artifacts may be 64 MiB; the control envelope and capability require
+// bounded headroom in the same length-delimited packet.
+const MAX_FRAME_BYTES: usize = 65 * 1024 * 1024;
 const MIN_CONNECTION_IDLE_TIMEOUT_MS: u64 = 100;
 const MAX_CONNECTION_IDLE_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_REGISTRY_EVENT_HISTORY: usize = 4_096;

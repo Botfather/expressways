@@ -61,7 +61,7 @@ Release bundles now build the broker, CLI, HTTP gateway, orchestrator, Nanobot r
 
 ### Adapter SDK and conformance suite
 
-The supported adapter SDK now provides durable monotonic cursor storage, deterministic replay identities, integrity-checked raw artifact upload/download, and focused contract tests; the chat bridge consumes the shared cursor and identity implementations. Reusable request/reply types remain in `expressways-protocol`. Completion still requires a live adapter conformance runner covering authentication, replay, ordering, large objects, backpressure, destination failure, and restart recovery. An integration becomes supported only after passing that suite.
+The supported adapter SDK provides durable monotonic cursor storage, deterministic replay identities, integrity-checked raw artifact upload/download, and focused contract tests; the chat bridge consumes the shared cursor and identity implementations. Reusable request/reply types remain in `expressways-protocol`. The isolated live conformance runner covers authentication, replay identity, conversation ordering, multi-megabyte raw objects, broker backpressure, destination failure/retry, and restart recovery. An integration becomes supported only after passing that suite.
 
 ### End-to-end deployment profile
 

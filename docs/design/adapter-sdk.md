@@ -34,4 +34,10 @@ The current artifact ceiling is 64 MiB. Larger media requires a future resumable
 
 ## Support boundary
 
-The SDK provides reusable correctness primitives and focused contract tests. A new adapter is not supported merely because it imports the crate. It must still pass live authentication, replay/idempotency, conversation ordering, raw artifact, backpressure, destination failure, and component-restart conformance tests.
+The SDK provides reusable correctness primitives and focused contract tests. A new adapter is not supported merely because it imports the crate. It must pass the live authentication, replay/idempotency, conversation ordering, raw artifact, backpressure, destination failure, and component-restart suite:
+
+```bash
+make test-adapter-conformance
+```
+
+The suite uses an isolated broker configuration, temporary credentials and state, a real bridge and orchestrator, and a bounded loopback destination that deliberately rejects the first reply.

@@ -9,7 +9,8 @@ socket_path = "./tmp/expressways.sock"
 data_dir = "./var/data"
 log_level = "info"
 max_connections = 256
-max_frame_bytes = 8388608
+# One MiB of envelope headroom above the 64 MiB artifact ceiling.
+max_frame_bytes = 68157440
 connection_idle_timeout_ms = 30000
 
 [storage]
@@ -126,7 +127,7 @@ quota_profile = "nanobot_bridge"
 
 [[quotas.profiles]]
 name = "operator"
-publish_payload_max_bytes = 16384
+publish_payload_max_bytes = 67108864
 publish_requests_per_window = 20
 publish_window_seconds = 1
 consume_max_limit = 100
@@ -148,7 +149,7 @@ backpressure_delay_ms = 150
 
 [[quotas.profiles]]
 name = "bridge"
-publish_payload_max_bytes = 65536
+publish_payload_max_bytes = 67108864
 publish_requests_per_window = 50
 publish_window_seconds = 1
 consume_max_limit = 200
@@ -159,7 +160,7 @@ backpressure_delay_ms = 50
 
 [[quotas.profiles]]
 name = "nanobot_runtime"
-publish_payload_max_bytes = 65536
+publish_payload_max_bytes = 67108864
 publish_requests_per_window = 30
 publish_window_seconds = 1
 consume_max_limit = 100
@@ -170,7 +171,7 @@ backpressure_delay_ms = 50
 
 [[quotas.profiles]]
 name = "nanobot_bridge"
-publish_payload_max_bytes = 65536
+publish_payload_max_bytes = 67108864
 publish_requests_per_window = 60
 publish_window_seconds = 1
 consume_max_limit = 200

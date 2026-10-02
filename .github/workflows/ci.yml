@@ -54,6 +54,9 @@ jobs:
       - name: Test HTTP Gateway Conformance
         run: bash scripts/test-http-gateway-conformance.sh
 
+      - name: Test Adapter Conformance
+        run: bash scripts/test-adapter-conformance.sh
+
       - name: Test Packaged Service Lifecycle
         run: bash scripts/test-service-lifecycle.sh
 
