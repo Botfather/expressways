@@ -13,6 +13,7 @@ Expressways is alpha software. Documents under `design` and `adr` describe the i
 
 ## Architecture and Contracts
 
+- [Local agent backbone](design/local-agent-backbone.md)
 - [Phase 1 system design](design/phase-1-system-design.md)
 - [Security, compliance, and audit baseline](design/security-compliance-baseline.md)
 - [Discovery registry](design/discovery-registry.md)

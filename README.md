@@ -9,9 +9,9 @@
 
 > **Project status:** Alpha. Interfaces and persisted formats may change before `1.0`; there is currently no production support SLA.
 
-Expressways is a desktop-first, local-first coordination bus for multi-agent systems.
+Expressways is a desktop-first, local-first backbone for agents. It provides the durable, secure spine connecting LLM runtimes, chat applications, automation harnesses, device tools, and HTTP clients on macOS, Windows, and Linux.
 
-It is not trying to be a general-purpose cloud event platform in Phase 1. It is trying to be a broker you can run on a workstation, understand completely, operate confidently, and extend carefully without sacrificing auditability, access control, integrity, or availability.
+It is not trying to be a general-purpose cloud event platform or a monolithic agent framework. It is a broker and control plane you can run on a workstation, understand completely, operate confidently, and connect to replaceable runtimes and adapters without sacrificing auditability, access control, integrity, or availability.
 
 The project is built around a simple idea:
 
@@ -19,7 +19,7 @@ The project is built around a simple idea:
 
 That means every meaningful operation should be authenticated, authorized, quota-aware, auditable, observable, and recoverable. Expressways starts there and only adds complexity when the simpler system is already trustworthy.
 
-The implemented scope is described in [the documentation index](docs/README.md), [the Phase 1 system design](docs/design/phase-1-system-design.md), [the security baseline](docs/design/security-compliance-baseline.md), and [the Phase 1 scope ADR](docs/adr/0001-phase-1-scope.md). A deliberately non-authoritative [original vision archive](docs/archive/original-vision.md) records ideas that are not implemented or promised.
+The product boundary and remaining gaps are described in [the local agent backbone design](docs/design/local-agent-backbone.md). The implemented scope is described in [the documentation index](docs/README.md), [the Phase 1 system design](docs/design/phase-1-system-design.md), [the security baseline](docs/design/security-compliance-baseline.md), and [the Phase 1 scope ADR](docs/adr/0001-phase-1-scope.md). A deliberately non-authoritative [original vision archive](docs/archive/original-vision.md) records ideas that are not implemented or promised.
 
 ## Table of Contents
 
