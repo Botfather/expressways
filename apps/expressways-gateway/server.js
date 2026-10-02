@@ -1,24 +1,84 @@
 const express = require('express')
 const { spawn } = require('node:child_process')
-const { randomUUID } = require('node:crypto')
+const { randomUUID, timingSafeEqual } = require('node:crypto')
 const fs = require('node:fs/promises')
 const path = require('node:path')
 
 const app = express()
-app.use(express.json({ limit: '1mb' }))
-app.use(express.static(path.join(__dirname, 'public')))
 
-const GATEWAY_PORT = Number(process.env.PORT || 8899)
+function boundedInteger(name, fallback, minimum, maximum) {
+  const value = Number(process.env[name] || fallback)
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`)
+  }
+  return value
+}
+
+const GATEWAY_HOST = process.env.HOST || '127.0.0.1'
+const GATEWAY_PORT = boundedInteger('PORT', 8899, 1, 65535)
 const TRANSPORT = process.env.EXPRESSWAYS_TRANSPORT || 'tcp'
 const ADDRESS = process.env.EXPRESSWAYS_ADDRESS || '127.0.0.1:7766'
 const TOKEN_FILE = process.env.EXPRESSWAYS_TOKEN_FILE || path.resolve(__dirname, '../../var/auth/developer.token')
 const TASKS_TOPIC = process.env.EXPRESSWAYS_TASKS_TOPIC || 'tasks'
 const TASK_EVENTS_TOPIC = process.env.EXPRESSWAYS_TASK_EVENTS_TOPIC || 'task_events'
 const RESULTS_TOPIC = process.env.EXPRESSWAYS_RESULTS_TOPIC || 'ollama_results'
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 1000)
-const CONSUME_BATCH_LIMIT = Number(process.env.CONSUME_BATCH_LIMIT || 100)
+const POLL_INTERVAL_MS = boundedInteger('POLL_INTERVAL_MS', 1000, 100, 60000)
+const CONSUME_BATCH_LIMIT = boundedInteger('CONSUME_BATCH_LIMIT', 100, 1, 1000)
+const REQUEST_TIMEOUT_MS = boundedInteger('REQUEST_TIMEOUT_MS', 15000, 100, 300000)
+const MAX_CONNECTIONS = boundedInteger('MAX_CONNECTIONS', 64, 1, 1024)
+const MAX_CHILD_OUTPUT_BYTES = boundedInteger('MAX_CHILD_OUTPUT_BYTES', 1048576, 1024, 16777216)
+const MAX_ARTIFACT_BYTES = boundedInteger('MAX_ARTIFACT_BYTES', 1048576, 1024, 16777216)
+const ACCESS_BEARER = process.env.GATEWAY_ACCESS_BEARER || ''
 const RESULT_DIR = process.env.OLLAMA_RESULT_DIR || path.resolve(__dirname, '../../var/agent/ollama-results')
 const CTL_BIN = process.env.EXPRESSWAYSCTL_BIN || path.resolve(__dirname, '../../target/debug/expresswaysctl')
+
+const loopbackHosts = new Set(['127.0.0.1', '::1', 'localhost'])
+if (!loopbackHosts.has(GATEWAY_HOST) && ACCESS_BEARER.length === 0) {
+  throw new Error('GATEWAY_ACCESS_BEARER is required for a non-loopback HOST')
+}
+
+function constantTimeEqual(left, right) {
+  const leftBytes = Buffer.from(left)
+  const rightBytes = Buffer.from(right)
+  if (leftBytes.length !== rightBytes.length) {
+    return false
+  }
+  return timingSafeEqual(leftBytes, rightBytes)
+}
+
+let activeConnections = 0
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+
+  if (ACCESS_BEARER.length > 0) {
+    const authorization = req.get('authorization') || ''
+    const provided = authorization.startsWith('Bearer ') ? authorization.slice(7) : ''
+    if (!constantTimeEqual(provided, ACCESS_BEARER)) {
+      res.status(401).json({ error: 'bearer authentication required' })
+      return
+    }
+  }
+
+  if (activeConnections >= MAX_CONNECTIONS) {
+    res.status(503).json({ error: 'gateway connection limit reached' })
+    return
+  }
+  activeConnections += 1
+  let released = false
+  const release = () => {
+    if (!released) {
+      released = true
+      activeConnections -= 1
+    }
+  }
+  res.once('finish', release)
+  res.once('close', release)
+  next()
+})
+app.use(express.json({ limit: '1mb', strict: true }))
+app.use(express.static(path.join(__dirname, 'public'), { dotfiles: 'deny', index: 'index.html' }))
 
 function buildCtlArgs(commandArgs) {
   return [
@@ -35,34 +95,77 @@ function runCtl(commandArgs) {
     const args = buildCtlArgs(commandArgs)
     const child = spawn(CTL_BIN, args, {
       cwd: path.resolve(__dirname, '../..'),
-      env: process.env,
+      env: {
+        PATH: process.env.PATH || '',
+        LANG: process.env.LANG || 'C.UTF-8',
+        LC_ALL: process.env.LC_ALL || '',
+        RUST_LOG: process.env.RUST_LOG || 'warn',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
 
     let stdout = ''
     let stderr = ''
+    let outputBytes = 0
+    let settled = false
+    const finish = (callback) => {
+      if (!settled) {
+        settled = true
+        clearTimeout(timer)
+        callback()
+      }
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      finish(() => reject(new Error('expresswaysctl timed out')))
+    }, REQUEST_TIMEOUT_MS)
 
     child.stdout.on('data', (chunk) => {
+      outputBytes += chunk.length
+      if (outputBytes > MAX_CHILD_OUTPUT_BYTES) {
+        child.kill('SIGKILL')
+        finish(() => reject(new Error('expresswaysctl output exceeded its limit')))
+        return
+      }
       stdout += chunk.toString()
     })
 
     child.stderr.on('data', (chunk) => {
+      outputBytes += chunk.length
+      if (outputBytes > MAX_CHILD_OUTPUT_BYTES) {
+        child.kill('SIGKILL')
+        finish(() => reject(new Error('expresswaysctl output exceeded its limit')))
+        return
+      }
       stderr += chunk.toString()
     })
 
     child.on('error', (error) => {
-      reject(new Error(`failed to run expresswaysctl: ${error.message}`))
+      finish(() => reject(new Error(`failed to run expresswaysctl: ${error.message}`)))
     })
 
     child.on('close', (code) => {
       if (code !== 0) {
-        reject(new Error(`expresswaysctl exited with code ${code}: ${stderr || stdout}`))
+        finish(() => reject(new Error(`expresswaysctl exited with code ${code}`)))
         return
       }
 
-      resolve(stdout.trim())
+      finish(() => resolve(stdout.trim()))
     })
   })
+}
+
+function validTaskId(taskId) {
+  return typeof taskId === 'string' && /^[A-Za-z0-9._:-]{1,256}$/.test(taskId)
+}
+
+function nonNegativeOffset(value) {
+  const parsed = Number(value || 0)
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null
+}
+
+function reportInternalError(context, error) {
+  console.error(JSON.stringify({ event: 'gateway_error', context, message: error.message }))
 }
 
 function parseJsonOutput(output) {
@@ -114,7 +217,7 @@ async function consumeTaskEvents(offset) {
   }
 
   return {
-    nextOffset: Number(json.next_offset || offset),
+    nextOffset: nonNegativeOffset(json.next_offset) ?? offset,
     events,
   }
 }
@@ -151,7 +254,7 @@ async function consumeResultMessages(offset) {
   }
 
   return {
-    nextOffset: Number(json.next_offset || offset),
+    nextOffset: nonNegativeOffset(json.next_offset) ?? offset,
     results,
   }
 }
@@ -181,10 +284,17 @@ async function findLatestResultForTask(taskId, startOffset = 0, maxBatches = 50)
 }
 
 async function tryReadTaskArtifact(taskId) {
+  if (!validTaskId(taskId)) {
+    return null
+  }
   const artifactPath = path.join(RESULT_DIR, `${taskId}.ollama.json`)
   try {
+    const metadata = await fs.lstat(artifactPath)
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_ARTIFACT_BYTES) {
+      return null
+    }
     const raw = await fs.readFile(artifactPath, 'utf8')
-    return { artifactPath, artifact: JSON.parse(raw) }
+    return { artifact: JSON.parse(raw) }
   } catch {
     return null
   }
@@ -202,10 +312,14 @@ app.get('/health', (_req, res) => {
 app.get('/results/:taskId', async (req, res) => {
   const taskId = req.params.taskId
   const includeArtifact = req.query.includeArtifact !== 'false'
-  const startOffset = Number(req.query.offset || 0)
+  const startOffset = nonNegativeOffset(req.query.offset)
 
-  if (!taskId) {
-    res.status(400).json({ error: 'taskId is required' })
+  if (!validTaskId(taskId)) {
+    res.status(400).json({ error: 'taskId is invalid' })
+    return
+  }
+  if (startOffset === null) {
+    res.status(400).json({ error: 'offset must be a non-negative integer' })
     return
   }
 
@@ -224,7 +338,6 @@ app.get('/results/:taskId', async (req, res) => {
         const artifact = await tryReadTaskArtifact(taskId)
         if (artifact) {
           response.artifact = artifact.artifact
-          response.artifactPath = artifact.artifactPath
         }
       }
 
@@ -239,7 +352,6 @@ app.get('/results/:taskId', async (req, res) => {
           taskId,
           source: 'artifact_file',
           artifact: artifact.artifact,
-          artifactPath: artifact.artifactPath,
         })
         return
       }
@@ -251,15 +363,32 @@ app.get('/results/:taskId', async (req, res) => {
       hint: 'Result may not be ready yet, or was not published to results topic.',
     })
   } catch (error) {
-    res.status(500).json({ error: error.message })
+    reportInternalError('results', error)
+    res.status(500).json({ error: 'result lookup failed' })
   }
 })
 
 app.post('/chat', async (req, res) => {
   const { prompt, model, system, temperature, maxTokens } = req.body || {}
 
-  if (typeof prompt !== 'string' || prompt.trim().length === 0) {
-    res.status(400).json({ error: 'prompt is required' })
+  if (typeof prompt !== 'string' || prompt.trim().length === 0 || Buffer.byteLength(prompt) > 65536) {
+    res.status(400).json({ error: 'prompt must contain 1..65536 bytes' })
+    return
+  }
+  if (model !== undefined && (typeof model !== 'string' || model.length === 0 || model.length > 256)) {
+    res.status(400).json({ error: 'model must contain 1..256 characters' })
+    return
+  }
+  if (system !== undefined && (typeof system !== 'string' || Buffer.byteLength(system) > 65536)) {
+    res.status(400).json({ error: 'system must be a string no larger than 65536 bytes' })
+    return
+  }
+  if (temperature !== undefined && (!Number.isFinite(temperature) || temperature < 0 || temperature > 2)) {
+    res.status(400).json({ error: 'temperature must be between 0 and 2' })
+    return
+  }
+  if (maxTokens !== undefined && (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 1000000)) {
+    res.status(400).json({ error: 'maxTokens must be an integer between 1 and 1000000' })
     return
   }
 
@@ -289,7 +418,8 @@ app.post('/chat', async (req, res) => {
       JSON.stringify(payload),
     ])
   } catch (error) {
-    res.status(500).json({ error: error.message })
+    reportInternalError('submit', error)
+    res.status(500).json({ error: 'task submission failed' })
     return
   }
 
@@ -301,11 +431,15 @@ app.post('/chat', async (req, res) => {
 
 app.get('/events/:taskId', async (req, res) => {
   const taskId = req.params.taskId
-  let nextOffset = Number(req.query.offset || 0)
-  let resultsOffset = Number(req.query.resultsOffset || 0)
+  let nextOffset = nonNegativeOffset(req.query.offset)
+  let resultsOffset = nonNegativeOffset(req.query.resultsOffset)
 
-  if (!taskId) {
-    res.status(400).json({ error: 'taskId is required' })
+  if (!validTaskId(taskId)) {
+    res.status(400).json({ error: 'taskId is invalid' })
+    return
+  }
+  if (nextOffset === null || resultsOffset === null) {
+    res.status(400).json({ error: 'offsets must be non-negative integers' })
     return
   }
 
@@ -370,7 +504,6 @@ app.get('/events/:taskId', async (req, res) => {
           if (artifactResult) {
             writeSse(res, 'result', {
               taskId,
-              artifactPath: artifactResult.artifactPath,
               artifact: artifactResult.artifact,
             })
           }
@@ -381,7 +514,8 @@ app.get('/events/:taskId', async (req, res) => {
         }
       }
     } catch (error) {
-      writeSse(res, 'error', { taskId, message: error.message })
+      reportInternalError('events', error)
+      writeSse(res, 'error', { taskId, message: 'event stream failed' })
       res.end()
       return
     }
@@ -396,18 +530,27 @@ app.get('/events/:taskId', async (req, res) => {
   }
 })
 
-app.listen(GATEWAY_PORT, () => {
-  console.log(
-    JSON.stringify({
-      event: 'gateway_started',
-      port: GATEWAY_PORT,
-      transport: TRANSPORT,
-      address: ADDRESS,
-      tasksTopic: TASKS_TOPIC,
-      taskEventsTopic: TASK_EVENTS_TOPIC,
-      resultsTopic: RESULTS_TOPIC,
-      resultDir: RESULT_DIR,
-      ctlBin: CTL_BIN,
-    })
-  )
-})
+function startGateway() {
+  return app.listen(GATEWAY_PORT, GATEWAY_HOST, () => {
+    console.log(
+      JSON.stringify({
+        event: 'gateway_started',
+        host: GATEWAY_HOST,
+        port: GATEWAY_PORT,
+        transport: TRANSPORT,
+        address: ADDRESS,
+        tasksTopic: TASKS_TOPIC,
+        taskEventsTopic: TASK_EVENTS_TOPIC,
+        resultsTopic: RESULTS_TOPIC,
+        resultDir: RESULT_DIR,
+        ctlBin: CTL_BIN,
+      })
+    )
+  })
+}
+
+if (require.main === module) {
+  startGateway()
+}
+
+module.exports = { app, constantTimeEqual, nonNegativeOffset, startGateway, validTaskId }

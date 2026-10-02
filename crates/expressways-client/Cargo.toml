@@ -1,7 +1,12 @@
 [package]
 name = "expressways-client"
+authors.workspace = true
+description = "Rust client SDK and command-line tools for Expressways"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

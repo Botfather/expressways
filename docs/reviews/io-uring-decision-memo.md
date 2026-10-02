@@ -14,7 +14,7 @@ The current Sprint 5 baseline does not show a transport bottleneck strong enough
 
 ## Evidence
 
-From [var/benchmarks/latest.json](/Users/tusharmohan/Documents/@labs/expressways/var/benchmarks/latest.json) on March 18, 2026:
+From a local `var/benchmarks/latest.json` run on March 18, 2026 (historical, machine-specific evidence; not committed):
 
 - TCP publish baseline: about `567 ops/sec`, average latency about `1.76 ms`.
 - Unix socket publish baseline: about `458 ops/sec`, average latency about `2.18 ms`.

@@ -6,7 +6,7 @@ Sprint 5 exists to create evidence before optimization work begins. The benchmar
 
 ## Benchmark Harness
 
-The workspace now includes [crates/expressways-bench](/Users/tusharmohan/Documents/@labs/expressways/crates/expressways-bench), a small CLI for repeatable local measurement.
+The workspace includes [`expressways-bench`](../../crates/expressways-bench), a small CLI for repeatable local measurement.
 
 ### Supported Commands
 
@@ -33,7 +33,7 @@ The workspace now includes [crates/expressways-bench](/Users/tusharmohan/Documen
 
 ## Current Output
 
-The latest suite output is stored in [var/benchmarks/latest.json](/Users/tusharmohan/Documents/@labs/expressways/var/benchmarks/latest.json). The benchmark harness writes JSON so results can feed dashboards, memo generation, or regression comparisons later.
+The latest local suite output is stored at `var/benchmarks/latest.json`. This ignored file is machine-specific evidence, not a repository baseline. The benchmark harness writes JSON so results can feed dashboards, memo generation, or regression comparisons later.
 
 ## How To Run
 

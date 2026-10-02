@@ -1,7 +1,12 @@
 [package]
 name = "expressways-adopter-api"
+authors.workspace = true
+description = "Shared interfaces for build-installed Expressways hardening adopters"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

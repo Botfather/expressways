@@ -1,5 +1,12 @@
 name: CI
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches:
@@ -9,6 +16,15 @@ on:
   pull_request:
 
 jobs:
+  repository-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check Repository Hygiene and Documentation
+        run: bash scripts/check-repository-hygiene.sh
+
   rust:
     runs-on: ubuntu-latest
     steps:
@@ -18,11 +34,19 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cargo Check (Nanobot System)
-        run: cargo check -p expressways-nanobot-system
+      - name: Check Formatting
+        run: cargo fmt --check
 
-      - name: Cargo Test (Nanobot System)
-        run: cargo test -p expressways-nanobot-system
+      - name: Lint Workspace
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test Workspace
+        run: cargo test --workspace --all-features
+
+      - name: Check Rust Advisories, Licenses, and Sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources
 
   config-rollback-reliability:
     runs-on: ubuntu-latest
@@ -246,5 +270,33 @@ jobs:
       - name: Install Dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Lint Console
+        run: pnpm lint
+
+      - name: Test Console
+        run: pnpm test
+
       - name: Build Console
         run: pnpm build
+
+  gateway:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/expressways-gateway
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/expressways-gateway/package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Test Gateway
+        run: npm test

@@ -1,7 +1,12 @@
 [package]
 name = "expressways-audit"
+authors.workspace = true
+description = "Tamper-evident audit log primitives for Expressways"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

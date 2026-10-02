@@ -6,7 +6,7 @@ The original Expressways concept is promising as a long-term vision, but it is n
 
 ## Confidence Scores
 
-- Original concept as written in `docs/main.md`: `4.6 / 10`
+- Original concept summarized in `docs/archive/original-vision.md`: `4.6 / 10`
 - Narrowed Phase 1 defined in this repository: `9.1 / 10`
 
 The repository proceeds only with the narrowed Phase 1.

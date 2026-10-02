@@ -1,4 +1,4 @@
-.PHONY: backup-runtime benchmark bootstrap-local export-support-bundle generate-admin-token generate-token help prepare-local-dirs rehearse-clean-machine rehearse-config-rollback-reliability rehearse-dr-restore-clean-env rehearse-key-rotation rehearse-m3-live-suite rehearse-reliability-denials rehearse-rollback restore-runtime run-expressways run-orchestrator run-dashboard run-stack run-ollama-agent run-gateway run-ollama-stack summarize-pilot-runs summarize-rollback-reliability-trend validate-support-bundle verify-first-run
+.PHONY: backup-runtime benchmark bootstrap-local check check-docs check-hygiene export-support-bundle generate-admin-token generate-token help prepare-local-dirs rehearse-clean-machine rehearse-config-rollback-reliability rehearse-dr-restore-clean-env rehearse-key-rotation rehearse-m3-live-suite rehearse-reliability-denials rehearse-rollback restore-runtime run-expressways run-orchestrator run-dashboard run-stack run-ollama-agent run-gateway run-ollama-stack summarize-pilot-runs summarize-rollback-reliability-trend validate-support-bundle verify-first-run
 
 EXPRESSWAYS_CONFIG ?= configs/expressways.example.toml
 BROKER_ADDRESS ?= 127.0.0.1:7766
@@ -61,6 +61,19 @@ help:
 	@echo "  make summarize-pilot-runs Build duration/pass-rate summary from pilot rehearsal reports"
 	@echo "  make generate-token    Alias for generate-admin-token"
 	@echo "  make benchmark         Run the benchmark suite"
+	@echo "  make check             Run repository hygiene, format, lint, and test gates"
+
+check-docs:
+	bash scripts/check-documentation.sh
+
+check-hygiene:
+	bash scripts/check-repository-hygiene.sh
+
+check: check-hygiene
+	cargo fmt --check
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo deny check advisories licenses sources
+	cargo test --workspace --all-features
 
 prepare-local-dirs:
 	@mkdir -p ./tmp ./var/auth ./var/agent ./var/benchmarks ./var/orchestrator
@@ -78,7 +91,7 @@ run-ollama-agent: prepare-local-dirs
 	cargo run -p expressways-client --bin expressways-agent-ollama -- --transport tcp --address $(BROKER_ADDRESS) --token-file $(TOKEN_FILE) --agent-id $(OLLAMA_AGENT_ID) --default-model $(OLLAMA_MODEL) --ollama-url $(OLLAMA_URL) --task-events-topic $(TASK_EVENTS_TOPIC) --results-topic $(OLLAMA_RESULTS_TOPIC)
 
 run-gateway: prepare-local-dirs
-	@cd apps/expressways-gateway && npm install
+	@cd apps/expressways-gateway && npm ci
 	@cd apps/expressways-gateway && PORT=$(GATEWAY_PORT) EXPRESSWAYS_TRANSPORT=tcp EXPRESSWAYS_ADDRESS=$(BROKER_ADDRESS) EXPRESSWAYS_TOKEN_FILE=$(TOKEN_FILE) EXPRESSWAYS_TASK_EVENTS_TOPIC=$(TASK_EVENTS_TOPIC) EXPRESSWAYS_RESULTS_TOPIC=$(OLLAMA_RESULTS_TOPIC) npm start
 
 run-stack: prepare-local-dirs
@@ -110,7 +123,7 @@ run-ollama-stack: prepare-local-dirs
 	cargo run -p expressways-client --bin expressways-agent-ollama -- --transport tcp --address $(BROKER_ADDRESS) --token-file $(TOKEN_FILE) --agent-id $(OLLAMA_AGENT_ID) --default-model $(OLLAMA_MODEL) --ollama-url $(OLLAMA_URL) --task-events-topic $(TASK_EVENTS_TOPIC) --results-topic $(OLLAMA_RESULTS_TOPIC) & \
 	agent_pid=$$!; \
 	sleep $(STARTUP_DELAY_SECONDS); \
-	cd apps/expressways-gateway && npm install >/dev/null && PORT=$(GATEWAY_PORT) EXPRESSWAYS_TRANSPORT=tcp EXPRESSWAYS_ADDRESS=$(BROKER_ADDRESS) EXPRESSWAYS_TOKEN_FILE=$(TOKEN_FILE) EXPRESSWAYS_TASK_EVENTS_TOPIC=$(TASK_EVENTS_TOPIC) EXPRESSWAYS_RESULTS_TOPIC=$(OLLAMA_RESULTS_TOPIC) npm start
+	cd apps/expressways-gateway && npm ci >/dev/null && PORT=$(GATEWAY_PORT) EXPRESSWAYS_TRANSPORT=tcp EXPRESSWAYS_ADDRESS=$(BROKER_ADDRESS) EXPRESSWAYS_TOKEN_FILE=$(TOKEN_FILE) EXPRESSWAYS_TASK_EVENTS_TOPIC=$(TASK_EVENTS_TOPIC) EXPRESSWAYS_RESULTS_TOPIC=$(OLLAMA_RESULTS_TOPIC) npm start
 
 benchmark: prepare-local-dirs
 	@echo "Running benchmarks..."

@@ -1,7 +1,14 @@
 {
   "name": "expressways-console",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Local monitoring and configuration console for Expressways",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Botfather/expressways.git",
+    "directory": "apps/expressways-console"
+  },
   "packageManager": "pnpm@10.28.2",
   "type": "module",
   "scripts": {

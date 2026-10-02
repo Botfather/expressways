@@ -1,5 +1,10 @@
 # Expressways
 
+[![CI](https://github.com/Botfather/expressways/actions/workflows/ci.yml/badge.svg)](https://github.com/Botfather/expressways/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> **Project status:** Alpha. Interfaces and persisted formats may change before `1.0`; there is currently no production support SLA.
+
 Expressways is a desktop-first, local-first coordination bus for multi-agent systems.
 
 It is not trying to be a general-purpose cloud event platform in Phase 1. It is trying to be a broker you can run on a workstation, understand completely, operate confidently, and extend carefully without sacrificing auditability, access control, integrity, or availability.
@@ -10,7 +15,7 @@ The project is built around a simple idea:
 
 That means every meaningful operation should be authenticated, authorized, quota-aware, auditable, observable, and recoverable. Expressways starts there and only adds complexity when the simpler system is already trustworthy.
 
-The original long-range concept lives in [docs/main.md](docs/main.md). The implemented system is intentionally smaller, sharper, and more honest. The current scope is described in [docs/design/phase-1-system-design.md](docs/design/phase-1-system-design.md), [docs/design/security-compliance-baseline.md](docs/design/security-compliance-baseline.md), [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md), [docs/design/nanobot-parity-on-expressways.md](docs/design/nanobot-parity-on-expressways.md), and [docs/adr/0001-phase-1-scope.md](docs/adr/0001-phase-1-scope.md).
+The implemented scope is described in [the documentation index](docs/README.md), [the Phase 1 system design](docs/design/phase-1-system-design.md), [the security baseline](docs/design/security-compliance-baseline.md), and [the Phase 1 scope ADR](docs/adr/0001-phase-1-scope.md). A deliberately non-authoritative [original vision archive](docs/archive/original-vision.md) records ideas that are not implemented or promised.
 
 ## Table of Contents
 
@@ -37,6 +42,7 @@ The original long-range concept lives in [docs/main.md](docs/main.md). The imple
 - [FAQ](#faq)
 - [Roadmap](#roadmap)
 - [Release Guardrails](#release-guardrails)
+- [Contributing and Support](#contributing-and-support)
 
 ## Why Expressways Exists
 
@@ -589,9 +595,12 @@ That means if you build with a subset of adopter features, you should update `ad
 
 ### Documentation
 
+- `docs/README.md`: documentation index and authority guidance.
 - `docs/design`: architecture and baseline operational contracts.
 - `docs/adr`: scope and design decisions.
+- `docs/operations`: installation and operator runbooks.
 - `docs/reviews`: critical review material.
+- `docs/archive`: historical, non-authoritative context.
 
 ## Quick Start
 
@@ -903,7 +912,7 @@ cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7
 Run the runtime:
 
 ```bash
-cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --ensure-topics true --workspace-root /Users/tusharmohan/Documents/@labs/expressways --allow-exec-program git --allow-exec-program ls
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --ensure-topics true --workspace-root "$(pwd)" --allow-exec-program git --allow-exec-program ls
 ```
 
 Nanobot file access and process execution are default-deny: at least one canonical `--workspace-root` is required for `read_file`, and `exec` accepts only exact program names supplied with `--allow-exec-program`. An empty executable allowlist disables `exec`. Subprocesses receive only a minimal `PATH`/locale environment, output capture is capped at 1 MiB per stream, and timed-out processes are terminated instead of continuing in the background.
@@ -911,20 +920,20 @@ Nanobot file access and process execution are default-deny: at least one canonic
 Run the runtime with native OpenAI provider:
 
 ```bash
-cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-api-key sk-1234 --provider-max-attempts 3 --provider-base-backoff-ms 200 --provider-max-backoff-ms 2000 --provider-jitter-ms 75 --provider-circuit-failure-threshold 3 --provider-circuit-cooldown-seconds 30 --workspace-root /Users/tusharmohan/Documents/@labs/expressways --allow-exec-program git --allow-exec-program ls
+OPENAI_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-max-attempts 3 --provider-base-backoff-ms 200 --provider-max-backoff-ms 2000 --provider-jitter-ms 75 --provider-circuit-failure-threshold 3 --provider-circuit-cooldown-seconds 30 --workspace-root "$(pwd)" --allow-exec-program git --allow-exec-program ls
 ```
 
 Enable provider text streaming into `nanobot.outbound.stream` (OpenAI or Anthropic):
 
 ```bash
-cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-api-key sk-1234 --provider-streaming true
-cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider anthropic --provider-model claude-3-5-sonnet-latest --provider-api-key sk-ant-1234 --provider-streaming true
+OPENAI_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-streaming true
+ANTHROPIC_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider anthropic --provider-model claude-3-5-sonnet-latest --provider-streaming true
 ```
 
 Run the runtime with native Anthropic provider:
 
 ```bash
-cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider anthropic --provider-model claude-3-5-sonnet-latest --provider-api-key sk-ant-1234 --workspace-root /Users/tusharmohan/Documents/@labs/expressways --allow-exec-program git --allow-exec-program ls
+ANTHROPIC_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider anthropic --provider-model claude-3-5-sonnet-latest --workspace-root "$(pwd)" --allow-exec-program git --allow-exec-program ls
 ```
 
 `--provider-api-key` falls back to `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for matching providers.
@@ -933,7 +942,7 @@ cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7
 Enable OpenAI primary with Anthropic failover:
 
 ```bash
-cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-api-key sk-1234 --provider-failover --fallback-provider-model claude-3-5-sonnet-latest --fallback-provider-api-key sk-ant-1234
+OPENAI_API_KEY='<provider-key>' ANTHROPIC_API_KEY='<fallback-provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-failover --fallback-provider-model claude-3-5-sonnet-latest
 ```
 
 Provider failures are returned to the user as a sanitized fallback response while detailed diagnostics are emitted to the runtime events topic.
@@ -1077,7 +1086,7 @@ curl -X POST http://127.0.0.1:8891/v1/webhook/handoff \
     },
     "routing": {
       "agent_id": "ops-assistant",
-      "workspace": "/Users/tusharmohan/Documents/@labs/expressways",
+      "workspace": "/path/to/expressways",
       "labels": ["handoff","triage"]
     }
   }'
@@ -1423,7 +1432,7 @@ Notably absent from the immediate roadmap:
 
 ## Release Guardrails
 
-Release packaging and publication are driven by `.github/workflows/release-skeleton.yml`.
+Release packaging and publication are driven by `.github/workflows/release-skeleton.yml`. Tag builds require configured signing material, validate the release manifest, and publish immutable GitHub Release assets only after those gates pass.
 The workflow now publishes:
 
 - per-platform bundles (`*.tar.gz`) and detached checksum files (`*.sha256`),
@@ -1446,3 +1455,11 @@ No new externally reachable operation should ship unless it:
 8. exposes enough metrics or verification surface for operators to explain what happened.
 
 If any of those are missing, the change is incomplete.
+
+## Contributing and Support
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), follow the [Code of Conduct](CODE_OF_CONDUCT.md), and review the [governance model](GOVERNANCE.md). General support expectations are in [SUPPORT.md](SUPPORT.md).
+
+Report security vulnerabilities privately according to [SECURITY.md](SECURITY.md). Do not place tokens, private keys, provider credentials, personal data, or unredacted support bundles in public issues.
+
+Expressways is available under the [MIT License](LICENSE).

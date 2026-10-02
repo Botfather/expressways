@@ -1,6 +1,6 @@
 # Expressways Gateway (Browser + SSE)
 
-Minimal Node gateway that lets a browser submit chat tasks into Expressways and receive task updates over Server-Sent Events.
+Minimal development gateway that lets a browser submit chat tasks into Expressways and receive task updates over Server-Sent Events. It binds to loopback by default and is not a general-purpose public ingress service.
 
 ## What it does
 
@@ -24,7 +24,7 @@ Open `http://127.0.0.1:8899/` for a minimal in-browser chat UI that submits prom
 
 ```bash
 cd apps/expressways-gateway
-npm install
+npm ci
 npm start
 ```
 
@@ -80,6 +80,8 @@ Optional query parameters:
 ## Environment variables
 
 - `PORT` (default `8899`)
+- `HOST` (default `127.0.0.1`; non-loopback values require `GATEWAY_ACCESS_BEARER`)
+- `GATEWAY_ACCESS_BEARER` (optional on loopback, required otherwise; clients send `Authorization: Bearer ...`)
 - `EXPRESSWAYS_TRANSPORT` (default `tcp`)
 - `EXPRESSWAYS_ADDRESS` (default `127.0.0.1:7766`)
 - `EXPRESSWAYS_TOKEN_FILE` (default `../../var/auth/developer.token`)
@@ -90,6 +92,12 @@ Optional query parameters:
 - `EXPRESSWAYSCTL_BIN` (default `../../target/debug/expresswaysctl`)
 - `POLL_INTERVAL_MS` (default `1000`)
 - `CONSUME_BATCH_LIMIT` (default `100`)
+- `REQUEST_TIMEOUT_MS` (default `15000`, bounded from 100 ms through 5 minutes)
+- `MAX_CONNECTIONS` (default `64`, hard ceiling `1024`)
+- `MAX_CHILD_OUTPUT_BYTES` (default `1 MiB`, hard ceiling `16 MiB`)
+- `MAX_ARTIFACT_BYTES` (default `1 MiB`, hard ceiling `16 MiB`)
+
+Prompts and system messages are bounded, task identifiers and offsets are validated, subprocess duration/output are capped, and local artifact paths are not returned to clients. Keep the gateway on loopback unless an authenticated deployment has been explicitly reviewed. The bundled browser demo does not implement a remote bearer-entry flow.
 
 ## One-command local stack
 

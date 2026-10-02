@@ -90,8 +90,12 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    #[error("binary serialization error: {0}")]
-    BinarySerialization(#[from] Box<bincode::ErrorKind>),
+    #[error("binary encoding error: {0}")]
+    BinaryEncoding(#[from] bincode::error::EncodeError),
+    #[error("binary decoding error: {0}")]
+    BinaryDecoding(#[from] bincode::error::DecodeError),
+    #[error("binary message contains {bytes} trailing bytes")]
+    TrailingBinaryData { bytes: usize },
     #[error("invalid topic name `{0}`")]
     InvalidTopic(String),
     #[error("topic `{0}` does not exist")]
@@ -133,6 +137,26 @@ pub enum StorageError {
         found: u32,
         supported: u32,
     },
+}
+
+fn encode_message(message: &StoredMessage) -> Result<Vec<u8>, StorageError> {
+    Ok(bincode::serde::encode_to_vec(
+        message,
+        bincode::config::legacy().with_limit::<{ MAX_STORED_FRAME_BYTES as usize }>(),
+    )?)
+}
+
+fn decode_message(payload: &[u8]) -> Result<StoredMessage, StorageError> {
+    let (message, consumed) = bincode::serde::decode_from_slice(
+        payload,
+        bincode::config::legacy().with_limit::<{ MAX_STORED_FRAME_BYTES as usize }>(),
+    )?;
+    if consumed != payload.len() {
+        return Err(StorageError::TrailingBinaryData {
+            bytes: payload.len() - consumed,
+        });
+    }
+    Ok(message)
 }
 
 impl Storage {
@@ -239,7 +263,7 @@ impl Storage {
             payload,
         };
 
-        let encoded = bincode::serialize(&message)?;
+        let encoded = encode_message(&message)?;
         if encoded.len() as u64 > MAX_STORED_FRAME_BYTES {
             return Err(StorageError::FrameTooLarge {
                 bytes: encoded.len(),
@@ -369,7 +393,7 @@ impl Storage {
                 let mut payload = vec![0u8; frame_len];
                 segment_file.read_exact(&mut payload)?;
 
-                let message: StoredMessage = bincode::deserialize(&payload)?;
+                let message = decode_message(&payload)?;
                 if message.offset < offset {
                     continue;
                 }
@@ -707,7 +731,7 @@ impl Storage {
                 }
                 let mut payload = vec![0u8; frame_len];
                 segment_file.read_exact(&mut payload)?;
-                messages.push(bincode::deserialize(&payload)?);
+                messages.push(decode_message(&payload)?);
             }
         }
 
@@ -736,7 +760,7 @@ impl Storage {
         let mut last_base = 0u64;
 
         for message in messages {
-            let encoded = bincode::serialize(message)?;
+            let encoded = encode_message(message)?;
             if encoded.len() as u64 > MAX_STORED_FRAME_BYTES {
                 return Err(StorageError::FrameTooLarge {
                     bytes: encoded.len(),

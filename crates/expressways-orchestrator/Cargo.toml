@@ -1,7 +1,12 @@
 [package]
 name = "expressways-orchestrator"
+authors.workspace = true
+description = "Deterministic task orchestration and operator tooling for Expressways"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

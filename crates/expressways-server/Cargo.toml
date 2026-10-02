@@ -10,8 +10,13 @@ adopter-registry-guard = ["dep:expressways-adopter-registry-guard"]
 
 [package]
 name = "expressways-server"
+authors.workspace = true
+description = "Secure local-first coordination broker for multi-agent systems"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
+publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

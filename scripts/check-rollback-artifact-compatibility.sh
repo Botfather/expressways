@@ -11,6 +11,8 @@ REQUIRED_SUFFIXES=(
   "/bin/expresswaysctl"
   "/configs/expressways.example.toml"
   "/scripts/expressways-service.sh"
+  "/LICENSE"
+  "/README.md"
   "/release-notes.md"
   "/checksums.txt"
 )

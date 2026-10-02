@@ -30,6 +30,8 @@ The `tasks` topic carries `TaskWorkItem` payloads with:
 - `skill`
 - `topic`
 - `principal`
+- `preferred_agents`
+- `avoid_agents`
 
 `retry_policy` keeps the first delivery model explicit:
 
@@ -43,7 +45,8 @@ The `task_events` topic carries `TaskEvent` payloads. The same topic is used for
 
 - orchestrator-published `assigned` events,
 - agent-published `completed` and `failed` events,
-- orchestrator-published `timed_out`, `retry_scheduled`, and `exhausted` events.
+- orchestrator-published `timed_out`, `retry_scheduled`, and `exhausted` events,
+- operator-published `pending` requeue and `canceled` events.
 
 Every event includes:
 
@@ -75,6 +78,10 @@ Canonical handoff payload shape is documented in:
   Bootstraps agent state from `list_agents`, tails `open_agent_watch_stream`, polls `tasks` and `task_events`, and persists the combined local view to disk.
 - `expressways-orchestrator assign`
   Keeps a manual escape hatch for publishing an audited `assigned` event from the current local registry view.
+- `expressways-orchestrator serve-dashboard`
+  Exposes bounded local queue, metrics, detail, and task-history views. Non-loopback listeners require a bearer credential.
+- `expressways-orchestrator list-tasks`, `show-task`, `show-metrics`, and `watch-tasks`
+  Provide persisted-state inspection without bypassing broker controls for mutations.
 
 ## State Model
 
@@ -95,15 +102,17 @@ The `agents` map is refreshed from the broker stream. The `tasks` map tracks the
 
 ## Assignment Strategy
 
-The current strategy remains `least_recently_assigned`:
+Scheduling is deterministic and explainable:
 
-- match active agents by optional `skill`, `topic`, and `principal`,
-- ignore expired agent cards even if they are still present in local state,
-- prefer agents that have never been assigned,
-- otherwise prefer the agent with the oldest `last_assigned_at`,
-- and use `agent_id` as the final tie-breaker.
+1. match active agents by optional `skill`, `topic`, and `principal`,
+2. exclude avoided agents,
+3. prefer the lowest active-assignment load,
+4. prefer explicitly requested agents,
+5. prefer agents with fewer historical assignments,
+6. prefer the least recently assigned agent,
+7. use `agent_id` as the final tie-breaker.
 
-This keeps the first task loop deterministic and easy to test.
+Ready tasks are ordered by higher task priority and then stable topic offset. Assignment events include a human-readable decision reason for operator inspection.
 
 ## Failure Model
 
@@ -112,6 +121,7 @@ This keeps the first task loop deterministic and easy to test.
 - If a task remains `assigned` past its lease timeout, the supervisor publishes `timed_out` and then either `retry_scheduled` or `exhausted`.
 - If an agent publishes `failed`, the supervisor applies the same retry-budget rules before reassignment.
 - If an agent publishes a stale outcome for an older `assignment_id`, the event is ignored so a newer assignment is not closed accidentally.
+- Event task offsets, attempt numbers, identifiers, reason sizes, and active lease identity are validated before state mutation. Raw task events are limited to 64 KiB and task work items to 1 MiB.
 - If an audited publish fails, the local task state is not advanced for that lifecycle transition.
 
 ## Audit and Compliance
@@ -122,7 +132,7 @@ This keeps the first task loop deterministic and easy to test.
 
 ## Next Steps
 
-- Multiple scheduling strategies such as sticky routing or weighted priority.
-- Supervisor metrics and health checks.
+- Additional scheduling strategies only where replay and fairness remain deterministic.
+- A stable public health contract for the supervisor process itself.
 - Topic partitioning or sharding once measurement justifies it.
 - Richer task result payload conventions for higher-level orchestration features.

@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Tauri monitoring suite for Expressways"
 authors = ["Expressways"]
 license = "MIT"
-repository = ""
+homepage = "https://github.com/Botfather/expressways"
+publish = false
+repository = "https://github.com/Botfather/expressways"
 edition = "2024"
 rust-version = "1.93"
 
