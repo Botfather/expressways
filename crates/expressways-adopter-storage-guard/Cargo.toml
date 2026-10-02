@@ -9,3 +9,4 @@ version.workspace = true
 expressways-adopter-api = { path = "../expressways-adopter-api" }
 serde.workspace = true
 toml.workspace = true
+uuid.workspace = true

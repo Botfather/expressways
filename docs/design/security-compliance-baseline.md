@@ -15,6 +15,7 @@ Security, compliance, and auditability are part of the runtime contract. They ar
 - Principals must be registered locally before their tokens are accepted.
 - Trusted issuers are explicitly configured and can be marked active, rotating, or disabled.
 - Revocation state for tokens, principals, and issuer keys is part of the runtime decision path.
+- Capability tokens, key files, and revocation files are size-bounded before decoding or allocation. Revocation state has bounded, unique entries and cache invalidation uses file identity as well as timestamp so replacement cannot silently preserve stale authorization decisions.
 - Discovery-registry ownership is derived from the verified principal, never from caller-supplied owner fields.
 - Discovery-registry freshness is explicit: cards must expire or be heartbeated, not linger indefinitely.
 
@@ -31,13 +32,14 @@ Security, compliance, and auditability are part of the runtime contract. They ar
 - Publish and consume operations must evaluate a quota profile.
 - Payload-size limits and consume batch limits must be enforced before storage work begins.
 - Rate-sensitive paths must choose an explicit overload behavior: reject or delay.
+- Quota profiles must have bounded payload, batch, rate-window, and delay settings so configuration cannot create unbounded work or effectively permanent delayed requests.
 - Quota denials are audited the same way policy denials are audited.
 
 ### Audit
 
 - Every allow and deny decision emits an audit event.
 - Audit events are append-only.
-- Audit events are hash-chained for tamper evidence.
+- Audit events are hash-chained for tamper evidence; current records bind their event ID and schema version into the hash, and an existing chain is fully verified before it can be extended. Verification processes the chain as a bounded-record stream so log length cannot cause startup memory growth, and oversized records fail closed.
 - Audit events include principal, action, resource, decision, and outcome.
 - Audit detail should include the capability token id when available.
 - Audit trails must be locally verifiable and exportable without requiring the broker to be online.
@@ -66,6 +68,7 @@ Security, compliance, and auditability are part of the runtime contract. They ar
 - Discovery watch streams must enforce explicit send-timeout and idle-close behavior so slow consumers cannot hold resources indefinitely.
 - Stream lifecycle metrics should expose opened streams, closed streams, keepalives, delivery failures, and slow-consumer drops.
 - Orchestrator local state may be cached on disk, but authoritative assignment decisions must be recorded through an audited broker path before local counters advance.
+- Orchestrator state loading must be size-bounded and fail closed on inconsistent identifiers or excessive collections; saves must atomically and durably replace an owner-only file.
 
 ### Compliance Metadata
 

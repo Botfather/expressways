@@ -1,27 +1,267 @@
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::path::PathBuf;
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use expressways_protocol::{
-    Classification, ControlCommand, ControlRequest, ControlResponse, ControlWireEnvelope,
-    StoredMessage, StreamFrame, TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent, TaskPayload, TaskStatus,
-    TaskWorkItem,
+    ArtifactMetadata, Classification, ControlCommand, ControlRequest, ControlResponse,
+    ControlWireEnvelope, StoredMessage, StreamFrame, TASK_EVENTS_TOPIC, TASKS_TOPIC, TaskEvent,
+    TaskPayload, TaskStatus, TaskWorkItem,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+pub const MAX_CAPABILITY_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+pub const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
+pub const MAX_AGENT_WORKER_STATE_BYTES: u64 = 1024 * 1024;
+pub const MAX_CLIENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+pub fn normalize_capability_token(token: &str) -> anyhow::Result<String> {
+    let token = token.trim();
+    anyhow::ensure!(!token.is_empty(), "capability token is empty");
+    anyhow::ensure!(
+        token.len() as u64 <= MAX_CAPABILITY_TOKEN_FILE_BYTES,
+        "capability token is {} bytes; maximum is {MAX_CAPABILITY_TOKEN_FILE_BYTES}",
+        token.len()
+    );
+    Ok(token.to_owned())
+}
+
+pub fn read_capability_token_file(path: &Path) -> anyhow::Result<String> {
+    let token = read_private_text_file(path, MAX_CAPABILITY_TOKEN_FILE_BYTES, "token")?;
+    normalize_capability_token(&token)
+        .map_err(|error| anyhow::anyhow!("invalid token file {}: {error}", path.display()))
+}
+
+pub fn read_secret_file(path: &Path) -> anyhow::Result<String> {
+    let secret = read_private_text_file(path, MAX_SECRET_FILE_BYTES, "secret")?;
+    let secret = secret.trim();
+    anyhow::ensure!(
+        !secret.is_empty(),
+        "secret file {} is empty",
+        path.display()
+    );
+    Ok(secret.to_owned())
+}
+
+pub async fn read_bounded_utf8_file(path: &Path, max_bytes: u64) -> anyhow::Result<String> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options
+        .open(path)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to inspect {}: {error}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= max_bytes,
+        "{} is {} bytes; maximum is {max_bytes}",
+        path.display(),
+        metadata.len()
+    );
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| anyhow::anyhow!("{} is too large to read", path.display()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= max_bytes,
+        "{} grew beyond the {max_bytes}-byte limit",
+        path.display()
+    );
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", path.display()))
+}
+
+fn read_private_text_file(path: &Path, max_bytes: u64, kind: &str) -> anyhow::Result<String> {
+    let initial_metadata = fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!("failed to inspect {kind} file {}: {error}", path.display())
+    })?;
+    anyhow::ensure!(
+        initial_metadata.file_type().is_file(),
+        "{kind} path {} is not a regular file",
+        path.display()
+    );
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{kind} path {} is not a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= max_bytes,
+        "{kind} file {} is {} bytes; maximum is {max_bytes}",
+        path.display(),
+        metadata.len()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "{kind} file {} has insecure permissions {mode:o}; expected no group or world access",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= max_bytes,
+        "{kind} file {} grew beyond its size limit",
+        path.display()
+    );
+    let value = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow::anyhow!("{kind} file {} is not valid UTF-8", path.display()))?;
+    Ok(value.to_owned())
+}
+
+pub fn load_agent_worker_state(path: &Path) -> anyhow::Result<AgentWorkerState> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AgentWorkerState::default());
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "failed to inspect worker state {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "worker state path {} is not a regular file",
+        path.display()
+    );
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "worker state path {} is not a regular file",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_AGENT_WORKER_STATE_BYTES,
+        "worker state {} is {} bytes; maximum is {MAX_AGENT_WORKER_STATE_BYTES}",
+        path.display(),
+        metadata.len()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        anyhow::ensure!(
+            mode & 0o022 == 0,
+            "worker state {} has unsafe writable permissions {mode:o}",
+            path.display()
+        );
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| anyhow::anyhow!("worker state {} is too large", path.display()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_AGENT_WORKER_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_AGENT_WORKER_STATE_BYTES,
+        "worker state {} grew beyond its size limit",
+        path.display()
+    );
+    serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!("failed to parse worker state {}: {error}", path.display())
+    })
+}
+
+pub fn save_agent_worker_state(path: &Path, state: &AgentWorkerState) -> anyhow::Result<()> {
+    let rendered = serde_json::to_vec_pretty(state)?;
+    anyhow::ensure!(
+        rendered.len() as u64 <= MAX_AGENT_WORKER_STATE_BYTES,
+        "serialized worker state is {} bytes; maximum is {MAX_AGENT_WORKER_STATE_BYTES}",
+        rendered.len()
+    );
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| anyhow::anyhow!("failed to create {}: {error}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("worker state path {} has no file name", path.display()))?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        Uuid::now_v7()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&rendered)?;
+        file.sync_all()?;
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+        .map_err(|error| anyhow::anyhow!("failed to save worker state {}: {error}", path.display()))
+}
 
 pub trait ClientIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -102,6 +342,8 @@ pub struct AssignedTask {
     pub assignment: TaskEvent,
     pub task_message: StoredMessage,
     pub task: TaskWorkItem,
+    #[doc(hidden)]
+    pub hydrated_payload_bytes: Option<Vec<u8>>,
 }
 
 impl AssignedTask {
@@ -190,29 +432,19 @@ impl AssignedTask {
             return Ok(bytes);
         }
         if let Some(file_ref) = self.payload_file_ref() {
-            return tokio::fs::read(&file_ref.path).await.map_err(|source| {
-                PayloadAccessError::Io {
-                    task_id: self.task.task_id.clone(),
-                    path: file_ref.path,
-                    source,
-                }
+            return Err(PayloadAccessError::UntrustedLocalPath {
+                task_id: self.task.task_id.clone(),
+                kind: "file_ref",
+                path: file_ref.path,
             });
         }
         if let Some(artifact_ref) = self.payload_artifact_ref() {
-            let path =
-                artifact_ref
-                    .local_path
-                    .ok_or_else(|| PayloadAccessError::MissingArtifactPath {
-                        task_id: self.task.task_id.clone(),
-                        artifact_id: artifact_ref.artifact_id,
-                    })?;
-            return tokio::fs::read(&path)
-                .await
-                .map_err(|source| PayloadAccessError::Io {
+            return self.hydrated_payload_bytes.clone().ok_or_else(|| {
+                PayloadAccessError::MissingArtifactBytes {
                     task_id: self.task.task_id.clone(),
-                    path,
-                    source,
-                });
+                    artifact_id: artifact_ref.artifact_id,
+                }
+            });
         }
         if let Some(text) = self.payload_text() {
             return Ok(text.as_bytes().to_vec());
@@ -292,10 +524,19 @@ pub enum PayloadAccessError {
     },
     #[error("task `{task_id}` has invalid inline bytes payload: {detail}")]
     InvalidInlineBytes { task_id: String, detail: String },
-    #[error("task `{task_id}` references artifact `{artifact_id}` without a local path")]
-    MissingArtifactPath {
+    #[error("task `{task_id}` references artifact `{artifact_id}` without broker-hydrated bytes")]
+    MissingArtifactBytes {
         task_id: String,
         artifact_id: String,
+    },
+    #[error(
+        "task `{task_id}` contains an untrusted {kind} local path `{}`; local path reads are disabled",
+        path.display()
+    )]
+    UntrustedLocalPath {
+        task_id: String,
+        kind: &'static str,
+        path: PathBuf,
     },
     #[error("failed to decode JSON payload for task `{task_id}`: {source}")]
     InvalidJson {
@@ -310,6 +551,66 @@ pub enum PayloadAccessError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Atomically writes a handler result below an operator-configured directory.
+///
+/// The destination parent is canonicalized after creation to reject symlink
+/// escapes. Writing through a same-directory temporary file prevents an
+/// existing destination symlink from redirecting the write.
+pub async fn write_contained_file(
+    root: &Path,
+    destination: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(root).await?;
+    let canonical_root = tokio::fs::canonicalize(root).await?;
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination has no parent directory",
+        )
+    })?;
+    tokio::fs::create_dir_all(parent).await?;
+    let canonical_parent = tokio::fs::canonicalize(parent).await?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "destination parent {} escapes configured root {}",
+                canonical_parent.display(),
+                canonical_root.display()
+            ),
+        ));
+    }
+
+    let file_name = destination.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination has no file name",
+        )
+    })?;
+    let temporary = canonical_parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        uuid::Uuid::now_v7()
+    ));
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, canonical_parent.join(file_name)).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
 }
 
 enum Transport {
@@ -346,6 +647,7 @@ struct MockClient {
 struct MockExchange {
     check: Box<dyn Fn(&ControlRequest) + Send + Sync>,
     response: Result<ControlResponse, ClientError>,
+    attachment: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Error)]
@@ -385,6 +687,12 @@ pub enum WorkerError {
     },
     #[error("malformed assignment event for task `{task_id}`: {detail}")]
     MalformedAssignment { task_id: String, detail: String },
+    #[error("failed to hydrate artifact `{artifact_id}` for task `{task_id}`: {detail}")]
+    ArtifactHydration {
+        task_id: String,
+        artifact_id: String,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -433,20 +741,20 @@ impl Client {
                 let stream = TcpStream::connect(address).await?;
                 stream.set_nodelay(true)?;
                 Ok(Self {
-                    transport: Transport::Tcp(Framed::new(stream, LengthDelimitedCodec::new())),
+                    transport: Transport::Tcp(Framed::new(stream, client_codec())),
                 })
             }
             #[cfg(unix)]
             Endpoint::Unix(path) => {
                 let stream = UnixStream::connect(path).await?;
                 Ok(Self {
-                    transport: Transport::Unix(Framed::new(stream, LengthDelimitedCodec::new())),
+                    transport: Transport::Unix(Framed::new(stream, client_codec())),
                 })
             }
             Endpoint::Custom(custom) => {
                 let stream = (custom.connector)().await?;
                 Ok(Self {
-                    transport: Transport::Custom(Framed::new(stream, LengthDelimitedCodec::new())),
+                    transport: Transport::Custom(Framed::new(stream, client_codec())),
                 })
             }
         }
@@ -480,6 +788,12 @@ impl Client {
     }
 }
 
+fn client_codec() -> LengthDelimitedCodec {
+    LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_CLIENT_FRAME_BYTES)
+        .new_codec()
+}
+
 impl StreamClient {
     pub async fn open(&mut self, request: ControlRequest) -> Result<StreamFrame, ClientError> {
         match &mut self.transport {
@@ -508,6 +822,17 @@ impl WorkerClient {
             Self::Mock(client) => client.send(request).await,
         }
     }
+
+    async fn send_with_attachment(
+        &mut self,
+        request: ControlRequest,
+    ) -> Result<(ControlResponse, Option<Vec<u8>>), ClientError> {
+        match self {
+            Self::Live(client) => client.send_with_attachment(request, None).await,
+            #[cfg(test)]
+            Self::Mock(client) => client.send_with_attachment(request).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -521,6 +846,22 @@ impl MockClient {
             .expect("unexpected request");
         (exchange.check)(&request);
         exchange.response
+    }
+
+    async fn send_with_attachment(
+        &mut self,
+        request: ControlRequest,
+    ) -> Result<(ControlResponse, Option<Vec<u8>>), ClientError> {
+        let exchange = self
+            .exchanges
+            .lock()
+            .expect("queue lock")
+            .pop_front()
+            .expect("unexpected request");
+        (exchange.check)(&request);
+        exchange
+            .response
+            .map(|response| (response, exchange.attachment))
     }
 }
 
@@ -834,10 +1175,64 @@ impl AgentWorker {
             .into());
         }
 
+        let hydrated_payload_bytes = if let TaskPayload::ArtifactRef {
+            artifact_id,
+            byte_length,
+            sha256,
+            ..
+        } = &task.payload
+        {
+            let (response, attachment) = client
+                .send_with_attachment(ControlRequest {
+                    capability_token: self.capability_token.clone(),
+                    command: ControlCommand::GetArtifact {
+                        artifact_id: artifact_id.clone(),
+                    },
+                })
+                .await
+                .map_err(WorkerError::from)?;
+            match response {
+                ControlResponse::Artifact { artifact } => {
+                    let bytes = attachment.ok_or_else(|| WorkerError::ArtifactHydration {
+                        task_id: task.task_id.clone(),
+                        artifact_id: artifact_id.clone(),
+                        detail: "broker response omitted artifact bytes".to_owned(),
+                    })?;
+                    verify_hydrated_artifact(
+                        &task.task_id,
+                        artifact_id,
+                        *byte_length,
+                        sha256.as_deref(),
+                        &artifact,
+                        &bytes,
+                    )?;
+                    Some(bytes)
+                }
+                ControlResponse::Error { code, message } => {
+                    return Err(WorkerError::Broker {
+                        operation: "hydrating task artifact",
+                        code,
+                        message,
+                    }
+                    .into());
+                }
+                other => {
+                    return Err(WorkerError::UnexpectedResponse {
+                        operation: "hydrating task artifact",
+                        response: format!("{other:?}"),
+                    }
+                    .into());
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(AssignedTask {
             assignment: assignment.clone(),
             task_message,
             task,
+            hydrated_payload_bytes,
         })
     }
 
@@ -859,6 +1254,38 @@ impl AgentWorker {
             emitted_at: Utc::now(),
         }
     }
+}
+
+fn verify_hydrated_artifact(
+    task_id: &str,
+    expected_artifact_id: &str,
+    declared_byte_length: Option<u64>,
+    declared_sha256: Option<&str>,
+    artifact: &ArtifactMetadata,
+    bytes: &[u8],
+) -> Result<(), WorkerError> {
+    let actual_length = bytes.len() as u64;
+    let actual_sha256 = hex::encode(Sha256::digest(bytes));
+    let invalid = artifact.artifact_id != expected_artifact_id
+        || artifact.byte_length != actual_length
+        || artifact.sha256 != actual_sha256
+        || declared_byte_length.is_some_and(|length| length != actual_length)
+        || declared_sha256.is_some_and(|sha256| sha256 != actual_sha256);
+    if invalid {
+        return Err(WorkerError::ArtifactHydration {
+            task_id: task_id.to_owned(),
+            artifact_id: expected_artifact_id.to_owned(),
+            detail: format!(
+                "integrity mismatch (response id={}, declared bytes={declared_byte_length:?}, response bytes={}, actual bytes={}, declared sha256={declared_sha256:?}, response sha256={}, actual sha256={})",
+                artifact.artifact_id,
+                artifact.byte_length,
+                actual_length,
+                artifact.sha256,
+                actual_sha256
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl Default for TaskExecutionContext {
@@ -886,12 +1313,15 @@ impl TaskExecutionContext {
     pub fn invalidation(&self) -> Option<TaskInvalidation> {
         self.invalidation
             .lock()
-            .expect("execution context lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
     fn invalidate(&self, invalidation: TaskInvalidation) {
-        let mut slot = self.invalidation.lock().expect("execution context lock");
+        let mut slot = self
+            .invalidation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if slot.is_none() {
             *slot = Some(invalidation);
             self.cancellation.cancel();
@@ -1206,6 +1636,131 @@ mod tests {
     use super::*;
     use expressways_protocol::{TaskPayload, TaskRequirements};
 
+    fn temp_token_path() -> PathBuf {
+        std::env::temp_dir().join(format!("expressways-token-{}", Uuid::now_v7()))
+    }
+
+    #[test]
+    fn capability_token_files_are_bounded_private_regular_files() {
+        let path = temp_token_path();
+        fs::write(&path, b"  signed-token\n").expect("write token");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("set private permissions");
+        }
+        assert_eq!(
+            read_capability_token_file(&path).expect("read token"),
+            "signed-token"
+        );
+
+        File::create(&path)
+            .expect("replace token")
+            .set_len(MAX_CAPABILITY_TOKEN_FILE_BYTES + 1)
+            .expect("make sparse oversized token");
+        assert!(read_capability_token_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_token_files_reject_insecure_modes_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let path = temp_token_path();
+        fs::write(&path, b"signed-token").expect("write token");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("set insecure permissions");
+        assert!(read_capability_token_file(&path).is_err());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("set secure permissions");
+        let link = temp_token_path();
+        symlink(&path, &link).expect("create symlink");
+        assert!(read_capability_token_file(&link).is_err());
+    }
+
+    #[test]
+    fn inline_capability_tokens_are_trimmed_and_bounded() {
+        assert_eq!(
+            normalize_capability_token("  signed-token \n").expect("normalize"),
+            "signed-token"
+        );
+        assert!(normalize_capability_token("  ").is_err());
+        assert!(
+            normalize_capability_token(&"x".repeat(MAX_CAPABILITY_TOKEN_FILE_BYTES as usize + 1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn client_codec_uses_the_explicit_protocol_frame_ceiling() {
+        assert_eq!(client_codec().max_frame_length(), MAX_CLIENT_FRAME_BYTES);
+    }
+
+    #[test]
+    fn worker_state_round_trips_through_private_atomic_file() {
+        let path = std::env::temp_dir().join(format!("expressways-worker-{}.json", Uuid::now_v7()));
+        let state = AgentWorkerState {
+            task_event_offset: 42,
+            pending_report: None,
+        };
+
+        save_agent_worker_state(&path, &state).expect("save worker state");
+        assert_eq!(
+            load_agent_worker_state(&path)
+                .expect("load worker state")
+                .task_event_offset,
+            42
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("inspect worker state")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        fs::remove_file(path).expect("remove worker state");
+    }
+
+    #[test]
+    fn worker_state_rejects_oversized_files_before_parsing() {
+        let path = std::env::temp_dir().join(format!("expressways-worker-{}.json", Uuid::now_v7()));
+        File::create(&path)
+            .expect("create worker state")
+            .set_len(MAX_AGENT_WORKER_STATE_BYTES + 1)
+            .expect("size worker state");
+
+        assert!(load_agent_worker_state(&path).is_err());
+        fs::remove_file(path).expect("remove worker state");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_state_rejects_symlinks_and_group_writable_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let path = std::env::temp_dir().join(format!("expressways-worker-{}.json", Uuid::now_v7()));
+        fs::write(&path, b"{}").expect("write worker state");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o620))
+            .expect("make worker state group writable");
+        assert!(load_agent_worker_state(&path).is_err());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("make worker state private");
+        let link = std::env::temp_dir().join(format!("expressways-worker-{}.json", Uuid::now_v7()));
+        symlink(&path, &link).expect("create worker state symlink");
+        assert!(load_agent_worker_state(&link).is_err());
+
+        fs::remove_file(link).expect("remove worker state symlink");
+        fs::remove_file(path).expect("remove worker state");
+    }
+
     #[tokio::test]
     async fn agent_worker_runs_assignment_and_publishes_completion() {
         let assignment_id =
@@ -1221,7 +1776,16 @@ mod tests {
             reason: None,
             emitted_at: Utc::now(),
         };
-        let task = task_work_item("task-1");
+        let artifact_bytes = b"managed artifact".to_vec();
+        let artifact_sha256 = hex::encode(Sha256::digest(&artifact_bytes));
+        let mut task = task_work_item("task-1");
+        task.payload = TaskPayload::artifact_ref(
+            "artifact-1",
+            Some("application/octet-stream".to_owned()),
+            Some(artifact_bytes.len() as u64),
+            Some(artifact_sha256.clone()),
+            Some("/untrusted/server/path.blob".to_owned()),
+        );
         let mut worker =
             AgentWorker::new(Endpoint::Tcp("unused".to_owned()), "signed-token", "alpha")
                 .with_mock_exchanges(vec![
@@ -1253,6 +1817,7 @@ mod tests {
                             next_offset: 5,
                         },
                     ),
+                    expect_get_artifact("artifact-1", artifact_bytes.clone(), artifact_sha256),
                     expect_consume(
                         TASK_EVENTS_TOPIC,
                         1,
@@ -1281,6 +1846,13 @@ mod tests {
         let outcome = worker
             .run_once(|assignment| async move {
                 assert_eq!(assignment.task.task_id, "task-1");
+                assert_eq!(
+                    assignment
+                        .read_payload_bytes()
+                        .await
+                        .expect("read hydrated artifact"),
+                    b"managed artifact".to_vec()
+                );
                 Ok(())
             })
             .await
@@ -1613,7 +2185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assigned_task_helpers_read_inline_and_file_payload_bytes() {
+    async fn assigned_task_helpers_read_inline_and_reject_untrusted_file_payloads() {
         let mut inline_task = task_work_item("task-inline");
         inline_task.payload = TaskPayload::bytes(b"PNG", "image/png");
         let inline_assigned = assigned_task(inline_task);
@@ -1629,8 +2201,7 @@ mod tests {
             b"PNG".to_vec()
         );
 
-        let path = std::env::temp_dir().join(format!("expressways-payload-{}.bin", Uuid::now_v7()));
-        std::fs::write(&path, b"PDF").expect("write payload file");
+        let path = PathBuf::from("/untrusted/host/path.pdf");
         let mut file_task = task_work_item("task-file");
         file_task.payload = TaskPayload::file_ref(
             path.display().to_string(),
@@ -1643,28 +2214,28 @@ mod tests {
         let file_ref = file_assigned.payload_file_ref().expect("file ref");
         assert_eq!(file_ref.path, path);
         assert_eq!(file_ref.content_type.as_deref(), Some("application/pdf"));
-        assert_eq!(
-            file_assigned.read_payload_bytes().await.expect("read file"),
-            b"PDF".to_vec()
-        );
-
-        let _ = std::fs::remove_file(file_ref.path);
+        let error = file_assigned
+            .read_payload_bytes()
+            .await
+            .expect_err("untrusted file references must not be read");
+        assert!(matches!(
+            error,
+            PayloadAccessError::UntrustedLocalPath { .. }
+        ));
     }
 
     #[tokio::test]
     async fn assigned_task_helpers_read_artifact_ref_payload_bytes() {
-        let path =
-            std::env::temp_dir().join(format!("expressways-artifact-{}.bin", Uuid::now_v7()));
-        std::fs::write(&path, b"PROTO").expect("write artifact file");
         let mut task = task_work_item("task-artifact");
         task.payload = TaskPayload::artifact_ref(
             "artifact-1",
             Some("application/x-protobuf".to_owned()),
             Some(5),
             Some("abc123".to_owned()),
-            Some(path.display().to_string()),
+            Some("/untrusted/server/path.blob".to_owned()),
         );
-        let assigned = assigned_task(task);
+        let mut assigned = assigned_task(task);
+        assigned.hydrated_payload_bytes = Some(b"PROTO".to_vec());
 
         let artifact_ref = assigned.payload_artifact_ref().expect("artifact ref");
         assert_eq!(artifact_ref.artifact_id, "artifact-1");
@@ -1679,8 +2250,88 @@ mod tests {
                 .expect("read artifact payload"),
             b"PROTO".to_vec()
         );
+    }
 
-        let _ = std::fs::remove_file(path);
+    #[test]
+    fn hydrated_artifact_verification_rejects_tampered_bytes() {
+        let expected = b"expected artifact";
+        let expected_sha256 = hex::encode(Sha256::digest(expected));
+        let metadata = ArtifactMetadata {
+            artifact_id: "artifact-1".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            byte_length: expected.len() as u64,
+            sha256: expected_sha256.clone(),
+            classification: Classification::Internal,
+            retention_class: expressways_protocol::RetentionClass::Operational,
+            created_at: Utc::now(),
+            principal: "local:developer".to_owned(),
+            local_path: Some("/untrusted/server/path.blob".to_owned()),
+        };
+
+        let error = verify_hydrated_artifact(
+            "task-1",
+            "artifact-1",
+            Some(expected.len() as u64),
+            Some(&expected_sha256),
+            &metadata,
+            b"tampered artifact",
+        )
+        .expect_err("tampered bytes must fail integrity verification");
+
+        assert!(matches!(error, WorkerError::ArtifactHydration { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_file_write_rejects_symlinked_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("expressways-output-{}", Uuid::now_v7()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        tokio::fs::create_dir_all(&outside)
+            .await
+            .expect("create outside");
+        symlink(&outside, root.join("escape")).expect("create symlink");
+
+        let error = write_contained_file(&root, &root.join("escape/result.json"), b"secret")
+            .await
+            .expect_err("symlink escape must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!outside.join("result.json").exists());
+
+        let _ = tokio::fs::remove_dir_all(base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_file_write_replaces_destination_symlink_not_target() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("expressways-output-{}", Uuid::now_v7()));
+        let root = base.join("root");
+        let outside = base.join("outside.txt");
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        tokio::fs::write(&outside, b"original")
+            .await
+            .expect("write outside");
+        let destination = root.join("result.json");
+        symlink(&outside, &destination).expect("create destination symlink");
+
+        write_contained_file(&root, &destination, b"safe")
+            .await
+            .expect("write contained file");
+        assert_eq!(
+            tokio::fs::read(&outside).await.expect("read outside"),
+            b"original"
+        );
+        assert_eq!(
+            tokio::fs::read(&destination).await.expect("read result"),
+            b"safe"
+        );
+
+        let _ = tokio::fs::remove_dir_all(base).await;
     }
 
     fn expect_consume(
@@ -1707,6 +2358,7 @@ mod tests {
                 }
             }),
             response: Ok(response),
+            attachment: None,
         }
     }
 
@@ -1756,6 +2408,35 @@ mod tests {
                 }
             }),
             response: Ok(response),
+            attachment: None,
+        }
+    }
+
+    fn expect_get_artifact(artifact_id: &str, bytes: Vec<u8>, sha256: String) -> MockExchange {
+        let expected_id = artifact_id.to_owned();
+        let response_id = expected_id.clone();
+        let byte_length = bytes.len() as u64;
+        MockExchange {
+            check: Box::new(move |request| match &request.command {
+                ControlCommand::GetArtifact { artifact_id } => {
+                    assert_eq!(artifact_id, &expected_id);
+                }
+                other => panic!("expected get artifact request, got {other:?}"),
+            }),
+            response: Ok(ControlResponse::Artifact {
+                artifact: ArtifactMetadata {
+                    artifact_id: response_id,
+                    content_type: "application/octet-stream".to_owned(),
+                    byte_length,
+                    sha256,
+                    classification: Classification::Internal,
+                    retention_class: expressways_protocol::RetentionClass::Operational,
+                    created_at: Utc::now(),
+                    principal: "local:developer".to_owned(),
+                    local_path: Some("/untrusted/server/path.blob".to_owned()),
+                },
+            }),
+            attachment: Some(bytes),
         }
     }
 
@@ -1796,6 +2477,7 @@ mod tests {
                 serde_json::to_string(&task).expect("serialize task"),
             ),
             task,
+            hydrated_payload_bytes: None,
         }
     }
 

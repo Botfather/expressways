@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::Path;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use chrono::{DateTime, Duration, Utc};
 use expressways_protocol::{
     AgentCard, AgentQuery, RegistryEvent, RegistryEventKind, TaskEvent, TaskPayload,
@@ -11,6 +13,20 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub type AssignmentRequirements = TaskRequirements;
+const ORCHESTRATOR_STATE_SCHEMA_VERSION: u32 = 1;
+const LEGACY_ORCHESTRATOR_STATE_SCHEMA_VERSION: u32 = 0;
+const MAX_ORCHESTRATOR_STATE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ORCHESTRATOR_AGENTS: usize = 10_000;
+const MAX_ORCHESTRATOR_TASKS: usize = 100_000;
+const MAX_ORCHESTRATOR_ASSIGNMENTS: usize = 10_000;
+const MAX_PENDING_TASK_EVENT_ACKS: usize = 100_000;
+const MAX_STATE_IDENTIFIER_BYTES: usize = 256;
+pub const MAX_TASK_WORK_ITEM_BYTES: usize = 1024 * 1024;
+pub const MAX_TASK_EVENT_BYTES: usize = 64 * 1024;
+const MAX_TASK_AGENT_HINTS: usize = 256;
+const MAX_TASK_ATTEMPTS: u32 = 1_000;
+const MAX_TASK_DURATION_SECONDS: u64 = 2_592_000;
+const MAX_TASK_EVENT_REASON_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AgentSelection<'a> {
@@ -73,18 +89,13 @@ pub struct OrchestratorMetricsView {
     pub tasks: TaskLifecycleMetrics,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TaskListSort {
+    #[default]
     Offset,
     Priority,
     Age,
     Retries,
-}
-
-impl Default for TaskListSort {
-    fn default() -> Self {
-        Self::Offset
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -301,8 +312,17 @@ pub fn ingest_task(
     work_item: TaskWorkItem,
     task_offset: u64,
 ) -> bool {
+    try_ingest_task(state, work_item, task_offset).unwrap_or(false)
+}
+
+pub fn try_ingest_task(
+    state: &mut OrchestratorState,
+    work_item: TaskWorkItem,
+    task_offset: u64,
+) -> anyhow::Result<bool> {
+    validate_task_work_item(&work_item)?;
     if state.tasks.contains_key(&work_item.task_id) {
-        return false;
+        return Ok(false);
     }
 
     let task_id = work_item.task_id.clone();
@@ -321,7 +341,7 @@ pub fn ingest_task(
             last_error: None,
         },
     );
-    true
+    Ok(true)
 }
 
 pub fn select_agent<'a>(
@@ -569,6 +589,11 @@ pub fn record_local_task_event(
     state: &mut OrchestratorState,
     event: TaskEvent,
 ) -> TaskEventApplyOutcome {
+    if state.pending_task_event_acks.len() >= MAX_PENDING_TASK_EVENT_ACKS
+        && !state.pending_task_event_acks.contains(&event.event_id)
+    {
+        return TaskEventApplyOutcome::SkippedMalformed;
+    }
     state.pending_task_event_acks.insert(event.event_id);
     let outcome = apply_task_event_inner(state, &event);
     if outcome != TaskEventApplyOutcome::Applied {
@@ -589,33 +614,368 @@ pub fn apply_task_event_message(
 }
 
 pub fn load_state(path: &Path) -> anyhow::Result<OrchestratorState> {
-    let raw = std::fs::read_to_string(path)
+    let raw = read_bounded_state(path)
         .with_context(|| format!("failed to read orchestrator state {}", path.display()))?;
-    serde_json::from_str(&raw).context("failed to parse orchestrator state")
+    let mut document: OrchestratorStateDocument =
+        serde_json::from_slice(&raw).context("failed to parse orchestrator state")?;
+    let migrated = migrate_orchestrator_state_document(&mut document)?;
+    validate_orchestrator_state(&document.state)?;
+    if migrated {
+        save_state(path, &document.state)?;
+    }
+    Ok(document.state)
 }
 
 pub fn save_state(path: &Path, state: &OrchestratorState) -> anyhow::Result<()> {
+    validate_orchestrator_state(state)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let rendered = serde_json::to_vec_pretty(state)?;
-    std::fs::write(path, rendered)
+    let rendered = serde_json::to_vec_pretty(&OrchestratorStateDocumentRef {
+        schema_version: ORCHESTRATOR_STATE_SCHEMA_VERSION,
+        state,
+    })?;
+    if rendered.len() as u64 > MAX_ORCHESTRATOR_STATE_BYTES {
+        bail!(
+            "orchestrator state is {} bytes, exceeding the {} byte limit",
+            rendered.len(),
+            MAX_ORCHESTRATOR_STATE_BYTES
+        );
+    }
+    atomic_replace_state(path, &rendered)
         .with_context(|| format!("failed to write orchestrator state {}", path.display()))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrchestratorStateDocument {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(flatten)]
+    state: OrchestratorState,
+}
+
+#[derive(Serialize)]
+struct OrchestratorStateDocumentRef<'a> {
+    schema_version: u32,
+    #[serde(flatten)]
+    state: &'a OrchestratorState,
+}
+
+fn read_bounded_state(path: &Path) -> std::io::Result<Vec<u8>> {
+    let initial_metadata = fs::symlink_metadata(path)?;
+    if !initial_metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "state path is not a regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "state path is not a regular file",
+        ));
+    }
+    let length = metadata.len();
+    if length > MAX_ORCHESTRATOR_STATE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "state is {length} bytes, exceeding the {MAX_ORCHESTRATOR_STATE_BYTES} byte limit"
+            ),
+        ));
+    }
+    let capacity = usize::try_from(length).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "state is too large to read",
+        )
+    })?;
+    let mut raw = Vec::with_capacity(capacity);
+    file.take(MAX_ORCHESTRATOR_STATE_BYTES + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_ORCHESTRATOR_STATE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "state grew beyond its size limit while being read",
+        ));
+    }
+    Ok(raw)
+}
+
+fn validate_orchestrator_state(state: &OrchestratorState) -> anyhow::Result<()> {
+    validate_collection_limit("agents", state.agents.len(), MAX_ORCHESTRATOR_AGENTS)?;
+    validate_collection_limit("tasks", state.tasks.len(), MAX_ORCHESTRATOR_TASKS)?;
+    validate_collection_limit(
+        "assignments",
+        state.assignments.len(),
+        MAX_ORCHESTRATOR_ASSIGNMENTS,
+    )?;
+    validate_collection_limit(
+        "pending task event acknowledgements",
+        state.pending_task_event_acks.len(),
+        MAX_PENDING_TASK_EVENT_ACKS,
+    )?;
+    for (agent_id, card) in &state.agents {
+        validate_state_identifier("agent", agent_id)?;
+        if agent_id != &card.agent_id {
+            bail!(
+                "orchestrator agent map key `{agent_id}` does not match card id `{}`",
+                card.agent_id
+            );
+        }
+    }
+    for (task_id, record) in &state.tasks {
+        validate_state_identifier("task", task_id)?;
+        validate_task_work_item(&record.work_item)?;
+        if task_id != &record.work_item.task_id {
+            bail!(
+                "orchestrator task map key `{task_id}` does not match work item id `{}`",
+                record.work_item.task_id
+            );
+        }
+        if record.attempts > max_attempts(record) {
+            bail!("orchestrator task `{task_id}` exceeds its attempt budget");
+        }
+        for (kind, value) in [
+            (
+                "assignment reason",
+                record.last_assignment_reason.as_deref(),
+            ),
+            ("error", record.last_error.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.len() > MAX_TASK_EVENT_REASON_BYTES) {
+                bail!("orchestrator task `{task_id}` {kind} exceeds its size limit");
+            }
+        }
+        match (&record.status, &record.active_assignment) {
+            (TaskStatus::Assigned, Some(assignment)) => {
+                validate_state_identifier("lease agent", &assignment.agent_id)?;
+                if assignment.attempt == 0
+                    || assignment.attempt != record.attempts
+                    || assignment.attempt > max_attempts(record)
+                {
+                    bail!("orchestrator task `{task_id}` has an invalid lease attempt");
+                }
+            }
+            (TaskStatus::Assigned, None) => {
+                bail!("orchestrator task `{task_id}` is assigned without a lease");
+            }
+            (_, Some(_)) => {
+                bail!("orchestrator task `{task_id}` has a lease while not assigned");
+            }
+            (_, None) => {}
+        }
+        if record.next_retry_at.is_some() && record.status != TaskStatus::RetryScheduled {
+            bail!("orchestrator task `{task_id}` has a retry time in an invalid state");
+        }
+    }
+    for agent_id in state.assignments.keys() {
+        validate_state_identifier("assignment agent", agent_id)?;
+    }
+    Ok(())
+}
+
+pub fn validate_task_work_item(work_item: &TaskWorkItem) -> anyhow::Result<()> {
+    validate_state_identifier("task", &work_item.task_id)?;
+    validate_state_identifier("task type", &work_item.task_type)?;
+    for (kind, value) in [
+        ("required skill", work_item.requirements.skill.as_deref()),
+        ("required topic", work_item.requirements.topic.as_deref()),
+        (
+            "required principal",
+            work_item.requirements.principal.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_state_identifier(kind, value)?;
+        }
+    }
+    validate_task_agent_hints("preferred agents", &work_item.requirements.preferred_agents)?;
+    validate_task_agent_hints("avoided agents", &work_item.requirements.avoid_agents)?;
+    let avoided = work_item
+        .requirements
+        .avoid_agents
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if let Some(conflict) = work_item
+        .requirements
+        .preferred_agents
+        .iter()
+        .find(|agent| avoided.contains(agent))
+    {
+        bail!("task agent `{conflict}` cannot be both preferred and avoided");
+    }
+
+    if !(1..=MAX_TASK_ATTEMPTS).contains(&work_item.retry_policy.max_attempts) {
+        bail!("task max_attempts must be between 1 and {MAX_TASK_ATTEMPTS}");
+    }
+    for (field, value) in [
+        ("timeout_seconds", work_item.retry_policy.timeout_seconds),
+        (
+            "retry_delay_seconds",
+            work_item.retry_policy.retry_delay_seconds,
+        ),
+    ] {
+        if !(1..=MAX_TASK_DURATION_SECONDS).contains(&value) {
+            bail!("task {field} must be between 1 and {MAX_TASK_DURATION_SECONDS}");
+        }
+    }
+
+    let encoded = serde_json::to_vec(work_item).context("failed to serialize task work item")?;
+    if encoded.len() > MAX_TASK_WORK_ITEM_BYTES {
+        bail!(
+            "serialized task work item is {} bytes; maximum is {MAX_TASK_WORK_ITEM_BYTES}",
+            encoded.len()
+        );
+    }
+    Ok(())
+}
+
+fn validate_task_agent_hints(kind: &str, agents: &[String]) -> anyhow::Result<()> {
+    if agents.len() > MAX_TASK_AGENT_HINTS {
+        bail!("task has too many {kind}; maximum is {MAX_TASK_AGENT_HINTS}");
+    }
+    let mut unique = BTreeSet::new();
+    for agent in agents {
+        validate_state_identifier(kind, agent)?;
+        if !unique.insert(agent) {
+            bail!("task {kind} contains duplicate agent `{agent}`");
+        }
+    }
+    Ok(())
+}
+
+fn validate_collection_limit(name: &str, actual: usize, limit: usize) -> anyhow::Result<()> {
+    if actual > limit {
+        bail!("orchestrator state has {actual} {name}, exceeding the limit of {limit}");
+    }
+    Ok(())
+}
+
+fn validate_state_identifier(kind: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() || value.len() > MAX_STATE_IDENTIFIER_BYTES {
+        bail!("orchestrator {kind} identifier must contain 1..={MAX_STATE_IDENTIFIER_BYTES} bytes");
+    }
+    Ok(())
+}
+
+fn atomic_replace_state(path: &Path, rendered: &[u8]) -> std::io::Result<()> {
+    let temp_path = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(rendered)?;
+        file.sync_all()?;
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&temp_path, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path);
+    }
+    result
+}
+
+fn migrate_orchestrator_state_document(
+    document: &mut OrchestratorStateDocument,
+) -> anyhow::Result<bool> {
+    match document.schema_version {
+        LEGACY_ORCHESTRATOR_STATE_SCHEMA_VERSION => {
+            document.schema_version = ORCHESTRATOR_STATE_SCHEMA_VERSION;
+            Ok(true)
+        }
+        ORCHESTRATOR_STATE_SCHEMA_VERSION => Ok(false),
+        found => bail!(
+            "orchestrator state schema version {} is newer than supported version {}",
+            found,
+            ORCHESTRATOR_STATE_SCHEMA_VERSION
+        ),
+    }
 }
 
 fn apply_task_event_inner(
     state: &mut OrchestratorState,
     event: &TaskEvent,
 ) -> TaskEventApplyOutcome {
+    if !valid_task_event_shape(event) {
+        return TaskEventApplyOutcome::SkippedMalformed;
+    }
+
+    let Some(task) = state.tasks.get(&event.task_id) else {
+        return TaskEventApplyOutcome::SkippedMissingTask;
+    };
+    if event
+        .task_offset
+        .is_some_and(|task_offset| task_offset != task.task_offset)
+        || event.attempt > max_attempts(task)
+    {
+        return TaskEventApplyOutcome::SkippedMalformed;
+    }
+
+    let preflight = match event.status {
+        TaskStatus::Pending | TaskStatus::Canceled => {
+            if event.assignment_id.is_some() || event.agent_id.is_some() {
+                if matches_current_assignment(task, event) {
+                    TaskEventApplyOutcome::Applied
+                } else {
+                    TaskEventApplyOutcome::SkippedStaleAssignment
+                }
+            } else {
+                TaskEventApplyOutcome::Applied
+            }
+        }
+        TaskStatus::Assigned => {
+            if event.assignment_id.is_none() || event.agent_id.is_none() || event.attempt == 0 {
+                TaskEventApplyOutcome::SkippedMalformed
+            } else {
+                TaskEventApplyOutcome::Applied
+            }
+        }
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::TimedOut => {
+            if matches_current_assignment(task, event) {
+                TaskEventApplyOutcome::Applied
+            } else {
+                TaskEventApplyOutcome::SkippedStaleAssignment
+            }
+        }
+        TaskStatus::RetryScheduled | TaskStatus::Exhausted => TaskEventApplyOutcome::Applied,
+    };
+    if preflight != TaskEventApplyOutcome::Applied {
+        return preflight;
+    }
+
     state.observed_at = state.observed_at.max(event.emitted_at);
 
     let mut assigned_agent = None;
     let outcome = {
-        let Some(task) = state.tasks.get_mut(&event.task_id) else {
-            return TaskEventApplyOutcome::SkippedMissingTask;
-        };
+        let task = state
+            .tasks
+            .get_mut(&event.task_id)
+            .expect("task existence checked before mutation");
 
         task.last_event_at = event.emitted_at;
         task.attempts = task.attempts.max(event.attempt);
@@ -625,12 +985,6 @@ fn apply_task_event_inner(
 
         match event.status {
             TaskStatus::Pending => {
-                if (event.assignment_id.is_some() || event.agent_id.is_some())
-                    && !matches_current_assignment(task, event)
-                {
-                    return TaskEventApplyOutcome::SkippedStaleAssignment;
-                }
-
                 task.status = TaskStatus::Pending;
                 task.active_assignment = None;
                 task.next_retry_at = None;
@@ -639,7 +993,7 @@ fn apply_task_event_inner(
             TaskStatus::Assigned => {
                 let (Some(assignment_id), Some(agent_id)) = (event.assignment_id, &event.agent_id)
                 else {
-                    return TaskEventApplyOutcome::SkippedMalformed;
+                    unreachable!("assignment fields checked before mutation");
                 };
 
                 task.status = TaskStatus::Assigned;
@@ -657,10 +1011,6 @@ fn apply_task_event_inner(
                 TaskEventApplyOutcome::Applied
             }
             TaskStatus::Completed => {
-                if !matches_current_assignment(task, event) {
-                    return TaskEventApplyOutcome::SkippedStaleAssignment;
-                }
-
                 task.status = TaskStatus::Completed;
                 task.active_assignment = None;
                 task.next_retry_at = None;
@@ -668,10 +1018,6 @@ fn apply_task_event_inner(
                 TaskEventApplyOutcome::Applied
             }
             TaskStatus::Failed => {
-                if !matches_current_assignment(task, event) {
-                    return TaskEventApplyOutcome::SkippedStaleAssignment;
-                }
-
                 task.status = TaskStatus::Failed;
                 task.active_assignment = None;
                 task.next_retry_at = None;
@@ -684,10 +1030,6 @@ fn apply_task_event_inner(
                 TaskEventApplyOutcome::Applied
             }
             TaskStatus::TimedOut => {
-                if !matches_current_assignment(task, event) {
-                    return TaskEventApplyOutcome::SkippedStaleAssignment;
-                }
-
                 task.status = TaskStatus::TimedOut;
                 task.active_assignment = None;
                 task.next_retry_at = None;
@@ -700,12 +1042,6 @@ fn apply_task_event_inner(
                 TaskEventApplyOutcome::Applied
             }
             TaskStatus::Canceled => {
-                if (event.assignment_id.is_some() || event.agent_id.is_some())
-                    && !matches_current_assignment(task, event)
-                {
-                    return TaskEventApplyOutcome::SkippedStaleAssignment;
-                }
-
                 task.status = TaskStatus::Canceled;
                 task.active_assignment = None;
                 task.next_retry_at = None;
@@ -719,6 +1055,19 @@ fn apply_task_event_inner(
     }
 
     outcome
+}
+
+fn valid_task_event_shape(event: &TaskEvent) -> bool {
+    !event.task_id.is_empty()
+        && event.task_id.len() <= MAX_STATE_IDENTIFIER_BYTES
+        && event.agent_id.as_ref().is_none_or(|agent_id| {
+            !agent_id.is_empty() && agent_id.len() <= MAX_STATE_IDENTIFIER_BYTES
+        })
+        && event
+            .reason
+            .as_ref()
+            .is_none_or(|reason| reason.len() <= MAX_TASK_EVENT_REASON_BYTES)
+        && event.attempt <= MAX_TASK_ATTEMPTS
 }
 
 fn note_agent_assignment(
@@ -769,6 +1118,7 @@ fn matches_current_assignment(task: &TaskRecord, event: &TaskEvent) -> bool {
             .agent_id
             .as_deref()
             .is_some_and(|agent_id| agent_id == active_assignment.agent_id)
+        && event.attempt == active_assignment.attempt
 }
 
 fn matches_requirements(agent: &AgentCard, requirements: &AssignmentRequirements) -> bool {
@@ -1034,6 +1384,9 @@ mod tests {
         AgentEndpoint, Classification, RetentionClass, TaskEvent, TaskRetryPolicy,
     };
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -1092,6 +1445,145 @@ mod tests {
                 retry_delay_seconds: 30,
             },
             submitted_at: Utc::now(),
+        }
+    }
+
+    fn temp_state_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "expressways-orchestrator-state-{}.json",
+            Uuid::now_v7()
+        ))
+    }
+
+    #[test]
+    fn load_state_migrates_legacy_schema_and_rewrites_file() {
+        let path = temp_state_path();
+        let legacy = OrchestratorState::default();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy state"),
+        )
+        .expect("write legacy state");
+
+        let loaded = load_state(&path).expect("load state");
+        assert_eq!(loaded.task_offset, legacy.task_offset);
+
+        let rewritten = fs::read_to_string(path).expect("read rewritten state");
+        let value: serde_json::Value = serde_json::from_str(&rewritten).expect("parse rewritten");
+        assert_eq!(value["schema_version"], ORCHESTRATOR_STATE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn load_state_rejects_newer_schema_versions() {
+        let path = temp_state_path();
+        fs::write(&path, "{\"schema_version\":99}").expect("write unsupported state");
+        let error = load_state(&path).expect_err("unsupported state should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("orchestrator state schema version 99 is newer than supported version 1")
+        );
+    }
+
+    #[test]
+    fn load_state_rejects_oversized_files_before_parsing() {
+        let path = temp_state_path();
+        File::create(&path)
+            .expect("create state")
+            .set_len(MAX_ORCHESTRATOR_STATE_BYTES + 1)
+            .expect("make sparse oversized state");
+
+        let error = load_state(&path).expect_err("oversized state must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read orchestrator state")
+        );
+        assert!(format!("{error:#}").contains("exceeding the 67108864 byte limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_state_rejects_symlinked_files() {
+        use std::os::unix::fs::symlink;
+
+        let target = temp_state_path();
+        let link = temp_state_path();
+        save_state(&target, &OrchestratorState::default()).expect("save target state");
+        symlink(&target, &link).expect("create state symlink");
+
+        assert!(load_state(&link).is_err());
+    }
+
+    #[test]
+    fn state_validation_rejects_mismatched_keys_and_excessive_collections() {
+        let path = temp_state_path();
+        let mut mismatched = OrchestratorState::default();
+        mismatched
+            .agents
+            .insert("map-key".to_owned(), card("card-id", "summarize"));
+        let error = save_state(&path, &mismatched).expect_err("mismatched key must fail");
+        assert!(error.to_string().contains("does not match card id"));
+
+        let mut excessive = OrchestratorState::default();
+        for index in 0..=MAX_ORCHESTRATOR_ASSIGNMENTS {
+            excessive
+                .assignments
+                .insert(format!("agent-{index}"), AgentAssignmentStats::default());
+        }
+        let error = save_state(&path, &excessive).expect_err("excessive state must fail");
+        assert!(error.to_string().contains("10001 assignments"));
+    }
+
+    #[test]
+    fn invalid_work_items_are_rejected_before_state_mutation() {
+        let mut state = OrchestratorState::default();
+        let mut invalid = task("task-1", "summarize", 3);
+        invalid.requirements.preferred_agents = vec!["alpha".to_owned(), "alpha".to_owned()];
+        let error =
+            try_ingest_task(&mut state, invalid, 0).expect_err("duplicate agent hints must fail");
+        assert!(error.to_string().contains("duplicate agent"));
+        assert!(state.tasks.is_empty());
+
+        let mut invalid = task("task-2", "summarize", 3);
+        invalid.requirements.preferred_agents = vec!["alpha".to_owned()];
+        invalid.requirements.avoid_agents = vec!["alpha".to_owned()];
+        assert!(try_ingest_task(&mut state, invalid, 1).is_err());
+        assert!(state.tasks.is_empty());
+
+        let mut invalid = task("task-3", "summarize", 3);
+        invalid.payload = TaskPayload::text(
+            "x".repeat(MAX_TASK_WORK_ITEM_BYTES),
+            "text/plain".to_owned(),
+        );
+        let error = try_ingest_task(&mut state, invalid, 2)
+            .expect_err("oversized task must fail before insertion");
+        assert!(error.to_string().contains("serialized task work item"));
+        assert!(state.tasks.is_empty());
+
+        let mut invalid = task("task-4", "summarize", 3);
+        invalid.retry_policy.timeout_seconds = u64::MAX;
+        assert!(try_ingest_task(&mut state, invalid, 3).is_err());
+        assert!(state.tasks.is_empty());
+    }
+
+    #[test]
+    fn save_state_uses_owner_only_atomic_file() {
+        let path = temp_state_path();
+        save_state(&path, &OrchestratorState::default()).expect("save state");
+        load_state(&path).expect("load saved state");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path)
+                    .expect("state metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
     }
 
@@ -1350,6 +1842,12 @@ mod tests {
             TaskEventApplyOutcome::Applied
         );
 
+        let observed_at = state.observed_at;
+        let tracked_before = state.tasks.get("task-1").expect("tracked task");
+        let attempts_before = tracked_before.attempts;
+        let last_event_at_before = tracked_before.last_event_at;
+        let last_error_before = tracked_before.last_error.clone();
+
         let stale_completion = TaskEvent {
             event_id: Uuid::now_v7(),
             task_id: "task-1".to_owned(),
@@ -1367,6 +1865,10 @@ mod tests {
         );
 
         let tracked = state.tasks.get("task-1").expect("tracked task");
+        assert_eq!(state.observed_at, observed_at);
+        assert_eq!(tracked.attempts, attempts_before);
+        assert_eq!(tracked.last_event_at, last_event_at_before);
+        assert_eq!(tracked.last_error, last_error_before);
         assert_eq!(tracked.status, TaskStatus::Assigned);
         assert_eq!(
             tracked
@@ -1376,6 +1878,40 @@ mod tests {
                 .agent_id,
             "beta"
         );
+    }
+
+    #[test]
+    fn malformed_task_events_do_not_mutate_state() {
+        let mut state = OrchestratorState::default();
+        assert!(ingest_task(&mut state, task("task-1", "summarize", 3), 7));
+
+        let observed_at = state.observed_at;
+        let tracked_before = state.tasks.get("task-1").expect("tracked task");
+        let last_event_at = tracked_before.last_event_at;
+        let malformed = TaskEvent {
+            event_id: Uuid::now_v7(),
+            task_id: "task-1".to_owned(),
+            task_offset: Some(8),
+            assignment_id: None,
+            agent_id: None,
+            status: TaskStatus::RetryScheduled,
+            attempt: 1,
+            reason: Some("malformed event".to_owned()),
+            emitted_at: observed_at + Duration::hours(1),
+        };
+
+        assert_eq!(
+            apply_task_event_message(&mut state, malformed),
+            TaskEventApplyOutcome::SkippedMalformed
+        );
+
+        let tracked = state.tasks.get("task-1").expect("tracked task");
+        assert_eq!(state.observed_at, observed_at);
+        assert_eq!(tracked.status, TaskStatus::Pending);
+        assert_eq!(tracked.attempts, 0);
+        assert_eq!(tracked.last_event_at, last_event_at);
+        assert_eq!(tracked.last_error, None);
+        assert_eq!(tracked.next_retry_at, None);
     }
 
     #[test]

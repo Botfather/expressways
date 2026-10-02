@@ -5,13 +5,23 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use thiserror::Error;
 
+const MAX_QUOTA_PROFILES: usize = 1_000;
+const MAX_QUOTA_NAME_BYTES: usize = 256;
+const MAX_QUOTA_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_QUOTA_CONSUME_LIMIT: usize = 10_000;
+const MAX_QUOTA_REQUESTS_PER_WINDOW: u32 = 1_000_000;
+const MAX_QUOTA_WINDOW_SECONDS: u64 = 86_400;
+const MAX_BACKPRESSURE_DELAY_MS: u64 = 3_600_000;
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuotaConfig {
     #[serde(default)]
     pub profiles: Vec<QuotaProfile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuotaProfile {
     pub name: String,
     pub publish_payload_max_bytes: usize,
@@ -28,15 +38,11 @@ pub struct QuotaProfile {
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BackpressureMode {
+    #[default]
     Reject,
     Delay,
-}
-
-impl Default for BackpressureMode {
-    fn default() -> Self {
-        Self::Reject
-    }
 }
 
 #[derive(Debug)]
@@ -114,6 +120,12 @@ impl QuotaManager {
         if config.profiles.is_empty() {
             anyhow::bail!("at least one quota profile is required");
         }
+        if config.profiles.len() > MAX_QUOTA_PROFILES {
+            anyhow::bail!(
+                "quota config has {} profiles, exceeding the limit of {MAX_QUOTA_PROFILES}",
+                config.profiles.len()
+            );
+        }
 
         let mut profiles = HashMap::new();
         for profile in config.profiles {
@@ -159,7 +171,7 @@ impl QuotaManager {
             });
         }
 
-        self.enforce_rate(principal, &profile, QuotaOperation::Publish)
+        self.enforce_rate(principal, profile, QuotaOperation::Publish)
             .await
     }
 
@@ -179,14 +191,13 @@ impl QuotaManager {
             });
         }
 
-        self.enforce_rate(principal, &profile, QuotaOperation::Consume)
+        self.enforce_rate(principal, profile, QuotaOperation::Consume)
             .await
     }
 
-    fn profile(&self, profile_name: &str) -> Result<QuotaProfile, QuotaError> {
+    fn profile(&self, profile_name: &str) -> Result<&QuotaProfile, QuotaError> {
         self.profiles
             .get(profile_name)
-            .cloned()
             .ok_or_else(|| QuotaError::UnknownProfile(profile_name.to_owned()))
     }
 
@@ -214,7 +225,10 @@ impl QuotaManager {
         profile: &QuotaProfile,
         operation: QuotaOperation,
     ) -> Result<RateDecision, QuotaError> {
-        let mut usage = self.usage.lock().expect("quota usage lock");
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = QuotaBucket {
             principal: principal.to_owned(),
             operation,
@@ -251,12 +265,18 @@ impl QuotaManager {
 }
 
 fn validate_profile(profile: &QuotaProfile) -> anyhow::Result<()> {
-    if profile.name.trim().is_empty() {
-        anyhow::bail!("quota profile names must not be empty");
+    if profile.name.trim().is_empty() || profile.name.len() > MAX_QUOTA_NAME_BYTES {
+        anyhow::bail!("quota profile names must contain 1..={MAX_QUOTA_NAME_BYTES} bytes");
     }
     if profile.publish_payload_max_bytes == 0 {
         anyhow::bail!(
             "quota profile `{}` must allow at least one publish byte",
+            profile.name
+        );
+    }
+    if profile.publish_payload_max_bytes > MAX_QUOTA_PAYLOAD_BYTES {
+        anyhow::bail!(
+            "quota profile `{}` publish payload limit must not exceed {MAX_QUOTA_PAYLOAD_BYTES} bytes",
             profile.name
         );
     }
@@ -266,9 +286,21 @@ fn validate_profile(profile: &QuotaProfile) -> anyhow::Result<()> {
             profile.name
         );
     }
+    if profile.publish_requests_per_window > MAX_QUOTA_REQUESTS_PER_WINDOW {
+        anyhow::bail!(
+            "quota profile `{}` publish request limit is too large",
+            profile.name
+        );
+    }
     if profile.publish_window_seconds == 0 {
         anyhow::bail!(
             "quota profile `{}` publish window must be at least one second",
+            profile.name
+        );
+    }
+    if profile.publish_window_seconds > MAX_QUOTA_WINDOW_SECONDS {
+        anyhow::bail!(
+            "quota profile `{}` publish window is too large",
             profile.name
         );
     }
@@ -278,15 +310,39 @@ fn validate_profile(profile: &QuotaProfile) -> anyhow::Result<()> {
             profile.name
         );
     }
+    if profile.consume_max_limit > MAX_QUOTA_CONSUME_LIMIT {
+        anyhow::bail!(
+            "quota profile `{}` consume limit is too large",
+            profile.name
+        );
+    }
     if profile.consume_requests_per_window == 0 {
         anyhow::bail!(
             "quota profile `{}` must allow at least one consume request per window",
             profile.name
         );
     }
+    if profile.consume_requests_per_window > MAX_QUOTA_REQUESTS_PER_WINDOW {
+        anyhow::bail!(
+            "quota profile `{}` consume request limit is too large",
+            profile.name
+        );
+    }
     if profile.consume_window_seconds == 0 {
         anyhow::bail!(
             "quota profile `{}` consume window must be at least one second",
+            profile.name
+        );
+    }
+    if profile.consume_window_seconds > MAX_QUOTA_WINDOW_SECONDS {
+        anyhow::bail!(
+            "quota profile `{}` consume window is too large",
+            profile.name
+        );
+    }
+    if profile.backpressure_delay_ms > MAX_BACKPRESSURE_DELAY_MS {
+        anyhow::bail!(
+            "quota profile `{}` backpressure delay is too large",
             profile.name
         );
     }
@@ -411,5 +467,24 @@ mod tests {
                 .to_string()
                 .contains("principal references unknown quota profile")
         );
+    }
+
+    #[test]
+    fn unsafe_quota_resource_limits_are_rejected() {
+        let mut candidate = profile(BackpressureMode::Reject);
+        candidate.publish_payload_max_bytes = MAX_QUOTA_PAYLOAD_BYTES + 1;
+        assert!(validate_profile(&candidate).is_err());
+
+        let mut candidate = profile(BackpressureMode::Reject);
+        candidate.consume_max_limit = MAX_QUOTA_CONSUME_LIMIT + 1;
+        assert!(validate_profile(&candidate).is_err());
+
+        let mut candidate = profile(BackpressureMode::Delay);
+        candidate.publish_window_seconds = MAX_QUOTA_WINDOW_SECONDS + 1;
+        assert!(validate_profile(&candidate).is_err());
+
+        let mut candidate = profile(BackpressureMode::Delay);
+        candidate.backpressure_delay_ms = MAX_BACKPRESSURE_DELAY_MS + 1;
+        assert!(validate_profile(&candidate).is_err());
     }
 }

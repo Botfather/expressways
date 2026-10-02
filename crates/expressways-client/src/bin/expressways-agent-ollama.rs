@@ -1,12 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, ValueEnum};
 use expressways_client::{
-    AgentWorker, AgentWorkerState, AssignedTask, Client, Endpoint, TaskExecutionContext,
-    WorkerRunOutcome,
+    AgentWorker, AssignedTask, Client, Endpoint, TaskExecutionContext, WorkerRunOutcome,
+    load_agent_worker_state, save_agent_worker_state, write_contained_file,
 };
 use expressways_protocol::{
     AgentEndpoint, AgentRegistration, Classification, ControlCommand, ControlRequest,
@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = endpoint_from_cli(cli.transport, cli.address.clone(), cli.socket.clone())?;
     let capability_token = resolve_token(cli.token.clone())?;
     let registration = registration_from_cli(&cli);
-    let worker_state = load_worker_state(&cli.state_path)?;
+    let worker_state = load_agent_worker_state(&cli.state_path)?;
     let shutdown = CancellationToken::new();
     let handler_config = HandlerConfig {
         endpoint: endpoint.clone(),
@@ -292,7 +292,7 @@ async fn run_worker_iteration(
             handle_assignment(assignment, handler_config, context).await
         })
         .await;
-    save_worker_state(state_path, worker.state())?;
+    save_agent_worker_state(state_path, worker.state())?;
     result.map_err(Into::into)
 }
 
@@ -325,7 +325,7 @@ async fn handle_ollama_chat(
         &config.output_dir,
         &assignment.task.task_id,
         payload.output_path.as_ref(),
-    );
+    )?;
 
     let start = Instant::now();
     let ollama_result = call_ollama(
@@ -340,11 +340,6 @@ async fn handle_ollama_chat(
     )
     .await?;
 
-    if let Some(parent) = output_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    }
     abort_if_cancelled(&context)?;
 
     let artifact = OllamaArtifact {
@@ -372,7 +367,7 @@ async fn handle_ollama_chat(
         .map_err(|error| format!("failed to render ollama artifact: {error}"))?;
     abort_if_cancelled(&context)?;
 
-    tokio::fs::write(&output_path, rendered)
+    write_contained_file(&config.output_dir, &output_path, &rendered)
         .await
         .map_err(|error| format!("failed to write {}: {error}", output_path.display()))?;
     abort_if_cancelled(&context)?;
@@ -394,6 +389,7 @@ async fn handle_ollama_chat(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps the single call site explicit about request controls.
 async fn call_ollama(
     ollama_url: &str,
     timeout_seconds: u64,
@@ -497,10 +493,44 @@ fn cancellation_reason(context: &TaskExecutionContext) -> String {
     }
 }
 
-fn resolve_output_path(output_dir: &Path, task_id: &str, explicit: Option<&PathBuf>) -> PathBuf {
-    match explicit {
+fn resolve_output_path(
+    output_dir: &Path,
+    task_id: &str,
+    explicit: Option<&PathBuf>,
+) -> Result<PathBuf, String> {
+    let relative = match explicit {
         Some(path) => path.clone(),
-        None => output_dir.join(format!("{task_id}.ollama.json")),
+        None => PathBuf::from(format!("{}.ollama.json", safe_filename(task_id))),
+    };
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!(
+            "output path {} must be a relative path contained by {}",
+            relative.display(),
+            output_dir.display()
+        ));
+    }
+    Ok(output_dir.join(relative))
+}
+
+fn safe_filename(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "task".to_owned()
+    } else {
+        sanitized
     }
 }
 
@@ -680,37 +710,16 @@ async fn run_shutdown_listener(shutdown: CancellationToken) {
 }
 
 async fn await_task<T>(name: &str, handle: tokio::task::JoinHandle<T>) {
-    if let Err(error) = handle.await {
-        if !error.is_cancelled() {
-            log_json(json!({
-                "timestamp": Utc::now(),
-                "event": "background_task_join_error",
-                "task": name,
-                "error": error.to_string(),
-            }));
-        }
+    if let Err(error) = handle.await
+        && !error.is_cancelled()
+    {
+        log_json(json!({
+            "timestamp": Utc::now(),
+            "event": "background_task_join_error",
+            "task": name,
+            "error": error.to_string(),
+        }));
     }
-}
-
-fn load_worker_state(path: &Path) -> anyhow::Result<AgentWorkerState> {
-    if !path.exists() {
-        return Ok(AgentWorkerState::default());
-    }
-
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read worker state {}", path.display()))?;
-    serde_json::from_str(&raw).context("failed to parse worker state")
-}
-
-fn save_worker_state(path: &Path, state: &AgentWorkerState) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let rendered = serde_json::to_vec_pretty(state)?;
-    std::fs::write(path, rendered)
-        .with_context(|| format!("failed to write worker state {}", path.display()))?;
-    Ok(())
 }
 
 fn log_worker_outcome(outcome: &WorkerRunOutcome) {
@@ -785,12 +794,10 @@ fn endpoint_from_cli(
 
 fn resolve_token(args: TokenArgs) -> anyhow::Result<String> {
     if let Some(token) = args.token {
-        return Ok(token);
+        return expressways_client::normalize_capability_token(&token);
     }
     if let Some(path) = args.token_file {
-        let token = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read token file {}", path.display()))?;
-        return Ok(token.trim().to_owned());
+        return expressways_client::read_capability_token_file(&path);
     }
 
     bail!("a capability token is required via --token or --token-file")

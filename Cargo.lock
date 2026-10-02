@@ -1040,8 +1040,10 @@ version = "0.1.0"
 dependencies = [
  "expressways-adopter-api",
  "expressways-audit",
+ "libc",
  "serde",
  "toml 0.9.12+spec-1.1.0",
+ "uuid",
 ]
 
 [[package]]
@@ -1049,9 +1051,11 @@ name = "expressways-adopter-registry-guard"
 version = "0.1.0"
 dependencies = [
  "expressways-adopter-api",
+ "libc",
  "serde",
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
+ "uuid",
 ]
 
 [[package]]
@@ -1061,6 +1065,7 @@ dependencies = [
  "expressways-adopter-api",
  "serde",
  "toml 0.9.12+spec-1.1.0",
+ "uuid",
 ]
 
 [[package]]
@@ -1070,6 +1075,7 @@ dependencies = [
  "chrono",
  "expressways-protocol",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -1087,6 +1093,7 @@ dependencies = [
  "ed25519-dalek",
  "expressways-protocol",
  "hex",
+ "libc",
  "rand_core 0.6.4",
  "serde",
  "serde_json",
@@ -1105,6 +1112,7 @@ dependencies = [
  "expressways-client",
  "expressways-protocol",
  "expressways-storage",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
@@ -1125,12 +1133,15 @@ dependencies = [
  "expressways-protocol",
  "futures-util",
  "hex",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "uuid",
 ]
 
@@ -1141,6 +1152,7 @@ dependencies = [
  "base64 0.22.1",
  "expressways-client",
  "expressways-protocol",
+ "libc",
  "log",
  "serde",
  "serde_json",
@@ -1163,6 +1175,7 @@ dependencies = [
  "expressways-protocol",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1179,6 +1192,7 @@ dependencies = [
  "expressways-client",
  "expressways-protocol",
  "futures-util",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -1198,6 +1212,7 @@ dependencies = [
  "clap",
  "expressways-client",
  "expressways-protocol",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
@@ -1247,6 +1262,7 @@ dependencies = [
  "expressways-storage",
  "futures-util",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

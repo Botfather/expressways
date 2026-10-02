@@ -8,7 +8,7 @@ mod registry_events;
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -31,7 +31,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -43,6 +43,12 @@ use crate::metrics::MetricsCollector;
 use crate::quota::QuotaManager;
 use crate::registry::AgentRegistry;
 use crate::registry_events::{RegistryEventError, RegistryEventHub};
+
+const MIN_FRAME_BYTES: usize = 256;
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MIN_CONNECTION_IDLE_TIMEOUT_MS: u64 = 100;
+const MAX_CONNECTION_IDLE_TIMEOUT_MS: u64 = 3_600_000;
+const MAX_REGISTRY_EVENT_HISTORY: usize = 4_096;
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -65,6 +71,9 @@ struct BrokerState {
     registry_events: RegistryEventHub,
     adopters: AdopterManager,
     stream_limits: StreamLimits,
+    connection_limit: Arc<Semaphore>,
+    connection_idle_timeout: Duration,
+    max_frame_bytes: usize,
     audit: Mutex<ManagedAuditSink>,
 }
 
@@ -99,30 +108,24 @@ pub(crate) struct ServiceModeTracker {
 }
 
 impl ServiceModeTracker {
-    fn mark_degraded(&self, component: impl Into<String>, detail: impl Into<String>) {
+    fn lock_state(&self) -> StdMutexGuard<'_, ServiceModeState> {
         self.inner
             .lock()
-            .expect("service mode lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn mark_degraded(&self, component: impl Into<String>, detail: impl Into<String>) {
+        self.lock_state()
             .degraded_components
             .insert(component.into(), detail.into());
     }
 
     fn clear_component(&self, component: &str) {
-        self.inner
-            .lock()
-            .expect("service mode lock")
-            .degraded_components
-            .remove(component);
+        self.lock_state().degraded_components.remove(component);
     }
 
     fn status(&self) -> String {
-        if self
-            .inner
-            .lock()
-            .expect("service mode lock")
-            .degraded_components
-            .is_empty()
-        {
+        if self.lock_state().degraded_components.is_empty() {
             "ok".to_owned()
         } else {
             "degraded".to_owned()
@@ -130,9 +133,7 @@ impl ServiceModeTracker {
     }
 
     fn degraded_components(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .expect("service mode lock")
+        self.lock_state()
             .degraded_components
             .iter()
             .map(|(component, detail)| format!("{component}: {detail}"))
@@ -186,7 +187,9 @@ impl ManagedAuditSink {
             }
         }
 
-        Err(last_error.expect("audit append should fail with an error"))
+        Err(last_error.unwrap_or_else(|| {
+            AuditError::Integrity("audit append exhausted retries without an error".to_owned())
+        }))
     }
 
     fn try_append(
@@ -197,10 +200,12 @@ impl ManagedAuditSink {
             self.sink = Some(AuditSink::new(&self.path)?);
         }
 
-        self.sink
-            .as_mut()
-            .expect("audit sink should be initialized")
-            .append(draft)
+        match self.sink.as_mut() {
+            Some(sink) => sink.append(draft),
+            None => Err(AuditError::Integrity(
+                "audit sink initialization completed without a sink".to_owned(),
+            )),
+        }
     }
 
     fn path(&self) -> &Path {
@@ -227,14 +232,36 @@ enum ListenerHandle {
     Unix {
         listener: UnixListener,
         socket_path: std::path::PathBuf,
+        socket_identity: SocketIdentity,
     },
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let config = AppConfig::load(&cli.config)?;
+    let (config, config_load_report) = AppConfig::load_with_report(&cli.config)?;
     init_tracing(&config.server.log_level)?;
+    if config_load_report.migrated {
+        warn!(
+            path = %cli.config.display(),
+            source_schema_version = config_load_report.source_schema_version,
+            target_schema_version = config_load_report.target_schema_version,
+            "loaded legacy config schema in compatibility mode; run migration tooling to persist updated metadata"
+        );
+    } else {
+        info!(
+            path = %cli.config.display(),
+            schema_version = config_load_report.target_schema_version,
+            "loaded config schema"
+        );
+    }
 
     let state = Arc::new(
         build_state(&config)
@@ -307,6 +334,32 @@ fn init_tracing(log_level: &str) -> anyhow::Result<()> {
 }
 
 fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
+    anyhow::ensure!(
+        config.server.max_connections > 0,
+        "server.max_connections must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.server.max_connections <= Semaphore::MAX_PERMITS,
+        "server.max_connections must not exceed {}",
+        Semaphore::MAX_PERMITS
+    );
+    anyhow::ensure!(
+        config.server.max_frame_bytes >= MIN_FRAME_BYTES,
+        "server.max_frame_bytes must be at least {MIN_FRAME_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        config.server.max_frame_bytes <= MAX_FRAME_BYTES,
+        "server.max_frame_bytes must not exceed {MAX_FRAME_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        (MIN_CONNECTION_IDLE_TIMEOUT_MS..=MAX_CONNECTION_IDLE_TIMEOUT_MS)
+            .contains(&config.server.connection_idle_timeout_ms),
+        "server.connection_idle_timeout_ms must be between {MIN_CONNECTION_IDLE_TIMEOUT_MS} and {MAX_CONNECTION_IDLE_TIMEOUT_MS}"
+    );
+    anyhow::ensure!(
+        (1..=MAX_REGISTRY_EVENT_HISTORY).contains(&config.registry.event_history_limit),
+        "registry.event_history_limit must be between 1 and {MAX_REGISTRY_EVENT_HISTORY}"
+    );
     let service_mode = ServiceModeTracker::default();
     let resilience = ResilienceRuntime {
         allow_degraded_runtime: config.resilience.allow_degraded_runtime,
@@ -372,7 +425,7 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
     Ok(BrokerState {
         node_name: config.server.node_name.clone(),
         verifier,
-        policy: PolicyEngine::new(config.policy.clone()),
+        policy: PolicyEngine::new(config.policy.clone())?,
         quotas,
         resilience,
         service_mode,
@@ -386,6 +439,9 @@ fn build_state(config: &AppConfig) -> anyhow::Result<BrokerState> {
             send_timeout: Duration::from_millis(config.registry.stream_send_timeout_ms.max(1)),
             idle_keepalive_limit: config.registry.stream_idle_keepalive_limit.max(1),
         },
+        connection_limit: Arc::new(Semaphore::new(config.server.max_connections)),
+        connection_idle_timeout: Duration::from_millis(config.server.connection_idle_timeout_ms),
+        max_frame_bytes: config.server.max_frame_bytes,
         audit: Mutex::new(audit),
     })
 }
@@ -445,9 +501,18 @@ fn bind_listener(config: &ServerConfig) -> anyhow::Result<ListenerHandle> {
                 let listener = UnixListener::bind(&socket_path).with_context(|| {
                     format!("failed to bind Unix socket at {}", socket_path.display())
                 })?;
+                if let Err(error) = set_private_socket_permissions(&socket_path) {
+                    drop(listener);
+                    if let Ok(metadata) = std::fs::symlink_metadata(&socket_path) {
+                        let _ = remove_socket_file(&socket_path, &metadata);
+                    }
+                    return Err(error);
+                }
+                let socket_identity = socket_identity(&socket_path)?;
                 Ok(ListenerHandle::Unix {
                     listener,
                     socket_path,
+                    socket_identity,
                 })
             }
             #[cfg(not(unix))]
@@ -460,17 +525,65 @@ fn bind_listener(config: &ServerConfig) -> anyhow::Result<ListenerHandle> {
 
 #[cfg(unix)]
 fn prepare_socket(path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("Unix socket path must not be empty");
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("failed to remove existing socket {}", path.display()))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => remove_socket_file(path, &metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect socket path {}", path.display()));
+        }
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn remove_socket_file(path: &Path, metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    anyhow::ensure!(
+        metadata.file_type().is_socket(),
+        "refusing to remove non-socket path {}",
+        path.display()
+    );
+    std::fs::remove_file(path)
+        .with_context(|| format!("failed to remove existing socket {}", path.display()))
+}
+
+#[cfg(unix)]
+fn set_private_socket_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure Unix socket {}", path.display()))
+}
+
+#[cfg(unix)]
+fn socket_identity(path: &Path) -> anyhow::Result<SocketIdentity> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect Unix socket {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_socket(),
+        "Unix socket path changed to a non-socket: {}",
+        path.display()
+    );
+    Ok(SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 async fn run_listener(listener: ListenerHandle, state: Arc<BrokerState>) -> anyhow::Result<()> {
@@ -480,10 +593,31 @@ async fn run_listener(listener: ListenerHandle, state: Arc<BrokerState>) -> anyh
         ListenerHandle::Unix {
             listener,
             socket_path,
+            socket_identity: expected_identity,
         } => {
             let result = run_unix_listener(listener, Arc::clone(&state)).await;
-            if socket_path.exists() {
-                let _ = std::fs::remove_file(&socket_path);
+            match std::fs::symlink_metadata(&socket_path) {
+                Ok(metadata) => {
+                    let current_identity = socket_identity(&socket_path);
+                    if !matches!(current_identity, Ok(identity) if identity == expected_identity) {
+                        warn!(
+                            socket = %socket_path.display(),
+                            "refusing to remove Unix socket path replaced while broker was running"
+                        );
+                    } else if let Err(error) = remove_socket_file(&socket_path, &metadata) {
+                        warn!(
+                            socket = %socket_path.display(),
+                            error = %error,
+                            "refused to remove unexpected Unix socket path during shutdown"
+                        );
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!(
+                    socket = %socket_path.display(),
+                    error = %error,
+                    "failed to inspect Unix socket path during shutdown"
+                ),
             }
             result
         }
@@ -505,8 +639,16 @@ async fn run_tcp_listener(listener: TcpListener, state: Arc<BrokerState>) -> any
                 if let Err(error) = stream.set_nodelay(true) {
                     warn!(error = %error, remote = %remote, "failed to set TCP_NODELAY");
                 }
+                let permit = match Arc::clone(&state.connection_limit).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(remote = %remote, "connection limit reached; rejecting TCP client");
+                        continue;
+                    }
+                };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = handle_connection(stream, state).await {
                         error!(error = %error, remote = %remote, "client handler exited with error");
                     }
@@ -536,8 +678,16 @@ async fn run_unix_listener(listener: UnixListener, state: Arc<BrokerState>) -> a
                         continue;
                     }
                 };
+                let permit = match Arc::clone(&state.connection_limit).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!("connection limit reached; rejecting Unix client");
+                        continue;
+                    }
+                };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = handle_connection(stream, state).await {
                         error!(error = %error, "client handler exited with error");
                     }
@@ -558,14 +708,28 @@ async fn handle_connection<T>(stream: T, state: Arc<BrokerState>) -> anyhow::Res
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+    let codec = LengthDelimitedCodec::builder()
+        .max_frame_length(state.max_frame_bytes)
+        .new_codec();
+    let mut framed = Framed::new(stream, codec);
 
-    while let Some(frame) = framed.next().await {
+    loop {
+        let frame = match tokio::time::timeout(state.connection_idle_timeout, framed.next()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => {
+                warn!(
+                    idle_timeout_ms = state.connection_idle_timeout.as_millis(),
+                    "closing idle client connection"
+                );
+                break;
+            }
+        };
         let packet = match frame {
             Ok(packet) => packet,
             Err(error) => {
                 warn!(error = %error, "failed to read request frame");
-                continue;
+                break;
             }
         };
 
@@ -577,6 +741,8 @@ where
                     &mut framed,
                     ControlResponse::error("invalid_request", error),
                     None,
+                    state.max_frame_bytes,
+                    state.connection_idle_timeout,
                 )
                 .await?;
                 continue;
@@ -590,7 +756,14 @@ where
 
         let (response, attachment) =
             process_request_with_attachment(&state, request, attachment).await;
-        send_response_packet(&mut framed, response, attachment).await?;
+        send_response_packet(
+            &mut framed,
+            response,
+            attachment,
+            state.max_frame_bytes,
+            state.connection_idle_timeout,
+        )
+        .await?;
     }
 
     Ok(())
@@ -678,6 +851,7 @@ where
         Err(error) => {
             let code = match error {
                 RegistryEventError::CursorExpired { .. } => "watch_cursor_expired",
+                RegistryEventError::SequenceExhausted => "registry_event_sequence_exhausted",
             };
             let message = error.to_string();
             let _ = finalize_failure(
@@ -858,6 +1032,7 @@ where
             Err(error) => {
                 let code = match error {
                     RegistryEventError::CursorExpired { .. } => "watch_cursor_expired",
+                    RegistryEventError::SequenceExhausted => "registry_event_sequence_exhausted",
                 };
                 let message = error.to_string();
                 warn!(
@@ -903,16 +1078,33 @@ async fn send_response_packet<T>(
     framed: &mut Framed<T, LengthDelimitedCodec>,
     response: ControlResponse,
     attachment: Option<Vec<u8>>,
+    max_frame_bytes: usize,
+    send_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let packet = ControlWireEnvelope::Response {
+    let mut packet = ControlWireEnvelope::Response {
         response,
         attachment_length: 0,
     }
     .encode_with_attachment(attachment.as_deref())?;
-    framed.send(packet.into()).await?;
+    if packet.len() > max_frame_bytes {
+        packet = ControlWireEnvelope::Response {
+            response: ControlResponse::error(
+                "response_too_large",
+                format!(
+                    "encoded response is {} bytes; maximum frame size is {max_frame_bytes} bytes",
+                    packet.len()
+                ),
+            ),
+            attachment_length: 0,
+        }
+        .encode_with_attachment(None)?;
+    }
+    tokio::time::timeout(send_timeout, framed.send(packet.into()))
+        .await
+        .context("timed out sending response frame")??;
     Ok(())
 }
 
@@ -981,6 +1173,7 @@ fn stream_error_from_response(response: ControlResponse) -> StreamFrame {
     }
 }
 
+#[cfg(test)]
 async fn process_request(state: &BrokerState, request: ControlRequest) -> ControlResponse {
     process_request_with_attachment(state, request, None)
         .await
@@ -1015,7 +1208,7 @@ async fn process_request_with_attachment(
     };
     state.metrics.record_request(&action);
 
-    let response = match request.command {
+    match request.command {
         ControlCommand::Health => (handle_health(state, request.capability_token).await, None),
         ControlCommand::GetMetrics => (
             handle_get_metrics(state, request.capability_token).await,
@@ -1141,9 +1334,7 @@ async fn process_request_with_attachment(
             handle_consume(state, request.capability_token, topic, offset, limit).await,
             None,
         ),
-    };
-
-    response
+    }
 }
 
 async fn handle_health(state: &BrokerState, capability_token: String) -> ControlResponse {
@@ -1176,7 +1367,6 @@ async fn handle_health(state: &BrokerState, capability_token: String) -> Control
     )
     .await
     {
-        state.metrics.record_audit_failure();
         return ControlResponse::error("audit_failure", error.to_string());
     }
 
@@ -1346,7 +1536,6 @@ async fn handle_get_auth_state(state: &BrokerState, capability_token: String) ->
     )
     .await
     {
-        state.metrics.record_audit_failure();
         return ControlResponse::error("audit_failure", error.to_string());
     }
 
@@ -1401,13 +1590,15 @@ async fn handle_register_agent(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 return ControlResponse::error("audit_failure", error.to_string());
             }
-            let _ = state
+            if let Err(error) = state
                 .registry_events
                 .record(RegistryEventKind::Registered, card.clone())
-                .await;
+                .await
+            {
+                error!(error = %error, agent_id = %card.agent_id, "failed to record registry event");
+            }
 
             info!(
                 principal = %identity.principal,
@@ -1484,7 +1675,6 @@ async fn handle_list_agents(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 return ControlResponse::error("audit_failure", error.to_string());
             }
 
@@ -1567,7 +1757,6 @@ async fn handle_watch_agents(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 return ControlResponse::error("audit_failure", error.to_string());
             }
 
@@ -1591,6 +1780,7 @@ async fn handle_watch_agents(
         Err(error) => {
             let code = match error {
                 RegistryEventError::CursorExpired { .. } => "watch_cursor_expired",
+                RegistryEventError::SequenceExhausted => "registry_event_sequence_exhausted",
             };
             let message = error.to_string();
             let _ = finalize_failure(
@@ -1652,13 +1842,15 @@ async fn handle_heartbeat_agent(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 return ControlResponse::error("audit_failure", error.to_string());
             }
-            let _ = state
+            if let Err(error) = state
                 .registry_events
                 .record(RegistryEventKind::Heartbeated, card.clone())
-                .await;
+                .await
+            {
+                error!(error = %error, agent_id = %card.agent_id, "failed to record registry event");
+            }
 
             info!(
                 principal = %identity.principal,
@@ -1739,14 +1931,16 @@ async fn handle_cleanup_stale_agents(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 return ControlResponse::error("audit_failure", error.to_string());
             }
             for card in removed_cards {
-                let _ = state
+                if let Err(error) = state
                     .registry_events
-                    .record(RegistryEventKind::CleanedUp, card)
-                    .await;
+                    .record(RegistryEventKind::CleanedUp, card.clone())
+                    .await
+                {
+                    error!(error = %error, agent_id = %card.agent_id, "failed to record registry event");
+                }
             }
 
             info!(
@@ -1821,13 +2015,15 @@ async fn handle_remove_agent(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 return ControlResponse::error("audit_failure", error.to_string());
             }
-            let _ = state
+            if let Err(error) = state
                 .registry_events
                 .record(RegistryEventKind::Removed, card)
-                .await;
+                .await
+            {
+                error!(error = %error, agent_id = %agent_id, "failed to record registry event");
+            }
 
             info!(
                 principal = %identity.principal,
@@ -1898,7 +2094,6 @@ async fn handle_create_topic(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 return ControlResponse::error("audit_failure", error.to_string());
             }
 
@@ -2141,7 +2336,6 @@ async fn handle_publish(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 state
                     .metrics
                     .record_publish_result(false, started_at.elapsed());
@@ -2185,6 +2379,7 @@ async fn handle_publish(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the protocol command fields at the dispatch boundary.
 async fn handle_put_artifact(
     state: &BrokerState,
     capability_token: String,
@@ -2295,7 +2490,6 @@ async fn handle_put_artifact(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 state
                     .metrics
                     .record_publish_result(false, started_at.elapsed());
@@ -2357,9 +2551,13 @@ async fn handle_consume(
     }
 
     let topic_for_read = topic.clone();
+    let response_budget = state
+        .max_frame_bytes
+        .saturating_sub(topic.len().saturating_add(512));
     let result = with_storage(state, move |storage| {
-        let messages = storage.read_from(&topic_for_read, offset, limit)?;
-        let next_offset = storage.next_offset(&topic_for_read)?;
+        let messages =
+            storage.read_from_bounded(&topic_for_read, offset, limit, response_budget)?;
+        let next_offset = next_consume_offset(offset, &messages);
         Ok((messages, next_offset))
     })
     .await;
@@ -2375,7 +2573,6 @@ async fn handle_consume(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 state
                     .metrics
                     .record_consume_result(false, started_at.elapsed());
@@ -2417,6 +2614,15 @@ async fn handle_consume(
             storage_error_response(message)
         }
     }
+}
+
+fn next_consume_offset(
+    requested_offset: u64,
+    messages: &[expressways_protocol::StoredMessage],
+) -> u64 {
+    messages
+        .last()
+        .map_or(requested_offset, |message| message.offset.saturating_add(1))
 }
 
 async fn handle_get_artifact(
@@ -2484,7 +2690,6 @@ async fn handle_get_artifact(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 state
                     .metrics
                     .record_consume_result(false, started_at.elapsed());
@@ -2576,7 +2781,6 @@ async fn handle_stat_artifact(
             )
             .await
             {
-                state.metrics.record_audit_failure();
                 state
                     .metrics
                     .record_consume_result(false, started_at.elapsed());
@@ -2610,7 +2814,6 @@ async fn revocation_success_response(
     if let Err(error) =
         finalize_success(state, identity, Action::Admin, resource, Some(detail)).await
     {
-        state.metrics.record_audit_failure();
         return ControlResponse::error("audit_failure", error.to_string());
     }
 
@@ -2697,7 +2900,12 @@ fn storage_error_response(message: String) -> ControlResponse {
 fn handle_artifact_store_error(state: &BrokerState, error: &ArtifactError) {
     if matches!(
         error,
-        ArtifactError::Io(_) | ArtifactError::Serialization(_)
+        ArtifactError::Io(_)
+            | ArtifactError::Serialization(_)
+            | ArtifactError::MetadataIdMismatch { .. }
+            | ArtifactError::LengthMismatch { .. }
+            | ArtifactError::UnsafeFile(_)
+            | ArtifactError::InvalidMetadata(_)
     ) {
         state.metrics.record_storage_failure();
         state
@@ -2711,13 +2919,20 @@ fn artifact_error_response(error: ArtifactError) -> ControlResponse {
         ArtifactError::InvalidArtifactId(_) | ArtifactError::EmptyContentType => {
             ControlResponse::error("invalid_request", error.to_string())
         }
+        ArtifactError::TooLarge { .. } => {
+            ControlResponse::error("artifact_too_large", error.to_string())
+        }
         ArtifactError::AlreadyExists(_) => {
             ControlResponse::error("artifact_exists", error.to_string())
         }
         ArtifactError::Missing(_) => {
             ControlResponse::error("artifact_not_found", error.to_string())
         }
-        ArtifactError::Sha256Mismatch { .. } => {
+        ArtifactError::Sha256Mismatch { .. }
+        | ArtifactError::MetadataIdMismatch { .. }
+        | ArtifactError::LengthMismatch { .. }
+        | ArtifactError::UnsafeFile(_)
+        | ArtifactError::InvalidMetadata(_) => {
             ControlResponse::error("integrity_error", error.to_string())
         }
         ArtifactError::Io(_) | ArtifactError::Serialization(_) => {
@@ -2749,13 +2964,11 @@ async fn enforce_publish_quota(
                 error = %error,
                 "publish denied by quota policy"
             );
-            let _ = record_internal_event(
+            record_denied_event(
                 state,
                 &identity.principal,
                 Action::Publish,
                 resource,
-                AuditDecision::Deny,
-                AuditOutcome::Rejected,
                 with_identity_detail(Some(error.to_string()), identity),
             )
             .await;
@@ -2787,13 +3000,11 @@ async fn enforce_consume_quota(
                 error = %error,
                 "consume denied by quota policy"
             );
-            let _ = record_internal_event(
+            record_denied_event(
                 state,
                 &identity.principal,
                 Action::Consume,
                 resource,
-                AuditDecision::Deny,
-                AuditOutcome::Rejected,
                 with_identity_detail(Some(error.to_string()), identity),
             )
             .await;
@@ -2818,13 +3029,11 @@ async fn authenticate_and_authorize(
                 error = %error,
                 "capability verification failed"
             );
-            let _ = record_internal_event(
+            record_denied_event(
                 state,
                 "auth:unknown",
                 action.clone(),
                 resource,
-                AuditDecision::Deny,
-                AuditOutcome::Rejected,
                 Some(error.to_string()),
             )
             .await;
@@ -2847,13 +3056,11 @@ async fn authenticate_and_authorize(
             error = %error,
             "capability scope denied request"
         );
-        let _ = record_internal_event(
+        record_denied_event(
             state,
             verified.principal(),
             action.clone(),
             resource,
-            AuditDecision::Deny,
-            AuditOutcome::Rejected,
             Some(format!(
                 "token {}: {}; quota_profile={}; principal_kind={}",
                 verified.token_id(),
@@ -2911,13 +3118,11 @@ async fn authorize_by_policy(
                 error = %error,
                 "request denied by policy"
             );
-            let _ = record_internal_event(
+            record_denied_event(
                 state,
                 verified.principal(),
                 action.clone(),
                 resource,
-                AuditDecision::Deny,
-                AuditOutcome::Rejected,
                 Some(format!(
                     "token {}: {}; quota_profile={}; principal_kind={}",
                     verified.token_id(),
@@ -2954,6 +3159,34 @@ async fn record_attempt(
         handle_audit_failure(state, error)
             .map_err(|error| ControlResponse::error("audit_failure", error.to_string()))
     })
+}
+
+async fn record_denied_event(
+    state: &BrokerState,
+    principal: &str,
+    action: Action,
+    resource: &str,
+    detail: Option<String>,
+) {
+    if let Err(error) = record_internal_event(
+        state,
+        principal,
+        action,
+        resource,
+        AuditDecision::Deny,
+        AuditOutcome::Rejected,
+        detail,
+    )
+    .await
+        && let Err(error) = handle_audit_failure(state, error)
+    {
+        error!(
+            principal = %principal,
+            resource = %resource,
+            error = %error,
+            "failed to record denied request in audit log"
+        );
+    }
 }
 
 async fn finalize_success(
@@ -3195,6 +3428,9 @@ mod tests {
                 socket_path: None,
                 data_dir: root.join("data"),
                 log_level: "info".to_owned(),
+                max_connections: 256,
+                max_frame_bytes: 8 * 1024 * 1024,
+                connection_idle_timeout_ms: 30_000,
             },
             storage: StorageSection {
                 segment_max_bytes: 4096,
@@ -3276,6 +3512,269 @@ mod tests {
                 ],
             },
         }
+    }
+
+    #[test]
+    fn build_state_rejects_unsafe_resource_limits() {
+        let root = test_root();
+        let (_, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.server.max_connections = 0;
+        assert!(
+            build_state(&config)
+                .expect_err("zero connection limit must fail")
+                .to_string()
+                .contains("max_connections")
+        );
+
+        config.server.max_connections = 1;
+        config.server.max_frame_bytes = MIN_FRAME_BYTES - 1;
+        assert!(
+            build_state(&config)
+                .expect_err("zero frame limit must fail")
+                .to_string()
+                .contains("at least")
+        );
+
+        config.server.max_frame_bytes = MAX_FRAME_BYTES + 1;
+        assert!(
+            build_state(&config)
+                .expect_err("oversized frame limit must fail")
+                .to_string()
+                .contains("must not exceed")
+        );
+
+        config.server.max_frame_bytes = MIN_FRAME_BYTES;
+        config.server.max_connections = usize::MAX;
+        assert!(
+            build_state(&config)
+                .expect_err("unsafe connection limit must fail")
+                .to_string()
+                .contains("max_connections")
+        );
+
+        config.server.max_connections = 1;
+        config.server.connection_idle_timeout_ms = MIN_CONNECTION_IDLE_TIMEOUT_MS - 1;
+        assert!(
+            build_state(&config)
+                .expect_err("short idle timeout must fail")
+                .to_string()
+                .contains("connection_idle_timeout_ms")
+        );
+
+        config.server.connection_idle_timeout_ms = MAX_CONNECTION_IDLE_TIMEOUT_MS + 1;
+        assert!(
+            build_state(&config)
+                .expect_err("long idle timeout must fail")
+                .to_string()
+                .contains("connection_idle_timeout_ms")
+        );
+
+        config.server.connection_idle_timeout_ms = MIN_CONNECTION_IDLE_TIMEOUT_MS;
+        config.registry.event_history_limit = 0;
+        assert!(
+            build_state(&config)
+                .expect_err("zero history limit must fail")
+                .to_string()
+                .contains("event_history_limit")
+        );
+
+        config.registry.event_history_limit = MAX_REGISTRY_EVENT_HISTORY + 1;
+        assert!(
+            build_state(&config)
+                .expect_err("oversized history limit must fail")
+                .to_string()
+                .contains("event_history_limit")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_preparation_only_removes_socket_files() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener as StdUnixListener;
+
+        let root = PathBuf::from("/tmp").join(format!("exw-{}", Uuid::now_v7().simple()));
+        fs::create_dir_all(&root).expect("create test root");
+
+        let regular = root.join("regular-file");
+        fs::write(&regular, "preserve me").expect("write regular file");
+        assert!(prepare_socket(&regular).is_err());
+        assert_eq!(
+            fs::read_to_string(&regular).expect("regular file preserved"),
+            "preserve me"
+        );
+
+        let target = root.join("target");
+        fs::write(&target, "preserve target").expect("write symlink target");
+        let link = root.join("socket-link");
+        symlink(&target, &link).expect("create symlink");
+        assert!(prepare_socket(&link).is_err());
+        assert_eq!(
+            fs::read_to_string(&target).expect("symlink target preserved"),
+            "preserve target"
+        );
+
+        let stale_socket = root.join("stale.sock");
+        drop(StdUnixListener::bind(&stale_socket).expect("bind stale socket"));
+        prepare_socket(&stale_socket).expect("remove stale socket safely");
+        assert!(!stale_socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_permissions_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener as StdUnixListener;
+
+        let root = PathBuf::from("/tmp").join(format!("exw-{}", Uuid::now_v7().simple()));
+        let socket = root.join("private.sock");
+        prepare_socket(&socket).expect("prepare socket");
+        let listener = StdUnixListener::bind(&socket).expect("bind socket");
+        set_private_socket_permissions(&socket).expect("secure socket permissions");
+
+        let mode = fs::symlink_metadata(&socket)
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(listener);
+    }
+
+    #[test]
+    fn consume_cursor_advances_only_past_returned_messages() {
+        let messages = [StoredMessage {
+            message_id: Uuid::now_v7(),
+            topic: "tasks".to_owned(),
+            offset: 7,
+            timestamp: Utc::now(),
+            producer: "local:developer".to_owned(),
+            classification: Classification::Internal,
+            payload: "payload".to_owned(),
+        }];
+
+        assert_eq!(next_consume_offset(7, &messages), 8);
+        assert_eq!(next_consume_offset(7, &[]), 7);
+        assert_eq!(
+            next_consume_offset(
+                u64::MAX,
+                &[StoredMessage {
+                    offset: u64::MAX,
+                    ..messages[0].clone()
+                }]
+            ),
+            u64::MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_frames_close_the_connection_before_request_decoding() {
+        let root = test_root();
+        let (_, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.server.max_frame_bytes = MIN_FRAME_BYTES;
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (server_stream, client_stream) = duplex(1024);
+        let handler = tokio::spawn(handle_connection(server_stream, state));
+        let mut client = Framed::new(client_stream, LengthDelimitedCodec::new());
+
+        client
+            .send(vec![0u8; MIN_FRAME_BYTES + 1].into())
+            .await
+            .expect("send oversized frame");
+        drop(client);
+
+        let result = tokio::time::timeout(StdDuration::from_secs(1), handler)
+            .await
+            .expect("handler should close promptly")
+            .expect("join handler");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn idle_connections_release_their_handler() {
+        let root = test_root();
+        let (_, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.server.connection_idle_timeout_ms = MIN_CONNECTION_IDLE_TIMEOUT_MS;
+        let state = Arc::new(build_state(&config).expect("build broker state"));
+        let (_idle_client, server_stream) = duplex(1024);
+
+        let handler = tokio::spawn(handle_connection(server_stream, state));
+        tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+            .await
+            .expect("idle handler should terminate within its timeout")
+            .expect("handler task should not panic")
+            .expect("handler should close cleanly");
+    }
+
+    #[tokio::test]
+    async fn oversized_responses_return_explicit_error_within_frame_limit() {
+        let (server_stream, client_stream) = duplex(4096);
+        let codec = LengthDelimitedCodec::builder()
+            .max_frame_length(256)
+            .new_codec();
+        let mut server = Framed::new(server_stream, codec);
+        let mut client = Framed::new(client_stream, LengthDelimitedCodec::new());
+        let response = ControlResponse::Messages {
+            topic: "tasks".to_owned(),
+            messages: vec![StoredMessage {
+                message_id: Uuid::now_v7(),
+                topic: "tasks".to_owned(),
+                offset: 0,
+                timestamp: Utc::now(),
+                producer: "local:developer".to_owned(),
+                classification: Classification::Internal,
+                payload: "x".repeat(4096),
+            }],
+            next_offset: 1,
+        };
+
+        send_response_packet(
+            &mut server,
+            response,
+            None,
+            256,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("send bounded response");
+        let packet = client
+            .next()
+            .await
+            .expect("response frame")
+            .expect("response I/O");
+        let (envelope, attachment) =
+            ControlWireEnvelope::decode_packet(&packet).expect("decode bounded response");
+        assert!(attachment.is_empty());
+        assert!(matches!(
+            envelope,
+            ControlWireEnvelope::Response {
+                response: ControlResponse::Error { ref code, .. },
+                ..
+            } if code == "response_too_large"
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_send_timeout_releases_slow_clients() {
+        let (server_stream, _blocked_client) = duplex(1);
+        let mut server = Framed::new(server_stream, LengthDelimitedCodec::new());
+        let error = send_response_packet(
+            &mut server,
+            ControlResponse::Health {
+                node_name: "test-node".to_owned(),
+                status: "ok".to_owned(),
+            },
+            None,
+            1024,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect_err("blocked response write should time out");
+
+        assert!(error.to_string().contains("timed out sending response"));
     }
 
     fn issue_token(
@@ -3494,6 +3993,7 @@ mod tests {
         endpoint: Endpoint,
         capability_token: String,
         agent_id: String,
+        input_dir: PathBuf,
         output_dir: PathBuf,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
@@ -3506,7 +4006,12 @@ mod tests {
 
             let outcome = worker
                 .run_once_with_context(|assignment, context| {
-                    sample_agent_bin::handle_assignment(assignment, output_dir.clone(), context)
+                    sample_agent_bin::handle_assignment(
+                        assignment,
+                        input_dir.clone(),
+                        output_dir.clone(),
+                        context,
+                    )
                 })
                 .await;
 
@@ -3565,6 +4070,155 @@ mod tests {
         let audit = fs::read_to_string(&config.audit.path).expect("read audit");
         assert!(audit.contains("\"decision\":\"deny\""));
         assert!(audit.contains(&token_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn policy_denials_are_rejected_and_audited() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, token) = issue_token(
+            &issuer,
+            "local:agent-alpha",
+            vec![CapabilityScope {
+                resource: BROKER_RESOURCE.to_owned(),
+                actions: vec![Action::Health],
+            }],
+        );
+
+        let response = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::Health,
+            },
+        )
+        .await;
+
+        match response {
+            ControlResponse::Error { code, message } => {
+                assert_eq!(code, "access_denied");
+                assert!(message.contains("not authorized"));
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
+
+        let audit = fs::read_to_string(&config.audit.path).expect("read audit");
+        assert!(audit.contains("\"decision\":\"deny\""));
+        assert!(audit.contains("local:agent-alpha"));
+        assert!(audit.contains("system:broker"));
+    }
+
+    #[tokio::test]
+    async fn denial_audit_failures_are_reported_as_degraded() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.resilience.audit_retry_attempts = 1;
+        let state = build_state(&config).expect("build broker state");
+        let (_, token) = issue_token(
+            &issuer,
+            "local:agent-alpha",
+            vec![CapabilityScope {
+                resource: BROKER_RESOURCE.to_owned(),
+                actions: vec![Action::Health],
+            }],
+        );
+
+        {
+            let mut audit = state.audit.lock().await;
+            audit.path = root.clone();
+            audit.sink = None;
+        }
+
+        let response = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::Health,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            ControlResponse::Error { ref code, .. } if code == "access_denied"
+        ));
+        assert_eq!(state.service_mode.status(), "degraded");
+        assert!(
+            state
+                .service_mode
+                .degraded_components()
+                .iter()
+                .any(|component| component.starts_with("audit:"))
+        );
+
+        let storage_stats = state
+            .storage
+            .lock()
+            .await
+            .as_ref()
+            .expect("storage available")
+            .stats()
+            .expect("storage stats");
+        let metrics = state.metrics.snapshot(
+            storage_stats,
+            state.audit.lock().await.summary(),
+            state.service_mode.status(),
+            state.service_mode.degraded_components(),
+            state.adopters.snapshot(),
+        );
+        assert_eq!(metrics.audit_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn strict_audit_failure_is_counted_once() {
+        let root = test_root();
+        let (_, public_key_path) = write_issuer(&root, "dev");
+        let mut config = app_config(&root, public_key_path);
+        config.resilience.allow_degraded_runtime = false;
+        config.resilience.audit_retry_attempts = 1;
+        let state = build_state(&config).expect("build broker state");
+        let identity = RequestIdentity {
+            principal: "local:developer".to_owned(),
+            principal_kind: "developer".to_owned(),
+            quota_profile: "operator".to_owned(),
+            token_id: Uuid::now_v7().to_string(),
+        };
+
+        {
+            let mut audit = state.audit.lock().await;
+            audit.path = root.clone();
+            audit.sink = None;
+        }
+        finalize_success(
+            &state,
+            &identity,
+            Action::Admin,
+            BROKER_RESOURCE,
+            Some("must fail".to_owned()),
+        )
+        .await
+        .expect_err("strict audit failure must propagate");
+
+        let storage_stats = state
+            .storage
+            .lock()
+            .await
+            .as_ref()
+            .expect("storage available")
+            .stats()
+            .expect("storage stats");
+        let metrics = state.metrics.snapshot(
+            storage_stats,
+            state.audit.lock().await.summary(),
+            state.service_mode.status(),
+            state.service_mode.degraded_components(),
+            state.adopters.snapshot(),
+        );
+        assert_eq!(metrics.audit_failures, 1);
+        assert_eq!(metrics.resilience.service_mode, "ok");
     }
 
     #[tokio::test]
@@ -3646,6 +4300,7 @@ mod tests {
             endpoint.clone(),
             agent_token.clone(),
             agent_id.to_owned(),
+            root.clone(),
             output_dir.clone(),
             agent_shutdown.clone(),
         ));
@@ -3798,7 +4453,11 @@ mod tests {
         assert_eq!(success_artifact.summary, "Alpha Beta Gamma");
         assert_eq!(
             success_artifact.source_path,
-            success_source.display().to_string()
+            success_source
+                .canonicalize()
+                .expect("canonical success source")
+                .display()
+                .to_string()
         );
 
         let retry_artifact: sample_agent_bin::SummaryArtifact = serde_json::from_str(
@@ -3810,7 +4469,11 @@ mod tests {
         assert_eq!(retry_artifact.summary, "Recovered Document");
         assert_eq!(
             retry_artifact.source_path,
-            retry_source.display().to_string()
+            retry_source
+                .canonicalize()
+                .expect("canonical retry source")
+                .display()
+                .to_string()
         );
 
         sleep(StdDuration::from_millis(100)).await;
@@ -3924,6 +4587,7 @@ mod tests {
             endpoint.clone(),
             agent_token.clone(),
             agent_id.to_owned(),
+            root.clone(),
             output_dir.clone(),
             agent_shutdown.clone(),
         ));
@@ -3983,30 +4647,30 @@ mod tests {
                 events.push(event);
             }
 
-            if !cancel_published {
-                if let Some(assignment) = events.iter().find(|event| {
+            if !cancel_published
+                && let Some(assignment) = events.iter().find(|event| {
                     event.task_id == "task-cancel"
                         && event.status == TaskStatus::Assigned
                         && event.agent_id.as_deref() == Some(agent_id)
-                }) {
-                    publish_task_event(
-                        state.as_ref(),
-                        &developer_token,
-                        &TaskEvent {
-                            event_id: Uuid::now_v7(),
-                            task_id: assignment.task_id.clone(),
-                            task_offset: assignment.task_offset,
-                            assignment_id: assignment.assignment_id,
-                            agent_id: assignment.agent_id.clone(),
-                            status: TaskStatus::Canceled,
-                            attempt: assignment.attempt,
-                            reason: Some("operator canceled stale work".to_owned()),
-                            emitted_at: Utc::now(),
-                        },
-                    )
-                    .await;
-                    cancel_published = true;
-                }
+                })
+            {
+                publish_task_event(
+                    state.as_ref(),
+                    &developer_token,
+                    &TaskEvent {
+                        event_id: Uuid::now_v7(),
+                        task_id: assignment.task_id.clone(),
+                        task_offset: assignment.task_offset,
+                        assignment_id: assignment.assignment_id,
+                        agent_id: assignment.agent_id.clone(),
+                        status: TaskStatus::Canceled,
+                        attempt: assignment.attempt,
+                        reason: Some("operator canceled stale work".to_owned()),
+                        emitted_at: Utc::now(),
+                    },
+                )
+                .await;
+                cancel_published = true;
             }
 
             let canceled = events.iter().any(|event| {
@@ -4161,12 +4825,7 @@ mod tests {
         assert_eq!(stored.byte_length, 3);
         assert_eq!(stored.classification, Classification::Restricted);
         assert_eq!(stored.retention_class, RetentionClass::Regulated);
-        assert!(
-            stored
-                .local_path
-                .as_deref()
-                .is_some_and(|path| Path::new(path).exists())
-        );
+        assert!(stored.local_path.is_none());
 
         let stat = process_request(
             &state,
@@ -4182,6 +4841,7 @@ mod tests {
             ControlResponse::ArtifactMetadata { artifact } => {
                 assert_eq!(artifact.artifact_id, "artifact-1");
                 assert_eq!(artifact.sha256, stored.sha256);
+                assert!(artifact.local_path.is_none());
             }
             other => panic!("expected artifact metadata response, got {other:?}"),
         }
@@ -4882,7 +5542,11 @@ mod tests {
             .iter_mut()
             .find(|entry| entry["agent_id"] == agent_id)
             .expect("registry agent entry");
+        let ttl_seconds = agent["ttl_seconds"].as_u64().expect("registry agent ttl");
+        let last_seen_at = expires_at - Duration::seconds(i64::try_from(ttl_seconds).expect("ttl"));
         agent["expires_at"] = serde_json::Value::String(expires_at.to_rfc3339());
+        agent["last_seen_at"] = serde_json::Value::String(last_seen_at.to_rfc3339());
+        agent["updated_at"] = serde_json::Value::String(last_seen_at.to_rfc3339());
         fs::write(
             path,
             serde_json::to_vec_pretty(&document).expect("serialize registry document"),
@@ -5351,7 +6015,7 @@ mod tests {
                         agent_id: "slow-consumer-agent".to_owned(),
                         display_name: "Slow Consumer Agent".to_owned(),
                         version: "1.0.0".to_owned(),
-                        summary: "x".repeat(8 * 1024),
+                        summary: "x".repeat(4 * 1024),
                         skills: vec!["watch".to_owned()],
                         subscriptions: vec!["topic:tasks".to_owned()],
                         publications: vec!["topic:results".to_owned()],

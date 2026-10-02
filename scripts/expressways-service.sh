@@ -36,6 +36,28 @@ service_command() {
   esac
 }
 
+service_process_pattern() {
+  local service="$1"
+  case "$service" in
+    expressways-server)
+      echo "expressways-server --config configs/expressways.example.toml"
+      ;;
+    nanobot-runtime)
+      echo "expressways-nanobot-system .*run-runtime.*--agent-id nanobot-runtime"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+find_service_pids() {
+  local service="$1"
+  local pattern
+  pattern="$(service_process_pattern "$service")"
+  pgrep -f "$pattern" 2>/dev/null | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent'
+}
+
 ensure_known_service() {
   local service="$1"
   if ! service_command "$service" >/dev/null 2>&1; then
@@ -62,6 +84,19 @@ is_running() {
   return 1
 }
 
+sync_pid_file_from_process() {
+  local service="$1"
+  local pidf
+  pidf="$(pid_file "$service")"
+  local pid
+  pid="$(find_service_pids "$service" | head -n 1 || true)"
+  if [[ -z "$pid" ]]; then
+    return 1
+  fi
+  echo "$pid" >"$pidf"
+  return 0
+}
+
 start_service() {
   local service="$1"
   ensure_known_service "$service"
@@ -69,6 +104,13 @@ start_service() {
     local pidf
     pidf="$(pid_file "$service")"
     echo "Service $service is already running (pid $(cat "$pidf"))."
+    return 0
+  fi
+
+  if sync_pid_file_from_process "$service"; then
+    local pidf
+    pidf="$(pid_file "$service")"
+    echo "Service $service was running without a valid pid file; reconciled pid $(cat "$pidf")."
     return 0
   fi
 
@@ -98,33 +140,55 @@ stop_service() {
   ensure_known_service "$service"
   local pidf
   pidf="$(pid_file "$service")"
+  local had_pid_file="false"
   if [[ ! -f "$pidf" ]]; then
-    echo "Service $service is not running (missing pid file)."
-    return 0
+    echo "Service $service is not running (missing pid file). Checking for orphan processes..."
+  else
+    had_pid_file="true"
   fi
 
-  local pid
-  pid="$(cat "$pidf" 2>/dev/null || true)"
-  if [[ -z "$pid" ]]; then
-    rm -f "$pidf"
-    echo "Service $service had empty pid file; cleaned up."
-    return 0
-  fi
-
-  if kill -0 "$pid" >/dev/null 2>&1; then
-    kill "$pid" >/dev/null 2>&1 || true
-    for _ in {1..20}; do
-      if ! kill -0 "$pid" >/dev/null 2>&1; then
-        break
+  if [[ "$had_pid_file" == "true" ]]; then
+    local pid
+    pid="$(cat "$pidf" 2>/dev/null || true)"
+    if [[ -z "$pid" ]]; then
+      rm -f "$pidf"
+      echo "Service $service had empty pid file; cleaned up."
+    else
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        kill "$pid" >/dev/null 2>&1 || true
+        for _ in {1..20}; do
+          if ! kill -0 "$pid" >/dev/null 2>&1; then
+            break
+          fi
+          sleep 0.25
+        done
+        if kill -0 "$pid" >/dev/null 2>&1; then
+          kill -9 "$pid" >/dev/null 2>&1 || true
+        fi
       fi
-      sleep 0.25
-    done
-    if kill -0 "$pid" >/dev/null 2>&1; then
-      kill -9 "$pid" >/dev/null 2>&1 || true
+
+      rm -f "$pidf"
     fi
   fi
 
-  rm -f "$pidf"
+  local orphan_pids
+  orphan_pids="$(find_service_pids "$service" || true)"
+  if [[ -n "$orphan_pids" ]]; then
+    echo "$orphan_pids" | while IFS= read -r orphan_pid; do
+      [[ -z "$orphan_pid" ]] && continue
+      kill "$orphan_pid" >/dev/null 2>&1 || true
+      for _ in {1..20}; do
+        if ! kill -0 "$orphan_pid" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 0.25
+      done
+      if kill -0 "$orphan_pid" >/dev/null 2>&1; then
+        kill -9 "$orphan_pid" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
+
   echo "Service $service stopped."
 }
 

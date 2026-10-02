@@ -27,6 +27,8 @@ The design stays within Expressways Phase 1 constraints:
 | Security controls around tools and IO | Workspace-root path allowlists + exec program allowlists |
 | Multi-instance runtime separation | Explicit `instance_id` + topic-prefix-scoped bootstrapping |
 
+Session and memory JSONL stores use collision-free filenames for unsafe session IDs, owner-only directories/files on Unix, bounded files and records, and bounded in-memory retention while scanning. A partial final record from an interrupted append is ignored, but malformed completed records fail closed. Runtime offsets are loaded from a bounded state file and saved through a durable atomic replacement; corrupt state stops the runtime instead of silently resetting consumption offsets.
+
 ## Parity Scope
 
 The crate targets architectural parity for local agent-runtime behavior, not model-quality parity with any specific upstream model provider.

@@ -211,11 +211,15 @@ A capability token is a signed credential with:
 
 The broker verifies the signature, audience, expiry, issuer state, revocation state, and allowed principal linkage before proceeding.
 
+All bundled CLIs, agents, orchestrators, Nanobot runtimes, and interop bridges use the same token loader. Token and bearer-secret files must be regular, non-symlinked UTF-8 files no larger than 64 KiB; on Unix they must not grant group or world access. Inline tokens are trimmed, non-empty, and subject to the same 64 KiB token bound.
+
 ### Policy
 
 After capability verification, the broker performs a server-side policy check. Capability scope alone is not enough. Policy is the local source of truth for what the server permits.
 
-The default policy is deny.
+The default policy is deny. Broker startup rejects a default-allow policy, empty or oversized
+patterns, malformed wildcards, empty action lists, duplicate actions, and policy sets above the
+safety bound. Rules may use an exact match, `*`, or one trailing `*` prefix wildcard.
 
 ### Quota Profile
 
@@ -277,6 +281,7 @@ The discovery registry is a local, file-backed registry of agent cards. It suppo
 - and multi-frame watch streaming with cursor resume.
 
 It is intentionally exact-match and operational, not semantic or fuzzy.
+Consume and registry-watch cursors advance only through records actually returned or examined; pagination limits never move a cursor past matching records that were omitted from the current page.
 
 ### Agent Card
 
@@ -369,7 +374,9 @@ Phase 1 uses:
 - TCP by default,
 - Unix sockets optionally on Unix hosts.
 
-The transport is local and simple. The protocol is JSON over line framing.
+The transport is local and simple. The protocol uses bounded length-delimited frames. Unix socket
+nodes are restricted to owner-only access (`0600`), and startup/shutdown cleanup refuses to remove
+regular files or symlinks found at the configured socket path.
 
 ### Protocol Layer
 
@@ -395,12 +402,19 @@ The broker requires both to pass before a request is allowed.
 `expressways-storage` implements append-only binary segments with index sidecars. It also enforces:
 
 - per-retention-class budgets,
-- global disk-pressure ceilings,
-- and basic recovery behavior for stale indexes and truncated frames.
+- atomic global disk-pressure reservations across concurrent topics,
+- rollback of partial segment/index writes,
+- bounded topic-state and stored-frame reads,
+- and streamed recovery for stale indexes and truncated or oversized frames.
+
+The global byte counter and recovered topic state are initialized from disk and maintained in memory. Normal consumes therefore do not rescan complete segment contents, while the first access after restart still validates frames and reconstructs indexes using constant memory. Per-topic synchronization prevents recovery and reads from racing an active append.
+
+On Unix, the storage root is owner-only (`0700`) and newly created segments, indexes, and state files are `0600`, preventing broker payloads from becoming readable through a permissive process umask.
 
 ### Audit
 
 `expressways-audit` records append-only, hash-chained audit events and provides offline verification/export utilities.
+Existing and newly created audit logs are restricted to `0600` on Unix; their containing directory is `0700`.
 
 ### Registry
 
@@ -500,7 +514,8 @@ Checks:
 
 - audit parent directory availability,
 - audit appendability,
-- audit-chain verification when enabled.
+- audit-chain verification when enabled,
+- and rejection of symlinked or non-regular audit targets.
 
 Can self-heal by creating the audit path when appropriate.
 
@@ -510,7 +525,9 @@ Checks:
 
 - storage path existence,
 - storage path type,
-- storage writeability through a probe file.
+- storage writeability through a collision-free `create_new` probe file.
+
+Probe filenames are restricted to a single path component, and probes never truncate a pre-existing file or follow a configured traversal path.
 
 Can self-heal by creating the storage directory when safe.
 
@@ -520,9 +537,11 @@ Checks:
 
 - registry parent availability,
 - registry document presence,
-- basic structural validity of the registry JSON.
+- bounded registry reads,
+- exact schema-version and agent-count validation,
+- and rejection of symlinked or non-regular registry targets.
 
-Can self-heal by bootstrapping the registry document when allowed.
+Can self-heal by bootstrapping an owner-only registry document with an exclusive create when allowed.
 
 ### Installation Model
 
@@ -574,6 +593,7 @@ That means if you build with a subset of adopter features, you should update `ad
 - `docs/adr`: scope and design decisions.
 - `docs/plans`: execution planning.
 - `docs/plans/productization-execution-plan.md`: productization milestones, ownership lanes, and acceptance gates.
+- `docs/plans/productization/`: week-by-week productization artifacts (contract, checklist, support policy, release channels).
 - `docs/reviews`: critical review material.
 
 ## Quick Start
@@ -607,10 +627,17 @@ make generate-admin-token
 ```
 
 By default this uses `local:developer` (registered in `configs/expressways.example.toml`) and writes `./var/auth/admin.token`.
+The target validates principal registration, status, policy-rule presence, and key compatibility before issuing the token.
 You can override the principal when needed:
 
 ```bash
 ADMIN_PRINCIPAL=local:developer make generate-admin-token
+```
+
+Or run one guarded bootstrap step:
+
+```bash
+make bootstrap-local
 ```
 
 ### 4. Start the broker
@@ -623,11 +650,32 @@ make run-expressways
 
 The sample config enables:
 
+- schema version metadata (`[schema].version = 1`) for upgrade diagnostics,
 - degraded startup,
 - degraded runtime serving,
 - audit retries,
 - listener retries,
 - and the built-in adopter allowlist.
+
+After the broker is running, verify first-run health/metrics/publish/consume in one command:
+
+```bash
+make verify-first-run
+```
+
+Run rehearsal automation with evidence capture:
+
+```bash
+make rehearse-clean-machine
+make rehearse-rollback
+make rehearse-config-rollback-reliability
+make rehearse-reliability-denials
+make rehearse-dr-restore-clean-env
+make rehearse-key-rotation
+make rehearse-m3-live-suite
+make summarize-rollback-reliability-trend
+make summarize-pilot-runs
+```
 
 ### 5. Verify health
 
@@ -653,12 +701,38 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 adopters --token-file ./var/auth/developer.token
 ```
 
+### Example: Export a support bundle
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 export-support-bundle --token-file ./var/auth/admin.token --config configs/expressways.example.toml --audit-log ./var/audit/audit.jsonl --config-audit-log ./var/agent/config-audit/entries.jsonl --redact-sensitive true --redaction-profile standard --redact-placeholder "[REDACTED]" --logs-dir ./var/agent/service-control/logs --output ./var/agent/support-bundle.json
+```
+
 Use this when you want to know:
 
 - whether the broker is `ok` or `degraded`,
 - which components are degraded,
 - what the request/audit/storage counters look like,
 - and which adopter packages are installed, enabled, inactive, or failing.
+
+Support bundle capture redacts sensitive lines by default and records redaction metadata (`enabled`, `profile`, `policy`, `placeholder`, `redacted_lines`) in the bundle payload. Use `--redaction-profile strict` when you need broader redaction coverage during incident sharing.
+
+Validate support-bundle diagnostic coverage for the top 10 expected incident classes:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- validate-support-bundle --bundle ./var/agent/support-bundle.json --output ./var/agent/support-bundle-coverage.json
+```
+
+### Example: Backup and restore runtime state
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- backup-runtime --config configs/expressways.example.toml --output-dir ./var/agent/backups --signing-private-key ./var/auth/issuer.private --signing-key-id dev
+cargo run -p expressways-client --bin expresswaysctl -- restore-runtime --backup-dir ./var/agent/backups/expressways-backup-20260326T000000Z --verification-public-key ./var/auth/issuer.public --overwrite
+```
+
+The backup utility captures config plus broker/runtime state paths referenced by the config (data dir, auth revocations, issuer public keys, audit/registry files when present), and emits a manifest-driven bundle under `./var/agent/backups/`.
+CLI file ingestion fails before allocation when configured limits are exceeded: configs are capped at 1 MiB, support bundles and signed backup manifests at 16 MiB, manifest signatures at 64 KiB, and inline task or artifact attachments at 64 MiB. These readers require regular files and do not follow symlinks.
+Backup signs the exact manifest bytes with Ed25519. Restore requires an explicitly trusted verification key and authenticates that signature before parsing the manifest, then re-derives allowed destinations from the current trusted config (override it with `--config`), rejects unknown or retargeted entries, confines payload paths to the bundle's `payload/` directory, and verifies deterministic SHA-256 digests for every file and directory tree before replacing anything. Replacements are staged beside each destination and rolled back if installation fails; unsigned legacy manifests or manifests without content digests are intentionally rejected as unverifiable.
+Runtime loaders migrate legacy persisted state documents in place to the current schema version (`1`) and fail fast on newer unsupported schema versions.
 
 ### Example: Create a regulated topic with explicit defaults
 
@@ -715,12 +789,55 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 revoke-token --token-file ./var/auth/developer.token --token-id <token-id>
 ```
 
+### Example: Rotate issuer keys with overlap and cutover
+
+Use this sequence for a safe issuer-key rotation:
+
+1. Generate the new keypair:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- generate-keypair --key-id dev-2026q2 --private-key ./var/auth/dev-2026q2.private --public-key ./var/auth/dev-2026q2.public
+```
+
+2. Update `auth.issuers` and `auth.principals` in config for overlap:
+   - keep old key `status = "active"`,
+   - add new key `status = "rotating"`,
+   - include both key ids in principal `allowed_key_ids`.
+
+3. Restart broker and issue a token from the rotating key:
+
+```bash
+bash scripts/expressways-service.sh restart expressways-server
+cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev-2026q2 --private-key ./var/auth/dev-2026q2.private --principal local:developer --audience expressways --scope system:broker:health --scope system:broker:admin --scope 'topic:*:admin,publish,consume' --scope 'registry:agents*:admin' --output ./var/auth/developer-rotating.token
+```
+
+4. Cut over config:
+   - old key `status = "disabled"`,
+   - new key `status = "active"`,
+   - principal `allowed_key_ids` contains only the new key.
+
+5. Restart broker and revoke retired key:
+
+```bash
+bash scripts/expressways-service.sh restart expressways-server
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 revoke-key --token-file ./var/auth/developer-rotating.token --key-id dev
+```
+
+6. Verify state and rehearse end-to-end:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 auth-state --token-file ./var/auth/developer-rotating.token
+make rehearse-key-rotation
+```
+
 ### Example: Verify the audit chain offline
 
 ```bash
 cargo run -p expressways-client --bin expresswaysctl -- verify-audit --path ./var/audit/audit.jsonl
 cargo run -p expressways-client --bin expresswaysctl -- export-audit --path ./var/audit/audit.jsonl --output ./var/audit/export.json
 ```
+
+Verification and export scan the hash chain as a bounded-record stream rather than loading the full log into memory. Export verifies each event in the same pass that writes it, stages the result with owner-only permissions, and replaces the destination only after the complete export is durable; the source audit log cannot be selected as the destination.
 
 ### Example: Run the orchestrator
 
@@ -748,17 +865,23 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 report-task --token-file ./var/auth/developer.token --task-id task-1 --assignment-id <assignment-id> --agent-id summarizer --status completed --attempt 1
 ```
 
-This loop lets the supervisor consume `tasks`, emit audited `assigned` records to `task_events`, and then close the task when an agent reports `completed` or `failed`. The same topic also carries orchestrator-published `timed_out`, `retry_scheduled`, `exhausted`, and `canceled` lifecycle events. `show-metrics` summarizes the persisted orchestrator state with per-status counts, total retries, and oldest in-flight assignment age, while `list-tasks`, `watch-tasks`, and `show-task` let operators inspect which specific task is active, retrying, or stuck. `watch-tasks` is a live terminal view that refreshes the same filtered and sorted queue output used by `list-tasks`, so operators can monitor assignments without rerunning commands manually. `serve-dashboard` exposes the same queue and lifecycle data over a small local HTTP server with `/api/metrics`, `/api/tasks`, `/api/tasks/<task-id>`, and `/api/tasks/<task-id>/history`, plus a built-in browser dashboard on `http://127.0.0.1:8787/`. The queue and task detail views now also surface payload kind and content type, which makes binary tasks such as images, PDFs, and protobuf blobs inspectable alongside the original JSON task flow. If you want quick local entrypoints instead of pasting the full commands, `make help` lists the common workflows and `make run-expressways`, `make run-orchestrator`, `make run-dashboard`, and `make run-stack` wrap the same broker, supervisor, and dashboard flows. Both `list-tasks` and `show-task` now include the latest assignment rationale from the scheduler, and `list-tasks` can sort by `offset`, `priority`, `age`, or `retries` to make the queue more actionable. `show-task-history` and `tail-task-events` now share the same event filters for `task_id`, `status`, `agent_id`, and `assignment_id`, plus matching `json`, `jsonl`, and compact `table` outputs, so point-in-time inspection and live tailing use the same operator workflow. `submit-task` now accepts scheduler hints such as `--priority`, repeated `--preferred-agent`, and repeated `--avoid-agent`, plus generic payload forms with `--payload-json`, `--payload-text`, `--payload-base64`, or `--payload-file`. File payloads are now uploaded to the broker as managed artifacts by default, so task messages carry `artifact_ref` metadata instead of host-local paths; `--payload-inline` is still available when you want small images, PDFs, protobuf bytes, or other blobs embedded directly in the task message. The broker also exposes `put-artifact`, `stat-artifact`, and `get-artifact` for explicit artifact workflows, including hash verification and durable local storage under the broker data directory. Each orchestrator-generated `assigned` event now also includes a human-readable scheduler reason so operators can see why that agent won. `requeue-task` and `cancel-task` publish audited control events instead of mutating local state silently, and cancellation-aware workers can observe those events before they emit a stale completion.
+The dashboard permits unauthenticated access only on a loopback bind. A non-loopback listener requires `--access-bearer` or, preferably, `--access-bearer-file`; every client or terminating reverse proxy request must send `Authorization: Bearer <value>`. Request headers are capped at 8 KiB, reads time out after 5 seconds, and concurrent connections default to 64 (`--request-timeout-ms` and `--max-connections` adjust these limits). For the Make targets, pass the authentication option through `DASHBOARD_ACCESS_ARGS`, for example `DASHBOARD_ACCESS_ARGS='--access-bearer-file ./var/auth/dashboard.token'`.
+
+This loop lets the supervisor consume `tasks`, emit audited `assigned` records to `task_events`, and then close the task when an agent reports `completed` or `failed`. The same topic also carries orchestrator-published `timed_out`, `retry_scheduled`, `exhausted`, and `canceled` lifecycle events. `show-metrics` summarizes the persisted orchestrator state with per-status counts, total retries, and oldest in-flight assignment age, while `list-tasks`, `watch-tasks`, and `show-task` let operators inspect which specific task is active, retrying, or stuck. `watch-tasks` is a live terminal view that refreshes the same filtered and sorted queue output used by `list-tasks`, so operators can monitor assignments without rerunning commands manually. `serve-dashboard` exposes the same queue and lifecycle data over a small local HTTP server with `/api/metrics`, `/api/tasks`, `/api/tasks/<task-id>`, and `/api/tasks/<task-id>/history`, plus a built-in browser dashboard on `http://127.0.0.1:8787/`. The queue and task detail views now also surface payload kind and content type, which makes binary tasks such as images, PDFs, and protobuf blobs inspectable alongside the original JSON task flow. If you want quick local entrypoints instead of pasting the full commands, `make help` lists the common workflows and `make run-expressways`, `make run-orchestrator`, `make run-dashboard`, and `make run-stack` wrap the same broker, supervisor, and dashboard flows. Both `list-tasks` and `show-task` now include the latest assignment rationale from the scheduler, and `list-tasks` can sort by `offset`, `priority`, `age`, or `retries` to make the queue more actionable. `show-task-history` and `tail-task-events` now share the same event filters for `task_id`, `status`, `agent_id`, and `assignment_id`, plus matching `json`, `jsonl`, and compact `table` outputs, so point-in-time inspection and live tailing use the same operator workflow. `submit-task` now accepts scheduler hints such as `--priority`, repeated `--preferred-agent`, and repeated `--avoid-agent`, plus generic payload forms with `--payload-json`, `--payload-text`, `--payload-base64`, or `--payload-file`. File payloads are uploaded to the broker as managed artifacts by default, so task messages carry `artifact_ref` metadata instead of host-local paths; `--payload-inline` is still available when you want images, PDFs, protobuf bytes, or other blobs up to the 64 MiB attachment ceiling embedded directly in the task message. Workers fetch managed artifacts through the authenticated broker API and verify the returned length and SHA-256 before handlers can read them. Broker-local paths and task-supplied `file_ref` paths are treated as untrusted metadata and are never opened implicitly by `AssignedTask`; remote artifact responses omit broker-local paths entirely. The broker also exposes `put-artifact`, `stat-artifact`, and `get-artifact` for explicit artifact workflows, including hash verification and durable local storage under the broker data directory. Artifact directories are `0700` and blobs/metadata are durably written as `0600` on Unix. Each orchestrator-generated `assigned` event now also includes a human-readable scheduler reason so operators can see why that agent won. `requeue-task` and `cancel-task` publish audited control events instead of mutating local state silently, and cancellation-aware workers can observe those events before they emit a stale completion.
+
+Orchestrator state is size-bounded and semantically validated before use, including collection limits and map-key/record-ID consistency. Incoming task work items are rejected before mutation when their serialized form exceeds 1 MiB or when identifiers, agent-hint collections, retry counts, or durations violate safety bounds; oversized raw task messages are discarded before JSON parsing. Lifecycle events are limited to 64 KiB and their identifiers, reasons, task offsets, attempts, and active-lease identity are validated before any state mutation. Saves use an atomically renamed, durably flushed owner-only file (`0600` on Unix), so an interrupted write cannot expose a partially serialized live state document.
+
+Managed artifacts are capped at 64 MiB and metadata at 64 KiB. Reads are bounded before allocation, and truncated, growing, oversized, or directory-escaping symlink files fail closed.
 
 ### Example: Run the sample task agent
 
 ```bash
-cargo run -p expressways-client --bin expressways-agent-example -- --transport tcp --address 127.0.0.1:7766 --token-file ./var/auth/developer.token --agent-id summarizer --display-name "Summarizer" --summary "Example document summarizer" --state-path ./var/agent/summarizer.state.json --output-dir ./var/agent/results
-cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 submit-task --token-file ./var/auth/developer.token --task-id task-2 --task-type summarize_document --skill summarize --payload-json '{"path":"README.md","max_summary_lines":4}'
+cargo run -p expressways-client --bin expressways-agent-example -- --transport tcp --address 127.0.0.1:7766 --token-file ./var/auth/developer.token --agent-id summarizer --display-name "Summarizer" --summary "Example document summarizer" --state-path ./var/agent/summarizer.state.json --input-dir ./var/agent/incoming --output-dir ./var/agent/results
+cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 submit-task --token-file ./var/auth/developer.token --task-id task-2 --task-type summarize_document --skill summarize --payload-json '{"path":"notes.md","max_summary_lines":4}'
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 consume --token-file ./var/auth/developer.token --topic task_events --offset 0 --limit 20
 ```
 
-The sample agent uses `AgentWorker`, registers itself in the discovery registry, keeps a heartbeat running, and writes summary artifacts to `./var/agent/results/<task-id>.summary.json`. Its local checkpoint file lives at `./var/agent/summarizer.state.json`, so pending completion or failure reports are retried after restart. While a task is in flight it also watches `task_events` for `canceled`, `timed_out`, requeue, or superseding assignment events and stops cooperatively instead of writing a stale artifact.
+The sample agent uses `AgentWorker`, registers itself in the discovery registry, keeps a heartbeat running, and writes summary artifacts to `./var/agent/results/<task-id>.summary.json`. Input paths are confined to `--input-dir` (including after symlink resolution), must resolve to regular UTF-8 files, and are limited to 16 MiB; optional output paths must remain relative to `--output-dir`, so traversal and absolute output paths fail closed. Its local checkpoint file lives at `./var/agent/summarizer.state.json`, so pending completion or failure reports are retried after restart. Bundled agents persist these checkpoints through the shared bounded, owner-only atomic state writer. While a task is in flight it also watches `task_events` for `canceled`, `timed_out`, requeue, or superseding assignment events and stops cooperatively instead of writing a stale artifact.
 
 ### Example: Run the binary payload agent
 
@@ -768,7 +891,7 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 submit-task --token-file ./var/auth/developer.token --task-id task-inline-image --task-type inspect_blob --skill binary --payload-file ./var/agent/incoming/image.png --payload-inline --payload-content-type image/png
 ```
 
-This example agent consumes `inspect_blob` tasks and uses the new `AssignedTask` payload helpers to inspect broker-managed artifact refs, file references, inline bytes, or text payloads without custom base64 plumbing in the handler. It writes JSON artifacts to `./var/agent/blob-results/<task-id>.blob.json` with payload kind, content type, byte length, a short hex preview, UTF-8 preview when available, and source metadata such as artifact id, declared size, or SHA-256.
+This example agent consumes `inspect_blob` tasks and uses the `AssignedTask` payload helpers to inspect authenticated broker-managed artifacts, inline bytes, or text payloads without custom base64 plumbing in the handler. Untrusted `file_ref` paths fail closed instead of reading the agent host filesystem. It writes JSON artifacts to `./var/agent/blob-results/<task-id>.blob.json` with payload kind, content type, byte length, a short hex preview, UTF-8 preview when available, and source metadata such as artifact id, declared size, or SHA-256.
 
 ## Nanobot Parity Deployment
 
@@ -785,6 +908,8 @@ Run the runtime:
 ```bash
 cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --ensure-topics true --workspace-root /Users/tusharmohan/Documents/@labs/expressways --allow-exec-program git --allow-exec-program ls
 ```
+
+Nanobot file access and process execution are default-deny: at least one canonical `--workspace-root` is required for `read_file`, and `exec` accepts only exact program names supplied with `--allow-exec-program`. An empty executable allowlist disables `exec`. Subprocesses receive only a minimal `PATH`/locale environment, output capture is capped at 1 MiB per stream, and timed-out processes are terminated instead of continuing in the background.
 
 Run the runtime with native OpenAI provider:
 
@@ -880,14 +1005,26 @@ pnpm install
 pnpm dev:tauri
 ```
 
-The `Config Console` tab shows discovered TOML components (broker + Nanobot system files), current section summaries, and per-component apply flow with validation, diff preview, backup snapshotting, rollback controls, and one-click restart orchestration for supported services.
+The `Config Console` tab shows discovered TOML components (broker + Nanobot system files), current section summaries, and mixed editing: form mode for core broker sections (including nested table-array editors for `auth.issuers`, `auth.principals`, `policy.rules`, and `quotas.profiles`) plus raw TOML mode with validation, diff preview, backup snapshotting, rollback controls, and one-click restart orchestration for supported services.
 
-The `Advanced Control` tab lets operators execute arbitrary control-plane commands from JSON templates (including attachment-aware artifact workflows), inspect full broker responses, and retain recent execution history for debugging and rehearsal runs.
+The same tab now includes:
+
+- a `Service Lifecycle` panel for `start|stop|restart|status` on supported services,
+- an `Operator Workflow` panel for guided first-run actions (`bootstrap_local`, `verify_first_run`, `export_support_bundle`) plus token re-issue (`generate_admin_token`),
+- schema-driven form-field hints (`required`, `min/max`, `allowed`) with server-side constraint enforcement for core broker sections,
+- nested table-array add/remove/edit support in form mode for auth/policy/quota rule/profile lists,
+- a `Config Audit Trail` panel backed by append-only local entries in `var/agent/config-audit/entries.jsonl`.
+
+The console bounds configuration files and backups to 1 MiB and applies them through contained, owner-only atomic replacements. Audit records are bounded to 64 KiB and the local audit log to 64 MiB; once full, audit appends fail visibly and configuration changes are rolled back until the log is exported and rotated.
+
+The `Advanced Control` tab lets operators execute arbitrary control-plane commands from JSON templates (including attachment-aware artifact workflows), inspect full broker responses, and retain recent execution history for debugging and rehearsal runs. Mutating command types now require a guard acknowledgment plus a short reason before execution.
+
+The `Overview` tab includes a `Token-Principal-Policy Diagnostics` panel to check token claim integrity, principal registration/status, key allowlist compatibility, and baseline scope/policy coverage before first-run operations.
 
 ### Example: Benchmark the broker
 
 ```bash
-cargo run -p expressways-bench -- suite --spawn-server --broker-iterations 100 --warmup-iterations 20 --payload-bytes 512 --message-count 2000 --read-batch 250 --output ./var/benchmarks/latest.json
+cargo run --release -p expressways-bench -- suite --spawn-server --server-bin target/release/expressways-server --broker-iterations 100 --warmup-iterations 20 --payload-bytes 512 --message-count 2000 --read-batch 250 --output ./var/benchmarks/latest.json
 ```
 
 ## Interop Deployment
@@ -917,8 +1054,10 @@ cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev
 Run the webhook ingress bridge:
 
 ```bash
-cargo run -p expressways-interop-bridge-example -- --transport tcp --address 127.0.0.1:7766 --listen 127.0.0.1:8891 --token-file ./var/auth/bridge-openclaw.token --ingress-bearer local-bridge-secret --tasks-topic interop.chat.requests --task-type interop.chat.handoff --default-skill chat.reply
+cargo run -p expressways-interop-bridge-example -- --transport tcp --address 127.0.0.1:7766 --listen 127.0.0.1:8891 --token-file ./var/auth/bridge-openclaw.token --ingress-bearer-file ./var/auth/bridge-ingress.secret --tasks-topic interop.chat.requests --task-type interop.chat.handoff --default-skill chat.reply
 ```
+
+Non-loopback bridge listeners require an ingress bearer. Prefer `--ingress-bearer-file` so the secret is not exposed in the bridge process arguments. Requests default to a 1 MiB limit (hard ceiling 16 MiB), a 10-second deadline, and 64 concurrent connections; deadlines are constrained to 100 ms through five minutes, connection counts cannot exceed the runtime semaphore ceiling, and oversized or overflowing `Content-Length` values fail before allocation. The request reader caps headers at 64 KiB and grows body storage only as bytes arrive instead of reserving the full request ceiling for every idle socket. Webhook records reject unknown fields and bound identifiers, metadata, attachments, routing labels, agent hints, retry counts, and task durations before any broker calls; duplicate or contradictory agent hints and mismatched inline attachment hashes or lengths are rejected. Use `--max-request-bytes`, `--request-timeout-ms`, and `--max-connections` only when the integration requires different bounded values. The orchestrator dashboard applies the same deadline and connection-count bounds.
 
 Submit a sample OpenClaw-style handoff:
 
@@ -1047,6 +1186,16 @@ If the broker is serving with reduced capabilities:
 
 Use [configs/expressways.example.toml](configs/expressways.example.toml) as the starting point.
 
+Broker configuration must be a regular, non-symlinked UTF-8 file no larger than 1 MiB. Unknown fields in schema, server, storage, audit, resilience, adopter, registry, authentication, quota, and policy records fail startup, preventing misspelled security settings from silently falling back to defaults. Authentication collection sizes and identifiers are bounded, policy is startup-validated and forced to default deny, and quota payloads, batch sizes, rates, windows, and delay values have explicit ceilings.
+
+### `[schema]`
+
+Controls:
+
+- config schema version metadata (`version`),
+- compatibility diagnostics during startup,
+- explicit version pinning for upgrade runbooks.
+
 ### `[server]`
 
 Controls:
@@ -1055,7 +1204,9 @@ Controls:
 - transport choice,
 - listen address or socket path,
 - broker data directory,
-- log level.
+- log level,
+- maximum concurrent client connections,
+- maximum request/response frame size (`max_frame_bytes`, 256 bytes through 64 MiB), enforced before request decoding and again before response transmission. Connection counts are validated against the runtime semaphore ceiling, and clients that send no complete request frame within `connection_idle_timeout_ms` (100 ms through one hour; 30 seconds by default) are disconnected so idle sockets cannot permanently exhaust the connection pool.
 
 ### `[storage]`
 
@@ -1105,9 +1256,13 @@ Controls:
 - registry backend,
 - registry path,
 - default TTL,
-- watch history size,
+- watch history size (1 through 4,096 events),
 - stream send timeout,
 - idle keepalive limit.
+
+Agent registrations are limited to 64 KiB, with bounded identifiers, summaries, endpoints, schemas, and discovery lists (at most 128 skills/subscriptions/publications and 64 schemas). The file-backed registry is limited to 10,000 uniquely identified agents and 64 MiB; oversized, duplicated, or semantically invalid state is rejected before serving. These bounds prevent authenticated registrations or corrupted local state from amplifying into unbounded watch-history, parsing, logging, and startup memory use.
+
+The file backend caches validated cards and uses file length, modification time, and (on Unix) device/inode identity to invalidate that cache. Normal list and heartbeat traffic therefore avoids repeated JSON reads and parsing, while operator-side file replacement is still detected and revalidated.
 
 ### `[auth]`
 
@@ -1270,6 +1425,17 @@ Notably absent from the immediate roadmap:
 - speculative complexity without measurement.
 
 ## Release Guardrails
+
+Release packaging and publication are driven by `.github/workflows/release-skeleton.yml`.
+The workflow now publishes:
+
+- per-platform bundles (`*.tar.gz`) and detached checksum files (`*.sha256`),
+- aggregate checksum index (`release-checksums.txt`),
+- CycloneDX SBOM (`release-sbom.cdx.json`),
+- detached signatures plus signature manifest (`release-signatures.json`) when signing key material is configured.
+
+Configure `EXPRESSWAYS_RELEASE_SIGNING_PRIVATE_KEY_PEM` in repository secrets to enable signatures.
+Tag-triggered releases require signing by default unless explicitly disabled via workflow-dispatch `signing_mode`.
 
 No new externally reachable operation should ship unless it:
 

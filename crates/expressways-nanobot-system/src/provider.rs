@@ -789,11 +789,11 @@ fn apply_openai_stream_payload(
                         text.push_str(content_text);
                         on_text_chunk(content_text);
                     }
-                } else if let Some(content_text) = part.as_str() {
-                    if !content_text.is_empty() {
-                        text.push_str(content_text);
-                        on_text_chunk(content_text);
-                    }
+                } else if let Some(content_text) = part.as_str()
+                    && !content_text.is_empty()
+                {
+                    text.push_str(content_text);
+                    on_text_chunk(content_text);
                 }
             }
         }
@@ -864,11 +864,11 @@ fn apply_anthropic_stream_payload(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
             if block_type == "text" {
-                if let Some(chunk) = block.get("text").and_then(serde_json::Value::as_str) {
-                    if !chunk.is_empty() {
-                        text.push_str(chunk);
-                        on_text_chunk(chunk);
-                    }
+                if let Some(chunk) = block.get("text").and_then(serde_json::Value::as_str)
+                    && !chunk.is_empty()
+                {
+                    text.push_str(chunk);
+                    on_text_chunk(chunk);
                 }
                 return Ok(false);
             }
@@ -902,11 +902,11 @@ fn apply_anthropic_stream_payload(
                 .unwrap_or_default();
 
             if delta_type == "text_delta" {
-                if let Some(chunk) = delta.get("text").and_then(serde_json::Value::as_str) {
-                    if !chunk.is_empty() {
-                        text.push_str(chunk);
-                        on_text_chunk(chunk);
-                    }
+                if let Some(chunk) = delta.get("text").and_then(serde_json::Value::as_str)
+                    && !chunk.is_empty()
+                {
+                    text.push_str(chunk);
+                    on_text_chunk(chunk);
                 }
                 return Ok(false);
             }
@@ -1024,23 +1024,23 @@ fn build_openai_messages(request: &ProviderRequest, system_prompt: &str) -> Vec<
     for (index, turn) in request.history.iter().enumerate() {
         match turn.role {
             SessionRole::User => {
-                if let Some(text) = turn.text.as_deref() {
-                    if !text.trim().is_empty() {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": text
-                        }));
-                    }
+                if let Some(text) = turn.text.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": text
+                    }));
                 }
             }
             SessionRole::Assistant => {
-                if let Some(text) = turn.text.as_deref() {
-                    if !text.trim().is_empty() {
-                        messages.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": text
-                        }));
-                    }
+                if let Some(text) = turn.text.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": text
+                    }));
                 }
             }
             SessionRole::ToolCall => {
@@ -1081,13 +1081,13 @@ fn build_openai_messages(request: &ProviderRequest, system_prompt: &str) -> Vec<
                 }
             }
             SessionRole::System => {
-                if let Some(text) = turn.text.as_deref() {
-                    if !text.trim().is_empty() {
-                        messages.push(serde_json::json!({
-                            "role": "system",
-                            "content": text
-                        }));
-                    }
+                if let Some(text) = turn.text.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": text
+                    }));
                 }
             }
         }
@@ -1109,23 +1109,23 @@ fn build_anthropic_messages(request: &ProviderRequest) -> Vec<serde_json::Value>
     for (index, turn) in request.history.iter().enumerate() {
         match turn.role {
             SessionRole::User => {
-                if let Some(text) = turn.text.as_deref() {
-                    if !text.trim().is_empty() {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": text
-                        }));
-                    }
+                if let Some(text) = turn.text.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": text
+                    }));
                 }
             }
             SessionRole::Assistant => {
-                if let Some(text) = turn.text.as_deref() {
-                    if !text.trim().is_empty() {
-                        messages.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": text
-                        }));
-                    }
+                if let Some(text) = turn.text.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": text
+                    }));
                 }
             }
             SessionRole::ToolCall => {
@@ -1165,13 +1165,13 @@ fn build_anthropic_messages(request: &ProviderRequest) -> Vec<serde_json::Value>
                 }
             }
             SessionRole::System => {
-                if let Some(text) = turn.text.as_deref() {
-                    if !text.trim().is_empty() {
-                        messages.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": format!("[system] {text}")
-                        }));
-                    }
+                if let Some(text) = turn.text.as_deref()
+                    && !text.trim().is_empty()
+                {
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": format!("[system] {text}")
+                    }));
                 }
             }
         }
@@ -1392,10 +1392,10 @@ fn parse_anthropic_response(payload: &serde_json::Value) -> Result<ProviderStep,
         {
             continue;
         }
-        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
-            if !text.trim().is_empty() {
-                text_parts.push(text.to_owned());
-            }
+        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str)
+            && !text.trim().is_empty()
+        {
+            text_parts.push(text.to_owned());
         }
     }
 
@@ -1426,10 +1426,10 @@ fn extract_content(content: Option<&serde_json::Value>) -> Result<String, String
                 }
                 continue;
             }
-            if let Some(text) = part.as_str() {
-                if !text.trim().is_empty() {
-                    text_parts.push(text.to_owned());
-                }
+            if let Some(text) = part.as_str()
+                && !text.trim().is_empty()
+            {
+                text_parts.push(text.to_owned());
             }
         }
         return Ok(text_parts.join("\n"));
@@ -1579,10 +1579,10 @@ mod tests {
                 }
             }
 
-            if let Some(total_len) = expected_len {
-                if bytes.len() >= total_len {
-                    return Ok(());
-                }
+            if let Some(total_len) = expected_len
+                && bytes.len() >= total_len
+            {
+                return Ok(());
             }
         }
     }

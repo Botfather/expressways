@@ -127,7 +127,7 @@ impl AdopterManager {
     pub fn has_enabled(&self) -> bool {
         self.statuses
             .lock()
-            .expect("adopter statuses lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
             .any(|status| status.enabled)
     }
@@ -135,7 +135,7 @@ impl AdopterManager {
     pub fn snapshot(&self) -> Vec<AdopterStatusView> {
         self.statuses
             .lock()
-            .expect("adopter statuses lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
             .cloned()
             .collect()
@@ -143,7 +143,10 @@ impl AdopterManager {
 
     pub fn probe_now(&self, service_mode: &ServiceModeTracker) {
         {
-            let statuses = self.statuses.lock().expect("adopter statuses lock");
+            let statuses = self
+                .statuses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for status in statuses.values().filter(|status| status.enabled) {
                 let key = format!("adopter:{}", status.id);
                 if status.status == "healthy" || status.status == "inactive" {
@@ -203,7 +206,7 @@ impl AdopterManager {
 
             self.statuses
                 .lock()
-                .expect("adopter statuses lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(manifest.id.clone(), snapshot);
 
             if outcome.status == AdopterHealth::Healthy {

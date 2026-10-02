@@ -24,6 +24,204 @@ jobs:
       - name: Cargo Test (Nanobot System)
         run: cargo test -p expressways-nanobot-system
 
+  config-rollback-reliability:
+    runs-on: ubuntu-latest
+    env:
+      ROLLBACK_RELIABILITY_ARTIFACT_RETENTION_DAYS: 30
+      ROLLBACK_RELIABILITY_TREND_WINDOW_REPORTS: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Config Rollback Reliability Rehearsal
+        run: bash scripts/rehearsal-config-rollback-reliability.sh
+
+      - name: Build Config Rollback Reliability Trend Summary
+        if: always()
+        run: |
+          export REPORT_DIR="var/agent/pilot-runs"
+          export WINDOW_SIZE="$ROLLBACK_RELIABILITY_TREND_WINDOW_REPORTS"
+          export ARTIFACT_RETENTION_DAYS="$ROLLBACK_RELIABILITY_ARTIFACT_RETENTION_DAYS"
+          export OUTPUT_MD="var/agent/pilot-runs/config-rollback-reliability-trend-${{ github.run_id }}.md"
+          export OUTPUT_JSON="var/agent/pilot-runs/config-rollback-reliability-trend-${{ github.run_id }}.json"
+          bash scripts/rollback-reliability-trend-summary.sh
+
+      - name: Publish Config Rollback Reliability Trend to Job Summary
+        if: always()
+        run: |
+          summary_path="var/agent/pilot-runs/config-rollback-reliability-trend-${{ github.run_id }}.md"
+          if [[ -f "$summary_path" ]]; then
+            cat "$summary_path" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Rollback reliability trend summary not found at $summary_path." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Config Rollback Reliability Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-rollback-reliability-${{ github.run_id }}
+          path: |
+            var/agent/pilot-runs/config-rollback-reliability-*.md
+            var/agent/pilot-runs/config-rollback-reliability-*.json
+            var/agent/pilot-runs/config-rollback-reliability-trend-*.md
+            var/agent/pilot-runs/config-rollback-reliability-trend-*.json
+            var/agent/pilot-runs/logs/*config-rollback-reliability*.log
+          retention-days: ${{ env.ROLLBACK_RELIABILITY_ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: warn
+
+  reliability-denials-rehearsal:
+    runs-on: ubuntu-latest
+    env:
+      REHEARSAL_ARTIFACT_RETENTION_DAYS: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Reliability and Denial Rehearsal Suite
+        run: bash scripts/rehearsal-reliability-denials.sh
+
+      - name: Publish Reliability and Denial Rehearsal Summary
+        if: always()
+        run: |
+          summary_path="$(ls -t var/agent/pilot-runs/reliability-denials-rehearsal-*.md 2>/dev/null | head -n 1 || true)"
+          if [[ -n "$summary_path" && -f "$summary_path" ]]; then
+            cat "$summary_path" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Reliability and denial rehearsal summary not found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Reliability and Denial Rehearsal Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-denials-rehearsal-${{ github.run_id }}
+          path: |
+            var/agent/pilot-runs/reliability-denials-rehearsal-*.md
+            var/agent/pilot-runs/reliability-denials-rehearsal-*.json
+            var/agent/pilot-runs/logs/*.log
+          retention-days: ${{ env.REHEARSAL_ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: warn
+
+  m3-live-rehearsal-suite:
+    runs-on: ubuntu-latest
+    env:
+      REHEARSAL_ARTIFACT_RETENTION_DAYS: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run M3 Live Rehearsal Suite
+        run: bash scripts/rehearsal-m3-live-suite.sh
+
+      - name: Publish M3 Live Rehearsal Summary
+        if: always()
+        run: |
+          summary_path="$(ls -t var/agent/pilot-runs/m3-live-rehearsal-suite-*.md 2>/dev/null | head -n 1 || true)"
+          if [[ -n "$summary_path" && -f "$summary_path" ]]; then
+            cat "$summary_path" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "M3 live rehearsal summary not found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload M3 Live Rehearsal Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3-live-rehearsal-suite-${{ github.run_id }}
+          path: |
+            var/agent/pilot-runs/m3-live-rehearsal-suite-*.md
+            var/agent/pilot-runs/m3-live-rehearsal-suite-*.json
+            var/agent/pilot-runs/support-bundle-coverage-*.json
+            var/agent/pilot-runs/clean-machine-*.md
+            var/agent/pilot-runs/rollback-rehearsal-*.md
+            var/agent/pilot-runs/reliability-denials-rehearsal-*.md
+            var/agent/pilot-runs/reliability-denials-rehearsal-*.json
+            var/agent/pilot-runs/logs/*.log
+          retention-days: ${{ env.REHEARSAL_ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: warn
+
+  dr-restore-clean-env:
+    runs-on: ubuntu-latest
+    env:
+      REHEARSAL_ARTIFACT_RETENTION_DAYS: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run DR Restore Rehearsal
+        run: bash scripts/rehearsal-dr-restore-clean-env.sh
+
+      - name: Publish DR Restore Rehearsal Summary
+        if: always()
+        run: |
+          summary_path="$(ls -t var/agent/pilot-runs/dr-restore-clean-env-*.md 2>/dev/null | head -n 1 || true)"
+          if [[ -n "$summary_path" && -f "$summary_path" ]]; then
+            cat "$summary_path" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "DR restore rehearsal summary not found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload DR Restore Rehearsal Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-restore-clean-env-${{ github.run_id }}
+          path: |
+            var/agent/pilot-runs/dr-restore-clean-env-*.md
+            var/agent/pilot-runs/dr-restore-clean-env-*.json
+            var/agent/pilot-runs/logs/*dr-restore*.log
+          retention-days: ${{ env.REHEARSAL_ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: warn
+
+  key-rotation-rehearsal:
+    runs-on: ubuntu-latest
+    env:
+      REHEARSAL_ARTIFACT_RETENTION_DAYS: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Key Rotation Rehearsal
+        run: bash scripts/rehearsal-key-rotation.sh
+
+      - name: Publish Key Rotation Rehearsal Summary
+        if: always()
+        run: |
+          summary_path="$(ls -t var/agent/pilot-runs/key-rotation-rehearsal-*.md 2>/dev/null | head -n 1 || true)"
+          if [[ -n "$summary_path" && -f "$summary_path" ]]; then
+            cat "$summary_path" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Key rotation rehearsal summary not found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Key Rotation Rehearsal Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: key-rotation-rehearsal-${{ github.run_id }}
+          path: |
+            var/agent/pilot-runs/key-rotation-rehearsal-*.md
+            var/agent/pilot-runs/key-rotation-rehearsal-*.json
+            var/agent/pilot-runs/logs/*key-rotation*.log
+          retention-days: ${{ env.REHEARSAL_ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: warn
+
   console-web:
     runs-on: ubuntu-latest
     defaults:

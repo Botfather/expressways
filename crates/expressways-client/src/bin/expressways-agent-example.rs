@@ -1,12 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, ValueEnum};
 use expressways_client::{
-    AgentWorker, AgentWorkerState, AssignedTask, Client, Endpoint, TaskExecutionContext,
-    WorkerRunOutcome,
+    AgentWorker, AssignedTask, Client, Endpoint, TaskExecutionContext, WorkerRunOutcome,
+    load_agent_worker_state, read_bounded_utf8_file, save_agent_worker_state, write_contained_file,
 };
 use expressways_protocol::{
     AgentEndpoint, AgentRegistration, Classification, ControlCommand, ControlRequest,
@@ -15,6 +15,8 @@ use expressways_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+
+const MAX_SUMMARIZE_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -52,6 +54,8 @@ struct Cli {
     state_path: PathBuf,
     #[arg(long, default_value = "./var/agent/results")]
     output_dir: PathBuf,
+    #[arg(long, default_value = "./var/agent/incoming")]
+    input_dir: PathBuf,
     #[arg(long, default_value = TASKS_TOPIC)]
     tasks_topic: String,
     #[arg(long, default_value = TASK_EVENTS_TOPIC)]
@@ -121,8 +125,12 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = endpoint_from_cli(cli.transport, cli.address.clone(), cli.socket.clone())?;
     let capability_token = resolve_token(cli.token.clone())?;
     let registration = registration_from_cli(&cli);
-    let worker_state = load_worker_state(&cli.state_path)?;
+    let worker_state = load_agent_worker_state(&cli.state_path)?;
     let shutdown = CancellationToken::new();
+    std::fs::create_dir_all(&cli.input_dir)
+        .with_context(|| format!("failed to create {}", cli.input_dir.display()))?;
+    std::fs::create_dir_all(&cli.output_dir)
+        .with_context(|| format!("failed to create {}", cli.output_dir.display()))?;
 
     register_agent(&endpoint, &capability_token, registration.clone()).await?;
     log_json(json!({
@@ -157,12 +165,19 @@ async fn main() -> anyhow::Result<()> {
     .with_state(worker_state);
 
     let run_result = if cli.once {
-        let outcome = run_worker_iteration(&mut worker, &cli.output_dir, &cli.state_path).await?;
+        let outcome = run_worker_iteration(
+            &mut worker,
+            &cli.input_dir,
+            &cli.output_dir,
+            &cli.state_path,
+        )
+        .await?;
         log_worker_outcome(&outcome);
         Ok(())
     } else {
         run_worker_loop(
             &mut worker,
+            &cli.input_dir,
             &cli.output_dir,
             &cli.state_path,
             shutdown.clone(),
@@ -198,27 +213,28 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_worker_loop(
     worker: &mut AgentWorker,
+    input_dir: &Path,
     output_dir: &Path,
     state_path: &Path,
     shutdown: CancellationToken,
     poll_interval: Duration,
 ) -> anyhow::Result<()> {
     loop {
-        let delay_after_iteration = match run_worker_iteration(worker, output_dir, state_path).await
-        {
-            Ok(outcome) => {
-                log_worker_outcome(&outcome);
-                matches!(outcome, WorkerRunOutcome::Idle)
-            }
-            Err(error) => {
-                log_json(json!({
-                    "timestamp": Utc::now(),
-                    "event": "worker_iteration_failed",
-                    "error": error.to_string(),
-                }));
-                true
-            }
-        };
+        let delay_after_iteration =
+            match run_worker_iteration(worker, input_dir, output_dir, state_path).await {
+                Ok(outcome) => {
+                    log_worker_outcome(&outcome);
+                    matches!(outcome, WorkerRunOutcome::Idle)
+                }
+                Err(error) => {
+                    log_json(json!({
+                        "timestamp": Utc::now(),
+                        "event": "worker_iteration_failed",
+                        "error": error.to_string(),
+                    }));
+                    true
+                }
+            };
 
         if shutdown.is_cancelled() {
             break;
@@ -237,32 +253,38 @@ async fn run_worker_loop(
 
 async fn run_worker_iteration(
     worker: &mut AgentWorker,
+    input_dir: &Path,
     output_dir: &Path,
     state_path: &Path,
 ) -> anyhow::Result<WorkerRunOutcome> {
+    let input_dir = input_dir.to_path_buf();
     let output_dir = output_dir.to_path_buf();
     let result = worker
         .run_once_with_context(|assignment, context| async move {
-            handle_assignment(assignment, output_dir, context).await
+            handle_assignment(assignment, input_dir, output_dir, context).await
         })
         .await;
-    save_worker_state(state_path, worker.state())?;
+    save_agent_worker_state(state_path, worker.state())?;
     result.map_err(Into::into)
 }
 
 pub(crate) async fn handle_assignment(
     assignment: AssignedTask,
+    input_dir: PathBuf,
     output_dir: PathBuf,
     context: TaskExecutionContext,
 ) -> Result<(), String> {
     match assignment.task.task_type.as_str() {
-        "summarize_document" => handle_summarize_document(assignment, output_dir, context).await,
+        "summarize_document" => {
+            handle_summarize_document(assignment, input_dir, output_dir, context).await
+        }
         other => Err(format!("unsupported task_type `{other}`")),
     }
 }
 
 async fn handle_summarize_document(
     assignment: AssignedTask,
+    input_dir: PathBuf,
     output_dir: PathBuf,
     context: TaskExecutionContext,
 ) -> Result<(), String> {
@@ -271,9 +293,10 @@ async fn handle_summarize_document(
         .map_err(|error| format!("invalid summarize_document payload: {error}"))?;
     abort_if_cancelled(&context)?;
 
-    let source_text = tokio::fs::read_to_string(&payload.path)
+    let source_path = resolve_input_path(&input_dir, &payload.path).await?;
+    let source_text = read_bounded_utf8_file(&source_path, MAX_SUMMARIZE_INPUT_BYTES)
         .await
-        .map_err(|error| format!("failed to read {}: {error}", payload.path.display()))?;
+        .map_err(|error| format!("invalid summary input: {error}"))?;
     abort_if_cancelled(&context)?;
     sleep_with_cancellation(&context, Duration::from_millis(payload.simulate_delay_ms)).await?;
 
@@ -282,13 +305,8 @@ async fn handle_summarize_document(
         &output_dir,
         &assignment.task.task_id,
         payload.output_path.as_ref(),
-    );
+    )?;
 
-    if let Some(parent) = output_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    }
     abort_if_cancelled(&context)?;
 
     let artifact = SummaryArtifact {
@@ -304,7 +322,7 @@ async fn handle_summarize_document(
             .clone()
             .unwrap_or_else(|| "unknown".to_owned()),
         task_type: assignment.task.task_type.clone(),
-        source_path: payload.path.display().to_string(),
+        source_path: source_path.display().to_string(),
         output_path: output_path.display().to_string(),
         generated_at: Utc::now(),
         line_count: summary.line_count,
@@ -316,7 +334,7 @@ async fn handle_summarize_document(
     let rendered = serde_json::to_vec_pretty(&artifact)
         .map_err(|error| format!("failed to render summary artifact: {error}"))?;
     abort_if_cancelled(&context)?;
-    tokio::fs::write(&output_path, rendered)
+    write_contained_file(&output_dir, &output_path, &rendered)
         .await
         .map_err(|error| format!("failed to write {}: {error}", output_path.display()))?;
     abort_if_cancelled(&context)?;
@@ -392,10 +410,69 @@ fn summarize_text(text: &str, max_summary_lines: usize) -> TextSummary {
     }
 }
 
-fn resolve_output_path(output_dir: &Path, task_id: &str, explicit: Option<&PathBuf>) -> PathBuf {
-    match explicit {
+async fn resolve_input_path(input_dir: &Path, requested: &Path) -> Result<PathBuf, String> {
+    let root = tokio::fs::canonicalize(input_dir).await.map_err(|error| {
+        format!(
+            "failed to resolve input root {}: {error}",
+            input_dir.display()
+        )
+    })?;
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let resolved = tokio::fs::canonicalize(&candidate)
+        .await
+        .map_err(|error| format!("failed to resolve input {}: {error}", candidate.display()))?;
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "input path {} escapes configured root {}",
+            requested.display(),
+            input_dir.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn resolve_output_path(
+    output_dir: &Path,
+    task_id: &str,
+    explicit: Option<&PathBuf>,
+) -> Result<PathBuf, String> {
+    let relative = match explicit {
         Some(path) => path.clone(),
-        None => output_dir.join(format!("{task_id}.summary.json")),
+        None => PathBuf::from(format!("{}.summary.json", safe_filename(task_id))),
+    };
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!(
+            "output path {} must be a relative path contained by {}",
+            relative.display(),
+            output_dir.display()
+        ));
+    }
+    Ok(output_dir.join(relative))
+}
+
+fn safe_filename(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "task".to_owned()
+    } else {
+        sanitized
     }
 }
 
@@ -548,37 +625,16 @@ async fn run_shutdown_listener(shutdown: CancellationToken) {
 }
 
 async fn await_task<T>(name: &str, handle: tokio::task::JoinHandle<T>) {
-    if let Err(error) = handle.await {
-        if !error.is_cancelled() {
-            log_json(json!({
-                "timestamp": Utc::now(),
-                "event": "background_task_join_error",
-                "task": name,
-                "error": error.to_string(),
-            }));
-        }
+    if let Err(error) = handle.await
+        && !error.is_cancelled()
+    {
+        log_json(json!({
+            "timestamp": Utc::now(),
+            "event": "background_task_join_error",
+            "task": name,
+            "error": error.to_string(),
+        }));
     }
-}
-
-fn load_worker_state(path: &Path) -> anyhow::Result<AgentWorkerState> {
-    if !path.exists() {
-        return Ok(AgentWorkerState::default());
-    }
-
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read worker state {}", path.display()))?;
-    serde_json::from_str(&raw).context("failed to parse worker state")
-}
-
-fn save_worker_state(path: &Path, state: &AgentWorkerState) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let rendered = serde_json::to_vec_pretty(state)?;
-    std::fs::write(path, rendered)
-        .with_context(|| format!("failed to write worker state {}", path.display()))?;
-    Ok(())
 }
 
 fn log_worker_outcome(outcome: &WorkerRunOutcome) {
@@ -653,12 +709,10 @@ fn endpoint_from_cli(
 
 fn resolve_token(args: TokenArgs) -> anyhow::Result<String> {
     if let Some(token) = args.token {
-        return Ok(token);
+        return expressways_client::normalize_capability_token(&token);
     }
     if let Some(path) = args.token_file {
-        let token = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read token file {}", path.display()))?;
-        return Ok(token.trim().to_owned());
+        return expressways_client::read_capability_token_file(&path);
     }
 
     bail!("a capability token is required via --token or --token-file")
@@ -704,8 +758,83 @@ mod tests {
     #[test]
     fn resolve_output_path_defaults_to_task_scoped_file() {
         let output_dir = PathBuf::from("./var/agent/results");
-        let path = resolve_output_path(&output_dir, "task-42", None);
+        let path = resolve_output_path(&output_dir, "task-42", None).expect("safe output path");
         assert_eq!(path, output_dir.join("task-42.summary.json"));
+    }
+
+    #[test]
+    fn resolve_output_path_rejects_absolute_and_parent_paths() {
+        let output_dir = PathBuf::from("./var/agent/results");
+        for path in [PathBuf::from("/tmp/stolen"), PathBuf::from("../stolen")] {
+            assert!(resolve_output_path(&output_dir, "task-42", Some(&path)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_input_path_rejects_paths_outside_configured_root() {
+        let root = std::env::temp_dir().join(format!("expressways-input-{}", uuid::Uuid::now_v7()));
+        tokio::fs::create_dir_all(&root).await.expect("create root");
+        let outside = root
+            .parent()
+            .expect("parent")
+            .join(format!("outside-document-{}.txt", uuid::Uuid::now_v7()));
+        tokio::fs::write(&outside, "secret")
+            .await
+            .expect("write outside");
+
+        let error = resolve_input_path(&root, &outside)
+            .await
+            .expect_err("outside path must be rejected");
+        assert!(error.contains("escapes configured root"));
+
+        let _ = tokio::fs::remove_file(outside).await;
+        let _ = tokio::fs::remove_dir(root).await;
+    }
+
+    #[tokio::test]
+    async fn bounded_summary_input_rejects_oversized_and_non_utf8_files() {
+        let oversized =
+            std::env::temp_dir().join(format!("expressways-summary-{}.txt", uuid::Uuid::now_v7()));
+        std::fs::File::create(&oversized)
+            .expect("create summary input")
+            .set_len(5)
+            .expect("size summary input");
+        assert!(read_bounded_utf8_file(&oversized, 4).await.is_err());
+        tokio::fs::remove_file(&oversized)
+            .await
+            .expect("remove oversized input");
+
+        let binary =
+            std::env::temp_dir().join(format!("expressways-summary-{}.txt", uuid::Uuid::now_v7()));
+        tokio::fs::write(&binary, [0xff, 0xfe])
+            .await
+            .expect("write binary input");
+        let error = read_bounded_utf8_file(&binary, 4)
+            .await
+            .expect_err("binary input must be rejected");
+        assert!(error.to_string().contains("UTF-8"));
+        tokio::fs::remove_file(binary)
+            .await
+            .expect("remove binary input");
+    }
+
+    #[tokio::test]
+    async fn bounded_summary_input_accepts_regular_utf8_files() {
+        let path =
+            std::env::temp_dir().join(format!("expressways-summary-{}.txt", uuid::Uuid::now_v7()));
+        tokio::fs::write(&path, "hello")
+            .await
+            .expect("write summary input");
+
+        assert_eq!(
+            read_bounded_utf8_file(&path, 5)
+                .await
+                .expect("read summary input"),
+            "hello"
+        );
+        tokio::fs::remove_file(path)
+            .await
+            .expect("remove summary input");
     }
 
     #[tokio::test]

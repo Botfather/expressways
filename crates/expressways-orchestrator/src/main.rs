@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -9,13 +10,13 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use expressways_client::{Client, Endpoint};
 use expressways_orchestrator::{
-    AssignmentRequirements, OrchestratorState, TaskEventApplyOutcome, TaskListQuery, TaskListSort,
-    TaskSummaryView, apply_event, apply_snapshot, apply_task_event_message, ingest_task,
-    list_tasks, load_state, orchestrator_metrics, plan_assignment_event_with_reason,
-    plan_cancel_event, plan_exhausted_event, plan_requeue_event, plan_retry_event,
-    plan_timeout_event, query_from_requirements, ready_task_ids, record_local_task_event,
-    retry_decision_task_ids, save_state, select_agent_with_reason, show_task, task_can_retry,
-    timed_out_task_ids,
+    AssignmentRequirements, MAX_TASK_EVENT_BYTES, MAX_TASK_WORK_ITEM_BYTES, OrchestratorState,
+    TaskEventApplyOutcome, TaskListQuery, TaskListSort, TaskSummaryView, apply_event,
+    apply_snapshot, apply_task_event_message, list_tasks, load_state, orchestrator_metrics,
+    plan_assignment_event_with_reason, plan_cancel_event, plan_exhausted_event, plan_requeue_event,
+    plan_retry_event, plan_timeout_event, query_from_requirements, ready_task_ids,
+    record_local_task_event, retry_decision_task_ids, save_state, select_agent_with_reason,
+    show_task, task_can_retry, timed_out_task_ids, try_ingest_task,
 };
 use expressways_protocol::{
     Classification, ControlCommand, ControlRequest, ControlResponse, RetentionClass, StoredMessage,
@@ -24,6 +25,7 @@ use expressways_protocol::{
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -170,6 +172,14 @@ enum Command {
         listen: String,
         #[arg(long, default_value = TASK_EVENTS_TOPIC)]
         task_events_topic: String,
+        #[arg(long, conflicts_with = "access_bearer_file")]
+        access_bearer: Option<String>,
+        #[arg(long)]
+        access_bearer_file: Option<PathBuf>,
+        #[arg(long, default_value_t = 64)]
+        max_connections: usize,
+        #[arg(long, default_value_t = 5_000)]
+        request_timeout_ms: u64,
     },
     ShowTask {
         #[arg(long, default_value = "./var/orchestrator/state.json")]
@@ -366,14 +376,24 @@ async fn main() -> anyhow::Result<()> {
             state_path,
             listen,
             task_events_topic,
+            access_bearer,
+            access_bearer_file,
+            max_connections,
+            request_timeout_ms,
         } => {
             let capability_token = resolve_token(token)?;
+            let access_bearer = resolve_optional_secret(access_bearer, access_bearer_file)?;
             serve_dashboard(
                 endpoint,
                 capability_token,
-                state_path,
-                task_events_topic,
-                listen,
+                DashboardServerOptions {
+                    state_path,
+                    task_events_topic,
+                    listen,
+                    access_bearer,
+                    max_connections,
+                    request_timeout_ms,
+                },
             )
             .await
         }
@@ -537,6 +557,7 @@ fn log_state_metrics(
     );
 }
 
+#[allow(clippy::too_many_arguments)] // Long-running command entry point with explicit operator settings.
 pub(crate) async fn supervise(
     endpoint: Endpoint,
     capability_token: String,
@@ -569,7 +590,7 @@ pub(crate) async fn supervise(
     .await?;
     drop(topic_client);
 
-    if synchronize_tasks(
+    synchronize_tasks(
         &endpoint,
         &capability_token,
         &mut state,
@@ -577,12 +598,8 @@ pub(crate) async fn supervise(
         &task_events_topic,
         consume_limit,
     )
-    .await?
-    {
-        save_state(&state_path, &state)?;
-    } else {
-        save_state(&state_path, &state)?;
-    }
+    .await?;
+    save_state(&state_path, &state)?;
     log_state_metrics("bootstrap_saved", &state_path, &state);
 
     loop {
@@ -705,6 +722,7 @@ pub(crate) async fn supervise(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // CLI command arguments remain explicit at this boundary.
 async fn assign(
     endpoint: Endpoint,
     capability_token: String,
@@ -802,6 +820,7 @@ async fn requeue_task(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // CLI query controls are intentionally independent.
 async fn show_task_history(
     endpoint: Endpoint,
     capability_token: String,
@@ -855,33 +874,86 @@ async fn watch_tasks(
     }
 }
 
-async fn serve_dashboard(
-    endpoint: Endpoint,
-    capability_token: String,
+#[derive(Debug)]
+struct DashboardServerOptions {
     state_path: PathBuf,
     task_events_topic: String,
     listen: String,
+    access_bearer: Option<String>,
+    max_connections: usize,
+    request_timeout_ms: u64,
+}
+
+const MIN_DASHBOARD_REQUEST_TIMEOUT_MS: u64 = 100;
+const MAX_DASHBOARD_REQUEST_TIMEOUT_MS: u64 = 300_000;
+
+fn validate_dashboard_limits(
+    max_connections: usize,
+    request_timeout_ms: u64,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(&listen)
+    if !(1..=Semaphore::MAX_PERMITS).contains(&max_connections) {
+        bail!(
+            "dashboard max_connections must be between 1 and {}",
+            Semaphore::MAX_PERMITS
+        );
+    }
+    if !(MIN_DASHBOARD_REQUEST_TIMEOUT_MS..=MAX_DASHBOARD_REQUEST_TIMEOUT_MS)
+        .contains(&request_timeout_ms)
+    {
+        bail!(
+            "dashboard request_timeout_ms must be between {MIN_DASHBOARD_REQUEST_TIMEOUT_MS} and {MAX_DASHBOARD_REQUEST_TIMEOUT_MS}"
+        );
+    }
+    Ok(())
+}
+
+async fn serve_dashboard(
+    endpoint: Endpoint,
+    capability_token: String,
+    options: DashboardServerOptions,
+) -> anyhow::Result<()> {
+    validate_dashboard_limits(options.max_connections, options.request_timeout_ms)?;
+    let listener = TcpListener::bind(&options.listen)
         .await
-        .with_context(|| format!("failed to bind dashboard listener on {listen}"))?;
+        .with_context(|| format!("failed to bind dashboard listener on {}", options.listen))?;
+    let local_addr = listener.local_addr()?;
+    validate_dashboard_exposure(
+        local_addr.ip().is_loopback(),
+        options.access_bearer.as_deref(),
+    )?;
     let context = DashboardContext {
         endpoint,
         capability_token,
-        state_path,
-        task_events_topic,
+        state_path: options.state_path,
+        task_events_topic: options.task_events_topic,
+        access_bearer: options.access_bearer,
     };
+    let connection_limit = Arc::new(Semaphore::new(options.max_connections));
+    let request_timeout = Duration::from_millis(options.request_timeout_ms);
 
-    info!(listen = %listen, "dashboard server listening");
+    info!(listen = %options.listen, "dashboard server listening");
 
     loop {
         tokio::select! {
             accept = listener.accept() => {
                 let (mut stream, peer) = accept?;
+                let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(peer = %peer, "dashboard connection limit reached; rejecting client");
+                        continue;
+                    }
+                };
                 let context = context.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_dashboard_connection(&mut stream, context).await {
-                        warn!(peer = %peer, error = %error, "dashboard request failed");
+                    let _permit = permit;
+                    match tokio::time::timeout(
+                        request_timeout,
+                        handle_dashboard_connection(&mut stream, context),
+                    ).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => warn!(peer = %peer, error = %error, "dashboard request failed"),
+                        Err(_) => warn!(peer = %peer, timeout_ms = request_timeout.as_millis(), "dashboard request timed out"),
                     }
                 });
             }
@@ -894,6 +966,14 @@ async fn serve_dashboard(
     }
 }
 
+fn validate_dashboard_exposure(loopback: bool, access_bearer: Option<&str>) -> anyhow::Result<()> {
+    if !loopback && access_bearer.is_none() {
+        bail!("dashboard bearer authentication is required for non-loopback listeners");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // CLI stream controls are intentionally independent.
 async fn tail_task_events(
     endpoint: Endpoint,
     capability_token: String,
@@ -1282,14 +1362,35 @@ async fn drain_tasks(
         }
 
         for message in &messages {
+            if message.payload.len() > MAX_TASK_WORK_ITEM_BYTES {
+                warn!(
+                    topic = %topic,
+                    offset = message.offset,
+                    payload_bytes = message.payload.len(),
+                    max_payload_bytes = MAX_TASK_WORK_ITEM_BYTES,
+                    "orchestrator skipped oversized task payload before parsing"
+                );
+                continue;
+            }
             match serde_json::from_str::<TaskWorkItem>(&message.payload) {
                 Ok(work_item) => {
                     let task_id = work_item.task_id.clone();
-                    if ingest_task(state, work_item, message.offset) {
-                        changed = true;
-                        info!(task_id = %task_id, offset = message.offset, "orchestrator consumed task work item");
-                    } else {
-                        warn!(task_id = %task_id, offset = message.offset, "orchestrator skipped duplicate task id");
+                    match try_ingest_task(state, work_item, message.offset) {
+                        Ok(true) => {
+                            changed = true;
+                            info!(task_id = %task_id, offset = message.offset, "orchestrator consumed task work item");
+                        }
+                        Ok(false) => {
+                            warn!(task_id = %task_id, offset = message.offset, "orchestrator skipped duplicate task id");
+                        }
+                        Err(error) => {
+                            warn!(
+                                task_id = %task_id,
+                                offset = message.offset,
+                                error = %error,
+                                "orchestrator skipped invalid task work item"
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -1338,6 +1439,16 @@ async fn drain_task_events(
         }
 
         for message in &messages {
+            if message.payload.len() > MAX_TASK_EVENT_BYTES {
+                warn!(
+                    topic = %topic,
+                    offset = message.offset,
+                    payload_bytes = message.payload.len(),
+                    max_payload_bytes = MAX_TASK_EVENT_BYTES,
+                    "orchestrator skipped oversized task-event payload"
+                );
+                continue;
+            }
             match serde_json::from_str::<TaskEvent>(&message.payload) {
                 Ok(event) => match apply_task_event_message(state, event.clone()) {
                     TaskEventApplyOutcome::Applied => {
@@ -1509,6 +1620,7 @@ struct DashboardContext {
     capability_token: String,
     state_path: PathBuf,
     task_events_topic: String,
+    access_bearer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1516,6 +1628,7 @@ struct HttpRequestHead {
     method: String,
     path: String,
     query: HashMap<String, String>,
+    headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1607,6 +1720,9 @@ async fn serve_dashboard_request(
     context: &DashboardContext,
     request: &HttpRequestHead,
 ) -> HttpResponse {
+    if !bearer_authorized(&request.headers, context.access_bearer.as_deref()) {
+        return text_response(401, "Unauthorized", "bearer authentication required");
+    }
     if request.method != "GET" {
         return text_response(405, "Method Not Allowed", "only GET is supported");
     }
@@ -1791,23 +1907,64 @@ async fn read_http_request_head(
         }
     }
 
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    parse_http_request_head(&request).context("invalid http request")
+    let request =
+        std::str::from_utf8(&buffer[..read]).context("http request is not valid UTF-8")?;
+    parse_http_request_head(request).context("invalid http request")
 }
 
 fn parse_http_request_head(request: &str) -> Option<HttpRequestHead> {
-    let request_line = request.lines().next()?;
+    let mut lines = request.split("\r\n");
+    let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_owned();
     let target = parts.next()?;
-    let _version = parts.next()?;
+    let version = parts.next()?;
+    if parts.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return None;
+    }
     let (path, query) = split_request_target(target);
+    let mut headers = HashMap::new();
+    for line in lines.take_while(|line| !line.is_empty()) {
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\t')
+            || headers.insert(name, value.trim().to_owned()).is_some()
+        {
+            return None;
+        }
+    }
 
     Some(HttpRequestHead {
         method,
         path,
         query,
+        headers,
     })
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..max_len {
+        difference |= usize::from(*left.get(index).unwrap_or(&0) ^ *right.get(index).unwrap_or(&0));
+    }
+    difference == 0
+}
+
+fn bearer_authorized(headers: &HashMap<String, String>, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    headers
+        .get("authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
 }
 
 fn split_request_target(target: &str) -> (String, HashMap<String, String>) {
@@ -1932,7 +2089,7 @@ fn encode_http_response(response: &HttpResponse) -> Vec<u8> {
     let mut encoded = Vec::new();
     write!(
         &mut encoded,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
         response.status_code,
         response.reason,
         response.content_type,
@@ -2030,15 +2187,34 @@ fn endpoint_from_cli(
 
 fn resolve_token(args: TokenArgs) -> anyhow::Result<String> {
     if let Some(token) = args.token {
-        return Ok(token);
+        return expressways_client::normalize_capability_token(&token);
     }
     if let Some(path) = args.token_file {
-        let token = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read token file {}", path.display()))?;
-        return Ok(token.trim().to_owned());
+        return expressways_client::read_capability_token_file(&path);
     }
 
     bail!("a capability token is required via --token or --token-file")
+}
+
+fn resolve_optional_secret(
+    inline: Option<String>,
+    file: Option<PathBuf>,
+) -> anyhow::Result<Option<String>> {
+    let value = match (inline, file) {
+        (Some(value), None) => Some(value),
+        (None, Some(path)) => Some(expressways_client::read_secret_file(&path)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => bail!("provide either an inline secret or secret file, not both"),
+    };
+    value
+        .map(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                bail!("dashboard access bearer must not be empty");
+            }
+            Ok(value)
+        })
+        .transpose()
 }
 
 fn build_task_list_query(
@@ -2978,8 +3154,8 @@ fn render_task_table(tasks: &[TaskSummaryView]) -> String {
     let mut rendered = String::new();
     writeln!(
         &mut rendered,
-        "{:<18} {:<12} {:>4} {:>5} {:<12} {:<14} {:<12} {}",
-        "TASK_ID", "STATUS", "PRI", "TRY", "PAYLOAD", "AGENT", "SKILL", "REASON"
+        "{:<18} {:<12} {:>4} {:>5} {:<12} {:<14} {:<12} REASON",
+        "TASK_ID", "STATUS", "PRI", "TRY", "PAYLOAD", "AGENT", "SKILL"
     )
     .expect("write header");
 
@@ -3020,8 +3196,8 @@ fn render_task_event_table_row(
     if !*table_header_rendered {
         writeln!(
             &mut rendered,
-            "{:<8} {:<16} {:<18} {:<14} {:>5} {:<12} {}",
-            "OFFSET", "STATUS", "TASK_ID", "AGENT", "TRY", "ASSIGNMENT", "REASON"
+            "{:<8} {:<16} {:<18} {:<14} {:>5} {:<12} REASON",
+            "OFFSET", "STATUS", "TASK_ID", "AGENT", "TRY", "ASSIGNMENT"
         )
         .expect("write header");
         *table_header_rendered = true;
@@ -3066,11 +3242,12 @@ fn truncate_cell(value: &str, max_len: usize) -> String {
 mod tests {
     use super::{
         DashboardRoute, TaskEventFilter, TaskEventOutputKind, TaskHistoryView, TaskListOutputKind,
-        TaskListSortKind, build_task_list_query, dashboard_history_request,
-        decode_task_event_entry, parse_http_request_head, render_dashboard_html,
-        render_task_event_entry, render_task_history, render_task_list, render_watch_task_frame,
-        route_dashboard_path, split_request_target, task_event_matches_filter,
-        task_list_query_from_params,
+        TaskListSortKind, bearer_authorized, build_task_list_query, constant_time_eq,
+        dashboard_history_request, decode_task_event_entry, parse_http_request_head,
+        render_dashboard_html, render_task_event_entry, render_task_history, render_task_list,
+        render_watch_task_frame, route_dashboard_path, split_request_target,
+        task_event_matches_filter, task_list_query_from_params, validate_dashboard_exposure,
+        validate_dashboard_limits,
     };
     use chrono::Utc;
     use expressways_orchestrator::{TaskListSort, TaskSummaryView};
@@ -3306,6 +3483,36 @@ mod tests {
             parsed.query.get("agent_id").map(String::as_str),
             Some("alpha")
         );
+        assert_eq!(
+            parsed.headers.get("host").map(String::as_str),
+            Some("localhost")
+        );
+    }
+
+    #[test]
+    fn dashboard_header_parser_rejects_ambiguous_duplicates() {
+        let request =
+            "GET / HTTP/1.1\r\nAuthorization: Bearer one\r\nauthorization: Bearer two\r\n\r\n";
+        assert!(parse_http_request_head(request).is_none());
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreu"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(validate_dashboard_exposure(true, None).is_ok());
+        assert!(validate_dashboard_exposure(false, Some("secret")).is_ok());
+        assert!(validate_dashboard_exposure(false, None).is_err());
+        assert!(validate_dashboard_limits(1, 100).is_ok());
+        assert!(validate_dashboard_limits(usize::MAX, 100).is_err());
+        assert!(validate_dashboard_limits(1, 99).is_err());
+        assert!(validate_dashboard_limits(1, 300_001).is_err());
+        let mut headers = HashMap::new();
+        assert!(!bearer_authorized(&headers, Some("secret")));
+        headers.insert("authorization".to_owned(), "Bearer secret".to_owned());
+        assert!(bearer_authorized(&headers, Some("secret")));
+        assert!(bearer_authorized(&HashMap::new(), None));
+        let response = super::encode_http_response(&super::text_response(200, "OK", "ok"));
+        let response = String::from_utf8(response).expect("response is UTF-8");
+        assert!(response.contains("Content-Security-Policy:"));
+        assert!(response.contains("X-Content-Type-Options: nosniff"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use expressways_audit::{AuditError, verify_file};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuditIntegritySettings {
     #[serde(default = "default_verify_chain")]
     verify_chain: bool,
@@ -92,9 +93,37 @@ impl Adopter for AuditIntegrityAdopter {
             });
         }
 
+        if let Ok(metadata) = fs::symlink_metadata(&context.audit_path)
+            && !metadata.file_type().is_file()
+        {
+            return Ok(AdopterOutcome {
+                status: AdopterHealth::Failed,
+                detail: format!(
+                    "audit path {} is not a regular file",
+                    context.audit_path.display()
+                ),
+            });
+        }
+
         let mut options = OpenOptions::new();
         options.create(self.settings.precreate_file).append(true);
-        options.open(&context.audit_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(&context.audit_path)?;
+        if !file.metadata()?.is_file() {
+            return Ok(AdopterOutcome {
+                status: AdopterHealth::Failed,
+                detail: format!(
+                    "audit path {} is not a regular file",
+                    context.audit_path.display()
+                ),
+            });
+        }
 
         if self.settings.verify_chain && context.audit_path.exists() {
             match verify_file(&context.audit_path) {
@@ -128,12 +157,27 @@ impl Adopter for AuditIntegrityAdopter {
             return Ok(None);
         };
 
+        if let Ok(metadata) = fs::symlink_metadata(&context.audit_path)
+            && !metadata.file_type().is_file()
+        {
+            return Ok(None);
+        }
+
         fs::create_dir_all(parent)?;
         if self.settings.precreate_file {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&context.audit_path)?;
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let file = options.open(&context.audit_path)?;
+            if !file.metadata()?.is_file() {
+                return Ok(None);
+            }
         }
 
         Ok(Some(format!(
@@ -141,5 +185,34 @@ impl Adopter for AuditIntegrityAdopter {
             parent.display(),
             context.audit_path.display()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_audit_paths() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("audit-guard-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create root");
+        let outside = root.join("outside.jsonl");
+        fs::write(&outside, b"sentinel").expect("write outside");
+        let link = root.join("audit.jsonl");
+        symlink(&outside, &link).expect("create symlink");
+        let context = AdopterContext {
+            data_dir: root.clone(),
+            audit_path: link,
+            registry_path: root.join("agents.json"),
+        };
+        let outcome = build(None)
+            .expect("build")
+            .inspect(&context)
+            .expect("inspect");
+        assert_eq!(outcome.status, AdopterHealth::Failed);
+        assert_eq!(fs::read(outside).expect("read outside"), b"sentinel");
     }
 }

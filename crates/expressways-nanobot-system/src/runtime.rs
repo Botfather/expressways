@@ -246,7 +246,7 @@ pub async fn run_runtime(config: RuntimeConfig) -> anyhow::Result<()> {
 
     let session_store = SessionStore::new(&config.session_dir)?;
     let memory_store = MemoryStore::new(&config.memory_dir)?;
-    let mut state = load_runtime_state(&config.state_path).unwrap_or_default();
+    let mut state = load_runtime_state(&config.state_path)?;
     let tools = ToolRegistry;
     let mut provider_runtime_state = ProviderRuntimeState::default();
 
@@ -472,8 +472,8 @@ async fn process_inbound_message(
         };
         match step {
             ProviderStep::Respond { text } => {
-                if streamed_chunk_count > 0 {
-                    if let Err(error) = publish_stream_chunk(
+                if streamed_chunk_count > 0
+                    && let Err(error) = publish_stream_chunk(
                         &config.endpoint,
                         &config.capability_token,
                         &config.outbound_stream_topic,
@@ -487,9 +487,8 @@ async fn process_inbound_message(
                         true,
                     )
                     .await
-                    {
-                        warn!(error = %error, stream_id = %stream_id, "failed to publish final stream marker");
-                    }
+                {
+                    warn!(error = %error, stream_id = %stream_id, "failed to publish final stream marker");
                 }
                 assistant_text = Some(text);
                 break;

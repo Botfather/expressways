@@ -56,19 +56,14 @@ impl FromStr for Action {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Classification {
     Public,
+    #[default]
     Internal,
     Confidential,
     Restricted,
-}
-
-impl Default for Classification {
-    fn default() -> Self {
-        Self::Internal
-    }
 }
 
 impl Display for Classification {
@@ -96,18 +91,13 @@ impl FromStr for Classification {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionClass {
     Ephemeral,
+    #[default]
     Operational,
     Regulated,
-}
-
-impl Default for RetentionClass {
-    fn default() -> Self {
-        Self::Operational
-    }
 }
 
 impl Display for RetentionClass {
@@ -851,6 +841,8 @@ pub enum StreamFrame {
     },
     RegistryEvents {
         events: Vec<RegistryEvent>,
+        /// Cursor through the last event examined for this page. It never
+        /// advances past matching events omitted by `max_events` pagination.
         cursor: u64,
     },
     KeepAlive {
@@ -894,6 +886,8 @@ pub enum ControlResponse {
     },
     RegistryEvents {
         events: Vec<RegistryEvent>,
+        /// Cursor through the last event examined for this page. It never
+        /// advances past matching events omitted by `max_events` pagination.
         cursor: u64,
         timed_out: bool,
     },
@@ -926,6 +920,8 @@ pub enum ControlResponse {
     Messages {
         topic: String,
         messages: Vec<StoredMessage>,
+        /// Cursor immediately after the last returned message, or the requested
+        /// offset when the batch is empty. It is not the topic high-water mark.
         next_offset: u64,
     },
     Error {
@@ -982,8 +978,23 @@ impl ControlWireEnvelope {
         };
 
         let header = serde_json::to_vec(&envelope)?;
-        let mut packet = Vec::with_capacity(4 + header.len() + attachment_length);
-        packet.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        let header_length = u32::try_from(header.len()).map_err(|_| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control header exceeds the 32-bit wire length limit",
+            ))
+        })?;
+        let packet_capacity = 4usize
+            .checked_add(header.len())
+            .and_then(|length| length.checked_add(attachment_length))
+            .ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "control packet length overflow",
+                ))
+            })?;
+        let mut packet = Vec::with_capacity(packet_capacity);
+        packet.extend_from_slice(&header_length.to_le_bytes());
         packet.extend_from_slice(&header);
         if let Some(attachment) = attachment {
             packet.extend_from_slice(attachment);
@@ -1001,20 +1012,24 @@ impl ControlWireEnvelope {
                 .try_into()
                 .map_err(|_| "failed to decode header length".to_owned())?,
         ) as usize;
-        if bytes.len() < 4 + header_len {
+        let attachment_start = 4usize
+            .checked_add(header_len)
+            .ok_or_else(|| "control header length overflow".to_owned())?;
+        if bytes.len() < attachment_start {
             return Err("control packet is truncated".to_owned());
         }
 
-        let header = serde_json::from_slice::<Self>(&bytes[4..4 + header_len])
+        let header = serde_json::from_slice::<Self>(&bytes[4..attachment_start])
             .map_err(|error| format!("failed to decode control header: {error}"))?;
-        let attachment = bytes[4 + header_len..].to_vec();
+        let attachment = bytes[attachment_start..].to_vec();
         let expected_length = match &header {
             Self::Request {
                 attachment_length, ..
             }
             | Self::Response {
                 attachment_length, ..
-            } => *attachment_length as usize,
+            } => usize::try_from(*attachment_length)
+                .map_err(|_| "control attachment length exceeds platform limits".to_owned())?,
             Self::Stream { .. } => 0,
         };
         if attachment.len() != expected_length {

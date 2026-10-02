@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -16,6 +17,61 @@ use expressways_protocol::{
 use expressways_storage::{DiskPressurePolicy, RetentionPolicy, Storage, StorageConfig};
 use serde::Serialize;
 use uuid::Uuid;
+
+const MAX_BENCHMARK_CONFIG_BYTES: u64 = 1024 * 1024;
+
+fn read_bounded_benchmark_config(path: &Path) -> anyhow::Result<String> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("benchmark config {} is not a regular file", path.display());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > MAX_BENCHMARK_CONFIG_BYTES {
+        bail!(
+            "benchmark config {} must be a regular file no larger than {MAX_BENCHMARK_CONFIG_BYTES} bytes",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_BENCHMARK_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_BENCHMARK_CONFIG_BYTES {
+        bail!("benchmark config {} grew beyond its limit", path.display());
+    }
+    String::from_utf8(bytes)
+        .with_context(|| format!("benchmark config {} is not valid UTF-8", path.display()))
+}
+
+fn write_private_new_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))
+}
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -185,8 +241,8 @@ struct TransportBenchmarkReport {
     total_duration_ms: u128,
     throughput_ops_per_sec: f64,
     average_latency_ms: f64,
-    p95_latency_ms: u128,
-    max_latency_ms: u128,
+    p95_latency_ms: f64,
+    max_latency_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,8 +266,8 @@ struct RegistryWatchBenchmarkReport {
     total_duration_ms: u128,
     throughput_ops_per_sec: f64,
     average_latency_ms: f64,
-    p95_latency_ms: u128,
-    max_latency_ms: u128,
+    p95_latency_ms: f64,
+    max_latency_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -420,7 +476,7 @@ async fn run_broker_benchmark(args: &BrokerBenchArgs) -> anyhow::Result<Transpor
         throughput_ops_per_sec: ops_per_sec(args.iterations, total_duration),
         average_latency_ms: average_latency_ms(&latencies),
         p95_latency_ms: percentile_latency_ms(&latencies, 0.95),
-        max_latency_ms: latencies.iter().map(Duration::as_millis).max().unwrap_or(0),
+        max_latency_ms: max_latency_ms(&latencies),
     })
 }
 
@@ -526,7 +582,7 @@ async fn run_long_poll_watch_benchmark(
         throughput_ops_per_sec: ops_per_sec(args.iterations, total_duration),
         average_latency_ms: average_latency_ms(&latencies),
         p95_latency_ms: percentile_latency_ms(&latencies, 0.95),
-        max_latency_ms: latencies.iter().map(Duration::as_millis).max().unwrap_or(0),
+        max_latency_ms: max_latency_ms(&latencies),
     })
 }
 
@@ -595,7 +651,7 @@ async fn run_stream_watch_benchmark(
         throughput_ops_per_sec: ops_per_sec(args.iterations, total_duration),
         average_latency_ms: average_latency_ms(&latencies),
         p95_latency_ms: percentile_latency_ms(&latencies, 0.95),
-        max_latency_ms: latencies.iter().map(Duration::as_millis).max().unwrap_or(0),
+        max_latency_ms: max_latency_ms(&latencies),
     })
 }
 
@@ -770,19 +826,16 @@ fn spawn_watch_server(args: &RegistryWatchBenchArgs) -> anyhow::Result<ServerLau
 async fn wait_for_server(args: &BrokerBenchArgs, token: &str) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match Client::connect(endpoint_for(args)).await {
-            Ok(mut client) => {
-                let response = client
-                    .send(ControlRequest {
-                        capability_token: token.to_owned(),
-                        command: ControlCommand::Health,
-                    })
-                    .await;
-                if let Ok(ControlResponse::Health { .. }) = response {
-                    return Ok(());
-                }
+        if let Ok(mut client) = Client::connect(endpoint_for(args)).await {
+            let response = client
+                .send(ControlRequest {
+                    capability_token: token.to_owned(),
+                    command: ControlCommand::Health,
+                })
+                .await;
+            if let Ok(ControlResponse::Health { .. }) = response {
+                return Ok(());
             }
-            Err(_) => {}
         }
 
         if Instant::now() >= deadline {
@@ -796,19 +849,16 @@ async fn wait_for_server(args: &BrokerBenchArgs, token: &str) -> anyhow::Result<
 async fn wait_for_watch_server(args: &RegistryWatchBenchArgs, token: &str) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match Client::connect(watch_endpoint_for(args)).await {
-            Ok(mut client) => {
-                let response = client
-                    .send(ControlRequest {
-                        capability_token: token.to_owned(),
-                        command: ControlCommand::Health,
-                    })
-                    .await;
-                if let Ok(ControlResponse::Health { .. }) = response {
-                    return Ok(());
-                }
+        if let Ok(mut client) = Client::connect(watch_endpoint_for(args)).await {
+            let response = client
+                .send(ControlRequest {
+                    capability_token: token.to_owned(),
+                    command: ControlCommand::Health,
+                })
+                .await;
+            if let Ok(ControlResponse::Health { .. }) = response {
+                return Ok(());
             }
-            Err(_) => {}
         }
 
         if Instant::now() >= deadline {
@@ -884,7 +934,7 @@ fn watch_endpoint_for(args: &RegistryWatchBenchArgs) -> Endpoint {
 }
 
 fn render_benchmark_config(args: &BrokerBenchArgs) -> anyhow::Result<Option<PathBuf>> {
-    let raw = fs::read_to_string(&args.config)
+    let raw = read_bounded_benchmark_config(&args.config)
         .with_context(|| format!("failed to read {}", args.config.display()))?;
     let mut value: toml::Value =
         toml::from_str(&raw).context("failed to parse benchmark config")?;
@@ -951,12 +1001,12 @@ fn render_benchmark_config(args: &BrokerBenchArgs) -> anyhow::Result<Option<Path
         },
         Uuid::now_v7()
     ));
-    fs::write(&path, rendered).with_context(|| format!("failed to write {}", path.display()))?;
+    write_private_new_file(&path, rendered.as_bytes())?;
     Ok(Some(path))
 }
 
 fn render_watch_benchmark_config(args: &RegistryWatchBenchArgs) -> anyhow::Result<Option<PathBuf>> {
-    let raw = fs::read_to_string(&args.config)
+    let raw = read_bounded_benchmark_config(&args.config)
         .with_context(|| format!("failed to read {}", args.config.display()))?;
     let mut value: toml::Value =
         toml::from_str(&raw).context("failed to parse benchmark config")?;
@@ -994,7 +1044,7 @@ fn render_watch_benchmark_config(args: &RegistryWatchBenchArgs) -> anyhow::Resul
         transport_label(args.transport),
         Uuid::now_v7()
     ));
-    fs::write(&path, rendered).with_context(|| format!("failed to write {}", path.display()))?;
+    write_private_new_file(&path, rendered.as_bytes())?;
     Ok(Some(path))
 }
 
@@ -1144,18 +1194,23 @@ fn average_latency_ms(latencies: &[Duration]) -> f64 {
     total_ms / latencies.len() as f64
 }
 
-fn percentile_latency_ms(latencies: &[Duration], percentile: f64) -> u128 {
+fn percentile_latency_ms(latencies: &[Duration], percentile: f64) -> f64 {
     if latencies.is_empty() {
-        return 0;
+        return 0.0;
     }
 
-    let mut sorted = latencies
-        .iter()
-        .map(Duration::as_millis)
-        .collect::<Vec<_>>();
-    sorted.sort_unstable();
+    let mut sorted = latencies.iter().map(duration_ms).collect::<Vec<_>>();
+    sorted.sort_by(f64::total_cmp);
     let index = ((sorted.len() as f64 - 1.0) * percentile).round() as usize;
     sorted[index]
+}
+
+fn max_latency_ms(latencies: &[Duration]) -> f64 {
+    latencies.iter().map(duration_ms).fold(0.0, f64::max)
+}
+
+fn duration_ms(duration: &Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 fn print_or_write<T: Serialize>(value: &T, output: Option<&Path>) -> anyhow::Result<()> {
@@ -1184,6 +1239,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn benchmark_config_reader_rejects_oversized_and_symlinked_files() {
+        let path = std::env::temp_dir().join(format!("expressways-bench-{}.toml", Uuid::now_v7()));
+        fs::File::create(&path)
+            .expect("create benchmark config")
+            .set_len(MAX_BENCHMARK_CONFIG_BYTES + 1)
+            .expect("size benchmark config");
+        assert!(read_bounded_benchmark_config(&path).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link =
+                std::env::temp_dir().join(format!("expressways-bench-{}.toml", Uuid::now_v7()));
+            symlink(&path, &link).expect("create config symlink");
+            assert!(read_bounded_benchmark_config(&link).is_err());
+            fs::remove_file(link).expect("remove config symlink");
+        }
+        fs::remove_file(path).expect("remove benchmark config");
+    }
+
+    #[test]
     fn benchmark_payload_has_expected_size() {
         let payload = bench_payload(64, 7);
         assert_eq!(payload.len(), 64);
@@ -1197,6 +1273,13 @@ mod tests {
             Duration::from_millis(3),
             Duration::from_millis(10),
         ];
-        assert_eq!(percentile_latency_ms(&samples, 0.95), 10);
+        assert_eq!(percentile_latency_ms(&samples, 0.95), 10.0);
+    }
+
+    #[test]
+    fn latency_metrics_preserve_sub_millisecond_precision() {
+        let samples = vec![Duration::from_micros(250), Duration::from_micros(750)];
+        assert_eq!(percentile_latency_ms(&samples, 0.95), 0.75);
+        assert_eq!(max_latency_ms(&samples), 0.75);
     }
 }

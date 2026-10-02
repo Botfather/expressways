@@ -1,10 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use anyhow::Context;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -38,17 +42,12 @@ impl PrincipalKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrincipalStatus {
+    #[default]
     Active,
     Disabled,
-}
-
-impl Default for PrincipalStatus {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl PrincipalStatus {
@@ -61,6 +60,7 @@ impl PrincipalStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalRecord {
     pub id: String,
     pub kind: PrincipalKind,
@@ -78,18 +78,13 @@ impl PrincipalRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IssuerStatus {
+    #[default]
     Active,
     Rotating,
     Disabled,
-}
-
-impl Default for IssuerStatus {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl IssuerStatus {
@@ -107,6 +102,7 @@ impl IssuerStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedIssuerConfig {
     pub key_id: String,
     pub public_key_path: PathBuf,
@@ -115,6 +111,7 @@ pub struct TrustedIssuerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default = "default_audience")]
     pub audience: String,
@@ -125,8 +122,11 @@ pub struct AuthConfig {
     pub principals: Vec<PrincipalRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationList {
+    #[serde(default)]
+    pub schema_version: u32,
     #[serde(default)]
     pub revoked_tokens: Vec<Uuid>,
     #[serde(default)]
@@ -134,6 +134,20 @@ pub struct RevocationList {
     #[serde(default)]
     pub revoked_key_ids: Vec<String>,
 }
+
+const REVOCATION_SCHEMA_VERSION: u32 = 1;
+const LEGACY_REVOCATION_SCHEMA_VERSION: u32 = 0;
+const MAX_REVOCATION_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_REVOKED_TOKENS: usize = 100_000;
+const MAX_REVOKED_PRINCIPALS: usize = 10_000;
+const MAX_REVOKED_KEY_IDS: usize = 1_000;
+const MAX_AUTH_IDENTIFIER_BYTES: usize = 256;
+const MAX_AUTH_DISPLAY_NAME_BYTES: usize = 1024;
+const MAX_TRUSTED_ISSUERS: usize = 1_000;
+const MAX_PRINCIPALS: usize = 10_000;
+const MAX_ALLOWED_KEYS_PER_PRINCIPAL: usize = 1_000;
+const MAX_KEY_FILE_BYTES: u64 = 4 * 1024;
+const MAX_CAPABILITY_TOKEN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssuerSummary {
@@ -156,9 +170,23 @@ impl RevocationList {
             return Ok(Self::default());
         }
 
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&raw).context("failed to parse revocation list")
+        let raw = read_bounded_text(path, MAX_REVOCATION_FILE_BYTES, "revocation list")?;
+        let mut list: Self =
+            serde_json::from_str(&raw).context("failed to parse revocation list")?;
+        list.validate()?;
+        match list.schema_version {
+            LEGACY_REVOCATION_SCHEMA_VERSION => {
+                list.schema_version = REVOCATION_SCHEMA_VERSION;
+                list.save(path)?;
+                Ok(list)
+            }
+            REVOCATION_SCHEMA_VERSION => Ok(list),
+            found => bail!(
+                "revocation list schema version {} is newer than supported version {}",
+                found,
+                REVOCATION_SCHEMA_VERSION
+            ),
+        }
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
@@ -168,8 +196,37 @@ impl RevocationList {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let raw = serde_json::to_vec_pretty(self).context("failed to serialize revocation list")?;
-        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
+        let mut persisted = self.clone();
+        persisted.schema_version = REVOCATION_SCHEMA_VERSION;
+        persisted.validate()?;
+        let raw =
+            serde_json::to_vec_pretty(&persisted).context("failed to serialize revocation list")?;
+        if u64::try_from(raw.len()).unwrap_or(u64::MAX) > MAX_REVOCATION_FILE_BYTES {
+            bail!(
+                "revocation list exceeds the {}-byte limit",
+                MAX_REVOCATION_FILE_BYTES
+            );
+        }
+        let temp_path = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
+        let result = (|| -> std::io::Result<()> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&temp_path)?;
+            file.write_all(&raw)?;
+            file.sync_all()?;
+            fs::rename(&temp_path, path)?;
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        result.with_context(|| format!("failed to write {}", path.display()))
     }
 
     pub fn revoke_token(&mut self, token_id: Uuid) {
@@ -193,6 +250,38 @@ impl RevocationList {
         let key_id = key_id.into();
         if !self.revoked_key_ids.iter().any(|item| item == &key_id) {
             self.revoked_key_ids.push(key_id);
+        }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        validate_unique_count("revoked_tokens", &self.revoked_tokens, MAX_REVOKED_TOKENS)?;
+        validate_unique_count(
+            "revoked_principals",
+            &self.revoked_principals,
+            MAX_REVOKED_PRINCIPALS,
+        )?;
+        validate_unique_count(
+            "revoked_key_ids",
+            &self.revoked_key_ids,
+            MAX_REVOKED_KEY_IDS,
+        )?;
+        for value in &self.revoked_principals {
+            validate_auth_identifier("revoked principal", value)?;
+        }
+        for value in &self.revoked_key_ids {
+            validate_auth_identifier("revoked key id", value)?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for RevocationList {
+    fn default() -> Self {
+        Self {
+            schema_version: REVOCATION_SCHEMA_VERSION,
+            revoked_tokens: Vec::new(),
+            revoked_principals: Vec::new(),
+            revoked_key_ids: Vec::new(),
         }
     }
 }
@@ -251,6 +340,8 @@ pub enum AuthError {
     InvalidKeyId(String),
     #[error("token format is invalid")]
     InvalidTokenFormat,
+    #[error("capability token is {bytes} bytes; maximum is {max_bytes} bytes")]
+    TokenTooLarge { bytes: usize, max_bytes: usize },
     #[error("token signature is invalid")]
     InvalidSignature,
     #[error("token `{0}` has expired")]
@@ -303,12 +394,27 @@ impl CapabilityIssuer {
         key_id: impl Into<String>,
         private_key_path: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
-        let raw = fs::read_to_string(private_key_path.as_ref()).with_context(|| {
-            format!(
-                "failed to read private key from {}",
-                private_key_path.as_ref().display()
-            )
-        })?;
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(private_key_path.as_ref())
+                .with_context(|| {
+                    format!(
+                        "failed to inspect private key {}",
+                        private_key_path.as_ref().display()
+                    )
+                })?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode & 0o077 != 0 {
+                bail!(
+                    "private key {} has insecure permissions {:03o}; expected owner-only access (0600)",
+                    private_key_path.as_ref().display(),
+                    mode
+                );
+            }
+        }
+        let raw = read_bounded_text(private_key_path.as_ref(), MAX_KEY_FILE_BYTES, "private key")?;
         let bytes = hex::decode(raw.trim()).context("private key is not valid hex")?;
         let key_bytes: [u8; 32] = bytes
             .try_into()
@@ -321,24 +427,19 @@ impl CapabilityIssuer {
     }
 
     pub fn write_private_key(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(path.as_ref(), hex::encode(self.signing_key.to_bytes()))
-            .with_context(|| format!("failed to write {}", path.as_ref().display()))
+        atomic_write_key(
+            path.as_ref(),
+            hex::encode(self.signing_key.to_bytes()).as_bytes(),
+            true,
+        )
     }
 
     pub fn write_public_key(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(
+        atomic_write_key(
             path.as_ref(),
-            hex::encode(self.signing_key.verifying_key().to_bytes()),
+            hex::encode(self.signing_key.verifying_key().to_bytes()).as_bytes(),
+            false,
         )
-        .with_context(|| format!("failed to write {}", path.as_ref().display()))
     }
 
     pub fn issue(&self, claims: CapabilityClaims) -> Result<String, AuthError> {
@@ -348,12 +449,72 @@ impl CapabilityIssuer {
         };
         let bytes = serde_json::to_vec(&payload)?;
         let signature = self.signing_key.sign(&bytes);
-        Ok(format!(
+        let token = format!(
             "{}.{}",
             URL_SAFE_NO_PAD.encode(bytes),
             URL_SAFE_NO_PAD.encode(signature.to_bytes())
-        ))
+        );
+        if token.len() > MAX_CAPABILITY_TOKEN_BYTES {
+            return Err(AuthError::TokenTooLarge {
+                bytes: token.len(),
+                max_bytes: MAX_CAPABILITY_TOKEN_BYTES,
+            });
+        }
+        Ok(token)
     }
+
+    pub fn sign_bytes(&self, message: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(self.signing_key.sign(message).to_bytes())
+    }
+}
+
+fn atomic_write_key(path: &Path, bytes: &[u8], private: bool) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let temp_path = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(if private { 0o600 } else { 0o644 });
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut file = options.open(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result.with_context(|| format!("failed to write {}", path.display()))
+}
+
+pub fn verify_detached_signature(
+    public_key_path: impl AsRef<Path>,
+    message: &[u8],
+    signature: &str,
+) -> anyhow::Result<()> {
+    let verifying_key = load_verifying_key(public_key_path.as_ref())?;
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(signature.trim())
+        .context("detached signature is not valid base64url")?;
+    let signature =
+        Signature::from_slice(&signature_bytes).context("detached signature is invalid")?;
+    verifying_key
+        .verify(message, &signature)
+        .context("detached signature verification failed")
+}
+
+pub fn write_secret_file(path: impl AsRef<Path>, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_key(path.as_ref(), bytes, true)
 }
 
 #[derive(Debug)]
@@ -364,8 +525,18 @@ struct LoadedIssuer {
 
 #[derive(Debug, Default)]
 struct CachedRevocations {
-    modified: Option<SystemTime>,
+    fingerprint: Option<FileFingerprint>,
     list: RevocationList,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 #[derive(Debug)]
@@ -379,6 +550,7 @@ pub struct CapabilityVerifier {
 
 impl CapabilityVerifier {
     pub fn from_config(config: &AuthConfig) -> anyhow::Result<Self> {
+        validate_auth_config(config)?;
         if config.issuers.is_empty() {
             anyhow::bail!("at least one trusted issuer is required");
         }
@@ -481,6 +653,12 @@ impl CapabilityVerifier {
     }
 
     pub fn verify(&self, token: &str) -> Result<VerifiedCapability, AuthError> {
+        if token.len() > MAX_CAPABILITY_TOKEN_BYTES {
+            return Err(AuthError::TokenTooLarge {
+                bytes: token.len(),
+                max_bytes: MAX_CAPABILITY_TOKEN_BYTES,
+            });
+        }
         let (payload_b64, signature_b64) =
             token.split_once('.').ok_or(AuthError::InvalidTokenFormat)?;
         let payload_bytes = URL_SAFE_NO_PAD
@@ -563,7 +741,10 @@ impl CapabilityVerifier {
     }
 
     fn current_revocation_list(&self) -> Result<RevocationList, AuthError> {
-        let mut guard = self.revocations.lock().expect("revocation cache lock");
+        let mut guard = self
+            .revocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         refresh_revocations(&self.revocation_path, &mut guard)
             .map_err(|error| AuthError::Io(std::io::Error::other(error.to_string())))?;
         Ok(guard.list.clone())
@@ -573,15 +754,69 @@ impl CapabilityVerifier {
     where
         F: FnOnce(&mut RevocationList) -> anyhow::Result<()>,
     {
-        let mut guard = self.revocations.lock().expect("revocation cache lock");
+        let mut guard = self
+            .revocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         refresh_revocations(&self.revocation_path, &mut guard)?;
         update(&mut guard.list)?;
         guard.list.save(&self.revocation_path)?;
-        guard.modified = fs::metadata(&self.revocation_path)
+        guard.fingerprint = fs::metadata(&self.revocation_path)
             .ok()
-            .and_then(|item| item.modified().ok());
+            .map(|item| file_fingerprint(&item));
         Ok(guard.list.clone())
     }
+}
+
+fn validate_auth_config(config: &AuthConfig) -> anyhow::Result<()> {
+    validate_auth_identifier("audience", &config.audience)?;
+    if config.issuers.len() > MAX_TRUSTED_ISSUERS {
+        bail!(
+            "auth config has {} issuers, exceeding the limit of {MAX_TRUSTED_ISSUERS}",
+            config.issuers.len()
+        );
+    }
+    if config.principals.len() > MAX_PRINCIPALS {
+        bail!(
+            "auth config has {} principals, exceeding the limit of {MAX_PRINCIPALS}",
+            config.principals.len()
+        );
+    }
+    for issuer in &config.issuers {
+        validate_auth_identifier("issuer key id", &issuer.key_id)?;
+        if issuer.public_key_path.as_os_str().is_empty() {
+            bail!("issuer `{}` has an empty public key path", issuer.key_id);
+        }
+    }
+    for principal in &config.principals {
+        validate_auth_identifier("principal id", &principal.id)?;
+        validate_auth_identifier("quota profile", &principal.quota_profile)?;
+        if principal.display_name.is_empty()
+            || principal.display_name.len() > MAX_AUTH_DISPLAY_NAME_BYTES
+        {
+            bail!(
+                "principal `{}` display name must contain 1..={MAX_AUTH_DISPLAY_NAME_BYTES} bytes",
+                principal.id
+            );
+        }
+        if principal.allowed_key_ids.len() > MAX_ALLOWED_KEYS_PER_PRINCIPAL {
+            bail!(
+                "principal `{}` has too many allowed issuer keys",
+                principal.id
+            );
+        }
+        let mut keys = HashSet::new();
+        for key_id in &principal.allowed_key_ids {
+            validate_auth_identifier("allowed issuer key id", key_id)?;
+            if !keys.insert(key_id) {
+                bail!(
+                    "principal `{}` contains duplicate allowed issuer key `{key_id}`",
+                    principal.id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -610,24 +845,105 @@ impl From<&RevocationList> for ResolvedRevocations {
 }
 
 fn refresh_revocations(path: &Path, guard: &mut CachedRevocations) -> anyhow::Result<()> {
-    let metadata = fs::metadata(path).ok();
-    let modified = metadata.and_then(|item| item.modified().ok());
+    let fingerprint = fs::metadata(path).ok().map(|item| file_fingerprint(&item));
 
-    if guard.modified != modified {
+    if guard.fingerprint != fingerprint {
         guard.list = if path.exists() {
             RevocationList::load(path)?
         } else {
             RevocationList::default()
         };
-        guard.modified = modified;
+        guard.fingerprint = fingerprint;
     }
 
     Ok(())
 }
 
+fn validate_unique_count<T>(field: &str, values: &[T], max: usize) -> anyhow::Result<()>
+where
+    T: Eq + std::hash::Hash,
+{
+    if values.len() > max {
+        bail!(
+            "{field} contains {} entries; maximum is {max}",
+            values.len()
+        );
+    }
+    let unique = values.iter().collect::<HashSet<_>>();
+    if unique.len() != values.len() {
+        bail!("{field} contains duplicate entries");
+    }
+    Ok(())
+}
+
+fn validate_auth_identifier(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() {
+        bail!("{field} must not be empty");
+    }
+    if value.len() > MAX_AUTH_IDENTIFIER_BYTES {
+        bail!(
+            "{field} is {} bytes; maximum is {MAX_AUTH_IDENTIFIER_BYTES} bytes",
+            value.len()
+        );
+    }
+    Ok(())
+}
+
+fn read_bounded_text(path: &Path, max_bytes: u64, kind: &str) -> anyhow::Result<String> {
+    let initial_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {kind} {}", path.display()))?;
+    if !initial_metadata.file_type().is_file() {
+        bail!("{kind} {} is not a regular file", path.display());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to read {kind} {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {kind} {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{kind} {} is not a regular file", path.display());
+    }
+    let declared_size = metadata.len();
+    if declared_size > max_bytes {
+        bail!(
+            "{kind} {} is {declared_size} bytes; maximum is {max_bytes} bytes",
+            path.display()
+        );
+    }
+    let mut raw = String::with_capacity(usize::try_from(declared_size).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut raw)
+        .with_context(|| format!("failed to read {kind} {}", path.display()))?;
+    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > max_bytes {
+        bail!(
+            "{kind} {} grew beyond the {max_bytes}-byte limit while being read",
+            path.display()
+        );
+    }
+    Ok(raw)
+}
+
+fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    FileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    }
+}
+
 fn load_verifying_key(path: &Path) -> anyhow::Result<VerifyingKey> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = read_bounded_text(path, MAX_KEY_FILE_BYTES, "public key")?;
     let bytes = hex::decode(raw.trim()).context("public key is not valid hex")?;
     let key_bytes: [u8; 32] = bytes
         .try_into()
@@ -659,6 +975,9 @@ fn default_audience() -> String {
 #[cfg(test)]
 mod tests {
     use chrono::Duration;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
@@ -671,6 +990,49 @@ mod tests {
             allowed_key_ids: vec!["dev".to_owned()],
             quota_profile: "default".to_owned(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_keys_are_written_atomically_with_owner_only_permissions() {
+        let root = std::env::temp_dir().join(format!("expressways-key-mode-{}", Uuid::now_v7()));
+        let private_path = root.join("issuer.private");
+        let issuer = CapabilityIssuer::generate("dev");
+
+        issuer
+            .write_private_key(&private_path)
+            .expect("write private key");
+
+        let mode = fs::metadata(&private_path)
+            .expect("private key metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(
+            fs::read_dir(&root)
+                .expect("read key directory")
+                .all(|entry| !entry
+                    .expect("key directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp-"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_loading_rejects_group_or_world_access() {
+        let root = std::env::temp_dir().join(format!("expressways-key-mode-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create key directory");
+        let private_path = root.join("issuer.private");
+        fs::write(&private_path, "00".repeat(32)).expect("write private key");
+        fs::set_permissions(&private_path, fs::Permissions::from_mode(0o644))
+            .expect("set insecure permissions");
+
+        let error = CapabilityIssuer::from_private_key_file("dev", &private_path)
+            .expect_err("insecure key permissions must fail");
+        assert!(error.to_string().contains("insecure permissions 644"));
     }
 
     fn auth_fixture() -> (CapabilityIssuer, AuthConfig, PathBuf, PathBuf, PathBuf) {
@@ -843,6 +1205,39 @@ mod tests {
     }
 
     #[test]
+    fn revocation_load_migrates_legacy_schema_and_rewrites_file() {
+        let (_, _, _, _, revocation_path) = auth_fixture();
+        fs::write(
+            &revocation_path,
+            "{\"revoked_tokens\":[],\"revoked_principals\":[],\"revoked_key_ids\":[]}",
+        )
+        .expect("write legacy revocations");
+
+        let loaded = RevocationList::load(&revocation_path).expect("load revocations");
+        assert_eq!(loaded.schema_version, REVOCATION_SCHEMA_VERSION);
+
+        let rewritten = fs::read_to_string(&revocation_path).expect("read migrated revocations");
+        let value: serde_json::Value = serde_json::from_str(&rewritten).expect("parse migrated");
+        assert_eq!(value["schema_version"], REVOCATION_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn revocation_load_rejects_newer_schema_versions() {
+        let (_, _, _, _, revocation_path) = auth_fixture();
+        fs::write(
+            &revocation_path,
+            "{\"schema_version\":99,\"revoked_tokens\":[],\"revoked_principals\":[],\"revoked_key_ids\":[]}",
+        )
+        .expect("write unsupported revocations");
+        let error = RevocationList::load(&revocation_path).expect_err("unsupported schema fails");
+        assert!(
+            error
+                .to_string()
+                .contains("revocation list schema version 99 is newer than supported version 1")
+        );
+    }
+
+    #[test]
     fn unknown_principal_is_rejected() {
         let (issuer, config, _, _, _) = auth_fixture();
         let verifier = CapabilityVerifier::from_config(&config).expect("build verifier");
@@ -933,5 +1328,108 @@ mod tests {
             .expect_err("key should not be allowed");
 
         assert!(matches!(error, AuthError::KeyNotAllowed { .. }));
+    }
+
+    #[test]
+    fn oversized_tokens_are_rejected_before_decoding() {
+        let (issuer, config, _, _, _) = auth_fixture();
+        let verifier = CapabilityVerifier::from_config(&config).expect("build verifier");
+        let error = verifier
+            .verify(&"x".repeat(MAX_CAPABILITY_TOKEN_BYTES + 1))
+            .expect_err("oversized token must fail");
+        assert!(matches!(error, AuthError::TokenTooLarge { .. }));
+
+        let error = issuer
+            .issue(CapabilityClaims {
+                token_id: Uuid::now_v7(),
+                principal: "local:agent-alpha".to_owned(),
+                audience: "expressways".to_owned(),
+                issued_at: Utc::now(),
+                expires_at: Utc::now() + Duration::minutes(10),
+                scopes: vec![CapabilityScope {
+                    resource: "x".repeat(MAX_CAPABILITY_TOKEN_BYTES),
+                    actions: vec![Action::Publish],
+                }],
+            })
+            .expect_err("issuer must reject oversized token");
+        assert!(matches!(error, AuthError::TokenTooLarge { .. }));
+    }
+
+    #[test]
+    fn oversized_auth_files_fail_before_unbounded_reads() {
+        let root = std::env::temp_dir().join(format!("expressways-auth-bounds-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create root");
+        let revocations = root.join("revocations.json");
+        File::create(&revocations)
+            .expect("create revocations")
+            .set_len(MAX_REVOCATION_FILE_BYTES + 1)
+            .expect("extend revocations");
+        let error =
+            RevocationList::load(&revocations).expect_err("oversized revocations must fail");
+        assert!(error.to_string().contains("maximum"));
+
+        let private_key = root.join("issuer.private");
+        File::create(&private_key)
+            .expect("create private key")
+            .set_len(MAX_KEY_FILE_BYTES + 1)
+            .expect("extend private key");
+        #[cfg(unix)]
+        fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600))
+            .expect("set private key permissions");
+        let error = CapabilityIssuer::from_private_key_file("dev", &private_key)
+            .expect_err("oversized private key must fail");
+        assert!(error.to_string().contains("maximum"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_auth_reader_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("expressways-auth-link-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create root");
+        let target = root.join("target.json");
+        let link = root.join("revocations.json");
+        fs::write(&target, b"{}").expect("write target");
+        symlink(&target, &link).expect("create symlink");
+
+        assert!(read_bounded_text(&link, MAX_REVOCATION_FILE_BYTES, "revocation file").is_err());
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn duplicate_and_excessive_revocations_are_rejected() {
+        let token_id = Uuid::now_v7();
+        let duplicates = RevocationList {
+            schema_version: REVOCATION_SCHEMA_VERSION,
+            revoked_tokens: vec![token_id, token_id],
+            revoked_principals: Vec::new(),
+            revoked_key_ids: Vec::new(),
+        };
+        assert!(duplicates.validate().is_err());
+
+        let excessive = RevocationList {
+            schema_version: REVOCATION_SCHEMA_VERSION,
+            revoked_tokens: Vec::new(),
+            revoked_principals: vec!["p".to_owned(); MAX_REVOKED_PRINCIPALS + 1],
+            revoked_key_ids: Vec::new(),
+        };
+        assert!(excessive.validate().is_err());
+    }
+
+    #[test]
+    fn auth_config_rejects_invalid_identifiers_and_duplicate_allowed_keys() {
+        let (_, mut config, _, _, _) = auth_fixture();
+        config.audience.clear();
+        assert!(validate_auth_config(&config).is_err());
+
+        config.audience = "expressways".to_owned();
+        config.principals[0].allowed_key_ids = vec!["dev".to_owned(), "dev".to_owned()];
+        let error = validate_auth_config(&config).expect_err("duplicate allowed key must fail");
+        assert!(error.to_string().contains("duplicate allowed issuer key"));
+
+        config.principals[0].allowed_key_ids.clear();
+        config.principals[0].display_name = "x".repeat(MAX_AUTH_DISPLAY_NAME_BYTES + 1);
+        assert!(validate_auth_config(&config).is_err());
     }
 }

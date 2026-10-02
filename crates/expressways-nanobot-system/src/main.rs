@@ -66,6 +66,7 @@ struct TokenArgs {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // Clap constructs one short-lived command; boxing harms parsing ergonomics.
 enum Command {
     CreateSystem {
         #[command(flatten)]
@@ -381,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
                     )?;
                     let api_key = non_empty_or_default(
                         provider_api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok()),
-                        || String::new(),
+                        String::new,
                         "--provider-api-key or OPENAI_API_KEY",
                     )?;
                     if api_key.trim().is_empty() {
@@ -415,7 +416,7 @@ async fn main() -> anyhow::Result<()> {
                     )?;
                     let api_key = non_empty_or_default(
                         provider_api_key.or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
-                        || String::new(),
+                        String::new,
                         "--provider-api-key or ANTHROPIC_API_KEY",
                     )?;
                     if api_key.trim().is_empty() {
@@ -461,7 +462,7 @@ async fn main() -> anyhow::Result<()> {
                         let api_key = non_empty_or_default(
                             fallback_provider_api_key
                                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
-                            || String::new(),
+                            String::new,
                             "--fallback-provider-api-key or ANTHROPIC_API_KEY",
                         )?;
                         if api_key.trim().is_empty() {
@@ -498,7 +499,7 @@ async fn main() -> anyhow::Result<()> {
                         let api_key = non_empty_or_default(
                             fallback_provider_api_key
                                 .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
-                            || String::new(),
+                            String::new,
                             "--fallback-provider-api-key or OPENAI_API_KEY",
                         )?;
                         if api_key.trim().is_empty() {
@@ -820,10 +821,10 @@ fn summarize_provider_events(
             }
         };
 
-        if let Some(session_filter) = session_filter {
-            if event.session_id.as_deref() != Some(session_filter) {
-                continue;
-            }
+        if let Some(session_filter) = session_filter
+            && event.session_id.as_deref() != Some(session_filter)
+        {
+            continue;
         }
         if !is_provider_runtime_event(&event.event) {
             continue;
@@ -950,21 +951,12 @@ fn endpoint_from_cli(
 
 fn resolve_token(args: TokenArgs) -> anyhow::Result<String> {
     if let Some(token) = args.token {
-        if token.trim().is_empty() {
-            bail!("--token cannot be empty");
-        }
-        return Ok(token);
+        return expressways_client::normalize_capability_token(&token);
     }
     let token_file = args
         .token_file
         .context("provide --token or --token-file for authenticated commands")?;
-    let token = std::fs::read_to_string(&token_file)
-        .with_context(|| format!("failed to read {}", token_file.display()))?;
-    let token = token.trim().to_owned();
-    if token.is_empty() {
-        bail!("token file {} was empty", token_file.display());
-    }
-    Ok(token)
+    expressways_client::read_capability_token_file(&token_file)
 }
 
 fn init_tracing(log_level: &str) -> anyhow::Result<()> {

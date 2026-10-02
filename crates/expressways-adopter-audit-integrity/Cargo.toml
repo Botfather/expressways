@@ -8,5 +8,9 @@ version.workspace = true
 [dependencies]
 expressways-adopter-api = { path = "../expressways-adopter-api" }
 expressways-audit = { path = "../expressways-audit" }
+libc.workspace = true
 serde.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

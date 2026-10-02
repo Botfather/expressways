@@ -1,3 +1,6 @@
+[schema]
+version = 1
+
 [server]
 node_name = "dev-node"
 transport = "tcp"
@@ -5,6 +8,9 @@ listen_addr = "127.0.0.1:7766"
 socket_path = "./tmp/expressways.sock"
 data_dir = "./var/data"
 log_level = "info"
+max_connections = 256
+max_frame_bytes = 8388608
+connection_idle_timeout_ms = 30000
 
 [storage]
 segment_max_bytes = 1048576

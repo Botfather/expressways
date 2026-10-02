@@ -28,3 +28,4 @@ tauri = { version = "2.10.3", features = [] }
 tauri-plugin-log = "2"
 expressways-client = { path = "../../../crates/expressways-client" }
 expressways-protocol = { path = "../../../crates/expressways-protocol" }
+libc = { workspace = true }

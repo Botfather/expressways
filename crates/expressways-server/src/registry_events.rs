@@ -24,6 +24,8 @@ pub enum RegistryEventError {
         earliest: u64,
         current: u64,
     },
+    #[error("registry event sequence space is exhausted")]
+    SequenceExhausted,
 }
 
 #[derive(Debug, Clone)]
@@ -38,9 +40,9 @@ struct RegistryEventHubInner {
     history_limit: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RegistryEventState {
-    next_sequence: u64,
+    next_sequence: Option<u64>,
     events: VecDeque<RegistryEvent>,
 }
 
@@ -49,7 +51,7 @@ impl RegistryEventHub {
         Self {
             inner: Arc::new(RegistryEventHubInner {
                 state: Mutex::new(RegistryEventState {
-                    next_sequence: 1,
+                    next_sequence: Some(1),
                     events: VecDeque::new(),
                 }),
                 notify: Notify::new(),
@@ -70,22 +72,29 @@ impl RegistryEventHub {
         current_cursor(&state)
     }
 
-    pub async fn record(&self, kind: RegistryEventKind, card: AgentCard) -> RegistryEvent {
+    pub async fn record(
+        &self,
+        kind: RegistryEventKind,
+        card: AgentCard,
+    ) -> Result<RegistryEvent, RegistryEventError> {
         let mut state = self.inner.state.lock().await;
+        let sequence = state
+            .next_sequence
+            .ok_or(RegistryEventError::SequenceExhausted)?;
         let event = RegistryEvent {
-            sequence: state.next_sequence,
+            sequence,
             timestamp: Utc::now(),
             kind,
             card,
         };
-        state.next_sequence += 1;
+        state.next_sequence = sequence.checked_add(1);
         state.events.push_back(event.clone());
         while state.events.len() > self.inner.history_limit {
             state.events.pop_front();
         }
         drop(state);
         self.inner.notify.notify_waiters();
-        event
+        Ok(event)
     }
 
     pub async fn watch(
@@ -139,14 +148,17 @@ impl RegistryEventHub {
         let state = self.inner.state.lock().await;
         validate_cursor(&state, cursor)?;
         let cursor_now = current_cursor(&state);
-        let events = state
-            .events
-            .iter()
-            .filter(|event| event.sequence > cursor)
-            .filter(|event| matches_query(&event.card, query))
-            .take(max_events)
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        let mut response_cursor = cursor;
+        for event in state.events.iter().filter(|event| event.sequence > cursor) {
+            response_cursor = event.sequence;
+            if matches_query(&event.card, query) {
+                events.push(event.clone());
+                if events.len() == max_events {
+                    break;
+                }
+            }
+        }
 
         if events.is_empty() && !immediate_if_empty {
             return Ok(None);
@@ -154,14 +166,21 @@ impl RegistryEventHub {
 
         Ok(Some(RegistryWatchBatch {
             events,
-            cursor: cursor_now,
+            cursor: if response_cursor == cursor {
+                cursor_now
+            } else {
+                response_cursor
+            },
             timed_out: false,
         }))
     }
 }
 
 fn current_cursor(state: &RegistryEventState) -> u64 {
-    state.next_sequence.saturating_sub(1)
+    state
+        .next_sequence
+        .map(|next| next.saturating_sub(1))
+        .unwrap_or(u64::MAX)
 }
 
 fn earliest_available_cursor(state: &RegistryEventState) -> u64 {
@@ -272,10 +291,12 @@ mod tests {
         let hub = RegistryEventHub::new(16);
         let first = hub
             .record(RegistryEventKind::Registered, card("alpha"))
-            .await;
+            .await
+            .expect("record first event");
         let second = hub
             .record(RegistryEventKind::Heartbeated, card("alpha"))
-            .await;
+            .await
+            .expect("record second event");
 
         let batch = hub
             .watch(&AgentQuery::default(), Some(first.sequence), 10, 0)
@@ -292,10 +313,12 @@ mod tests {
         let hub = RegistryEventHub::new(1);
         let first = hub
             .record(RegistryEventKind::Registered, card("alpha"))
-            .await;
+            .await
+            .expect("record first event");
         let _second = hub
             .record(RegistryEventKind::Registered, card("beta"))
-            .await;
+            .await
+            .expect("record second event");
 
         let error = hub
             .watch(
@@ -324,10 +347,67 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let event = hub
             .record(RegistryEventKind::Registered, card("alpha"))
-            .await;
+            .await
+            .expect("record event");
 
         let batch = watch.await.expect("join");
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].sequence, event.sequence);
+    }
+
+    #[tokio::test]
+    async fn paginated_watch_cursor_does_not_skip_unreturned_events() {
+        let hub = RegistryEventHub::new(16);
+        let first = hub
+            .record(RegistryEventKind::Registered, card("alpha"))
+            .await
+            .expect("record first event");
+        let second = hub
+            .record(RegistryEventKind::Registered, card("beta"))
+            .await
+            .expect("record second event");
+        let third = hub
+            .record(RegistryEventKind::Registered, card("gamma"))
+            .await
+            .expect("record third event");
+
+        let first_page = hub
+            .watch(&AgentQuery::default(), Some(0), 1, 0)
+            .await
+            .expect("first page");
+        assert_eq!(first_page.events, vec![first]);
+        assert_eq!(first_page.cursor, first_page.events[0].sequence);
+
+        let second_page = hub
+            .watch(&AgentQuery::default(), Some(first_page.cursor), 1, 0)
+            .await
+            .expect("second page");
+        assert_eq!(second_page.events, vec![second]);
+
+        let third_page = hub
+            .watch(&AgentQuery::default(), Some(second_page.cursor), 1, 0)
+            .await
+            .expect("third page");
+        assert_eq!(third_page.events, vec![third]);
+    }
+
+    #[tokio::test]
+    async fn sequence_exhaustion_never_wraps_or_duplicates_cursors() {
+        let hub = RegistryEventHub::new(16);
+        hub.inner.state.lock().await.next_sequence = Some(u64::MAX);
+
+        let last = hub
+            .record(RegistryEventKind::Registered, card("last"))
+            .await
+            .expect("record final sequence");
+        assert_eq!(last.sequence, u64::MAX);
+        assert_eq!(hub.current_cursor().await, u64::MAX);
+
+        let error = hub
+            .record(RegistryEventKind::Registered, card("overflow"))
+            .await
+            .expect_err("exhausted sequence must fail");
+        assert_eq!(error, RegistryEventError::SequenceExhausted);
+        assert_eq!(hub.current_cursor().await, u64::MAX);
     }
 }

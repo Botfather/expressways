@@ -170,6 +170,7 @@ export interface TopicConsumeResult {
 
 export interface AdvancedControlExecuteResult {
   commandType: string
+  guarded: boolean
   responseType: string
   response: unknown
   attachmentBase64: string | null
@@ -177,10 +178,43 @@ export interface AdvancedControlExecuteResult {
   executedAtMs: number
 }
 
+export type ConfigFormFieldKind =
+  | 'string'
+  | 'integer'
+  | 'float'
+  | 'boolean'
+  | 'string_array'
+
+export interface ConfigFormValidationView {
+  required: boolean
+  min: number | null
+  max: number | null
+  allowedValues: string[] | null
+}
+
+export interface ConfigFormFieldView {
+  key: string
+  label: string
+  kind: ConfigFormFieldKind
+  value: string | number | boolean | string[]
+  description: string | null
+  validation: ConfigFormValidationView | null
+}
+
+export interface ConfigTableArrayView {
+  key: string
+  label: string
+  description: string | null
+  entryFields: ConfigFormFieldView[]
+  entries: Array<Record<string, unknown>>
+}
+
 export interface ConfigSectionView {
   key: string
   kind: string
   summary: string
+  formFields: ConfigFormFieldView[]
+  tableArrays: ConfigTableArrayView[]
 }
 
 export interface ConfigRestartHint {
@@ -228,6 +262,32 @@ export interface ConfigBackupsResult {
   backups: ConfigBackupEntry[]
 }
 
+export interface ConfigDiffSummaryView {
+  addedLines: number
+  removedLines: number
+  changedLines: number
+}
+
+export interface ConfigAuditEntryView {
+  entryId: string
+  recordedAtMs: number
+  actor: string
+  category: string
+  action: string
+  componentId: string | null
+  sectionKey: string | null
+  serviceId: string | null
+  commandType: string | null
+  success: boolean | null
+  statusCode: number | null
+  summary: string
+  diff: ConfigDiffSummaryView | null
+}
+
+export interface ConfigAuditEntriesResult {
+  entries: ConfigAuditEntryView[]
+}
+
 export interface ConfigComponentRollbackResult {
   component: ConfigComponentView
   rollbackSource: string
@@ -248,4 +308,34 @@ export interface ConfigRestartServiceOutcome {
 export interface ConfigRestartServicesResult {
   restartedAtMs: number
   outcomes: ConfigRestartServiceOutcome[]
+}
+
+export type ServiceControlAction = 'start' | 'stop' | 'restart' | 'status'
+
+export interface ServiceControlResult {
+  serviceId: string
+  action: ServiceControlAction
+  ok: boolean
+  statusCode: number | null
+  message: string
+  stdout: string
+  stderr: string
+  executedAtMs: number
+}
+
+export type OperatorAction =
+  | 'bootstrap_local'
+  | 'generate_admin_token'
+  | 'verify_first_run'
+  | 'export_support_bundle'
+
+export interface OperatorActionResult {
+  action: OperatorAction
+  target: string
+  ok: boolean
+  statusCode: number | null
+  message: string
+  stdout: string
+  stderr: string
+  executedAtMs: number
 }
