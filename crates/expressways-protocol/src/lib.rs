@@ -263,6 +263,29 @@ pub struct InteropChatMessage {
     pub text: Option<String>,
     #[serde(default)]
     pub attachments: Vec<InteropChatAttachmentRef>,
+    /// Structured channel-native content that is neither text nor a binary
+    /// attachment, such as locations, contacts, polls, edits, or deletes.
+    #[serde(default)]
+    pub content: Vec<InteropChatContent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteropChatContent {
+    #[serde(rename = "type")]
+    pub kind: InteropChatContentKind,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InteropChatContentKind {
+    Location,
+    Contact,
+    Poll,
+    Edit,
+    Delete,
+    Protocol,
 }
 
 /// Optional channel-to-agent routing hints carried by an interop handoff.
@@ -1315,6 +1338,10 @@ mod tests {
                     sha256: Some("abc123".to_owned()),
                     byte_length: Some(2_000_000),
                 }],
+                content: vec![InteropChatContent {
+                    kind: InteropChatContentKind::Location,
+                    data: serde_json::json!({"latitude": 28.6139, "longitude": 77.2090}),
+                }],
             },
             routing: Some(InteropChatRouting {
                 agent_id: Some("nanobot".to_owned()),
@@ -1330,6 +1357,10 @@ mod tests {
             serde_json::from_slice(&encoded).expect("deserialize handoff");
         assert_eq!(decoded, handoff);
         assert_eq!(decoded.message.attachments[0].byte_length, Some(2_000_000));
+        assert_eq!(
+            decoded.message.content[0].kind,
+            InteropChatContentKind::Location
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use expressways_protocol::{ArtifactMetadata, Classification, RetentionClass};
@@ -17,6 +18,7 @@ const MAX_PRINCIPAL_BYTES: usize = 256;
 #[derive(Debug, Clone)]
 pub struct ArtifactStore {
     root: PathBuf,
+    put_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +77,10 @@ impl ArtifactStore {
         create_private_dir(&root)?;
         create_private_dir(&root.join("blobs"))?;
         create_private_dir(&root.join("metadata"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            put_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn put(&self, request: PutArtifactRequest) -> Result<ArtifactMetadata, ArtifactError> {
@@ -113,6 +118,27 @@ impl ArtifactStore {
                 expected: expected_sha256.to_owned(),
                 actual: actual_sha256,
             });
+        }
+
+        // Serialize the existence check and two-file commit within this store.
+        // A retried named upload is therefore deterministic even when requests
+        // arrive concurrently through cloned handles.
+        let _put_guard = self.put_lock.lock().map_err(|_| {
+            ArtifactError::Io(std::io::Error::other("artifact put lock is poisoned"))
+        })?;
+        if blob_path.exists() || metadata_path.exists() {
+            if blob_path.exists() && metadata_path.exists() {
+                let (existing, _) = self.get(&artifact_id)?;
+                if existing.byte_length == byte_length
+                    && existing.sha256.eq_ignore_ascii_case(&actual_sha256)
+                {
+                    return Ok(existing);
+                }
+                return Err(ArtifactError::AlreadyExists(artifact_id));
+            }
+            return Err(ArtifactError::InvalidMetadata(format!(
+                "artifact `{artifact_id}` has an incomplete blob/metadata pair"
+            )));
         }
 
         if let Some(parent) = blob_path.parent() {
@@ -259,9 +285,9 @@ fn validate_artifact_id(artifact_id: &str) -> Result<(), ArtifactError> {
 }
 
 fn validate_text_length(field: &str, value: &str, max_bytes: usize) -> Result<(), ArtifactError> {
-    if value.len() > max_bytes {
+    if value.len() > max_bytes || value.chars().any(char::is_control) {
         return Err(ArtifactError::InvalidMetadata(format!(
-            "{field} is {} bytes; maximum is {max_bytes} bytes",
+            "{field} must contain at most {max_bytes} bytes and no control characters; got {} bytes",
             value.len()
         )));
     }
@@ -404,6 +430,32 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn identical_named_uploads_are_idempotent_but_conflicts_fail() {
+        let root = temp_root("idempotent-put");
+        let store = ArtifactStore::new(root).expect("create store");
+        let request = PutArtifactRequest {
+            artifact_id: Some("content-addressed-blob".to_owned()),
+            content_type: "application/octet-stream".to_owned(),
+            data: b"same bytes".to_vec(),
+            sha256: None,
+            classification: Classification::Internal,
+            retention_class: RetentionClass::Operational,
+            principal: "local:adapter".to_owned(),
+        };
+
+        let first = store.put(request.clone()).expect("initial upload");
+        let retried = store.put(request.clone()).expect("idempotent retry");
+        assert_eq!(retried, first);
+
+        let mut conflict = request;
+        conflict.data = b"different bytes".to_vec();
+        assert!(matches!(
+            store.put(conflict),
+            Err(ArtifactError::AlreadyExists(id)) if id == "content-addressed-blob"
+        ));
     }
 
     #[test]

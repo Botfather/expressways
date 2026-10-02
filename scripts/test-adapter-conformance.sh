@@ -193,6 +193,29 @@ jq -e --arg sha "$MEDIA_SHA" \
   <<<"$artifact_response" >/dev/null \
   || fail_with_logs "raw artifact upload response was invalid"
 
+artifact_retry_response="$(curl -fsS -X POST \
+  -H "Authorization: Bearer ${INGRESS_BEARER}" \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'X-Artifact-Id: adapter-conformance-media' \
+  -H "X-Content-Sha256: ${MEDIA_SHA}" \
+  --data-binary "@$MEDIA_FILE" \
+  "$BRIDGE_URL/v1/artifacts")"
+jq -e --arg sha "$MEDIA_SHA" \
+  '.artifact_id == "adapter-conformance-media" and .byte_length == 2097152 and .sha256 == $sha' \
+  <<<"$artifact_retry_response" >/dev/null \
+  || fail_with_logs "identical named artifact retry was not idempotent"
+
+unauthorized_download_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+  "$BRIDGE_URL/v1/artifacts/adapter-conformance-media")"
+[[ "$unauthorized_download_status" == "401" ]] \
+  || fail_with_logs "unauthenticated bridge artifact download returned HTTP $unauthorized_download_status"
+curl -fsS \
+  -H "Authorization: Bearer ${INGRESS_BEARER}" \
+  "$BRIDGE_URL/v1/artifacts/adapter-conformance-media" \
+  -o "$CONFORMANCE_ROOT/downloaded-media.bin"
+[[ "$(shasum -a 256 "$CONFORMANCE_ROOT/downloaded-media.bin" | awk '{print $1}')" == "$MEDIA_SHA" ]] \
+  || fail_with_logs "bridge artifact download did not preserve media bytes"
+
 webhook_payload() {
   local key="$1"
   local message_id="$2"
@@ -329,6 +352,7 @@ reply_payload() {
     --arg delivery_id "$delivery_id" \
     --arg correlation_id "$correlation_id" \
     --arg task_id "$task_id" \
+    --arg sha "$MEDIA_SHA" \
     '{
       schema_version:"interop.chat.reply.v1",
       delivery_id:$delivery_id,
@@ -343,7 +367,16 @@ reply_payload() {
         reply_to_message_id:"message-1"
       },
       in_reply_to_task_id:$task_id,
-      message:{text:"conformance reply",attachments:[]},
+      message:{
+        text:"conformance reply",
+        attachments:[{
+          name:"media.bin",
+          content_type:"application/octet-stream",
+          artifact_id:"adapter-conformance-media",
+          byte_length:2097152,
+          sha256:$sha
+        }]
+      },
       metadata:{conformance:true},
       created_at:"2026-01-01T00:00:00Z"
     }'
@@ -395,6 +428,32 @@ done
 jq -e '.cursors["interop.chat.replies"] == 2' "$BRIDGE_STATE" >/dev/null \
   || fail_with_logs "restart recovery did not persist the second reply cursor"
 
+structured_payload="$(jq -cn '{
+  schema_version:"interop.chat.handoff.v1",
+  idempotency_key:"adapter-location-1",
+  source_runtime:"pigeon",
+  session:{
+    session_id:"conversation-structured",
+    channel:"whatsapp",
+    account_id:"account-1",
+    sender_id:"sender-1",
+    message_id:"location-1"
+  },
+  message:{
+    text:"   ",
+    content:[{
+      type:"location",
+      data:{latitude:28.6139,longitude:77.2090}
+    }]
+  },
+  skill:"chat.reply"
+}')"
+post_webhook "$structured_payload" >/dev/null
+requests="$(ctl consume --token-file "$TOKEN_FILE" --topic interop.chat.requests --offset 0 --limit 20)"
+jq -e 'any(.messages[].payload | fromjson; .payload.message.content[0].type == "location")' \
+  <<<"$requests" >/dev/null \
+  || fail_with_logs "structured content-only handoff was not preserved"
+
 pressure_pids=()
 for index in $(seq 1 40); do
   (
@@ -422,4 +481,4 @@ done
 [[ "$backpressure_rejections" -gt 0 ]] \
   || fail_with_logs "parallel adapter load did not surface broker backpressure"
 
-printf 'Adapter conformance passed: auth, replay, ordering, 2 MiB raw media, backpressure, retry, and restart recovery.\n'
+printf 'Adapter conformance passed: auth, replay, ordering, idempotent 2 MiB media upload/download, backpressure, retry, and restart recovery.\n'

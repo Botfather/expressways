@@ -59,11 +59,17 @@
               { "required": ["inline_base64"], "not": { "required": ["artifact_id"] } }
             ]
           }
+        },
+        "content": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "interop-chat-handoff-v1.schema.json#/$defs/structured_content" }
         }
       },
       "anyOf": [
         { "required": ["text"] },
-        { "required": ["attachments"] }
+        { "required": ["attachments"] },
+        { "required": ["content"] }
       ]
     },
     "routing": {

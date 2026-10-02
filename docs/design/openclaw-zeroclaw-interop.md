@@ -47,6 +47,13 @@ At least one stable source identity is required: `task_id`, `idempotency_key`, `
 
 Unknown fields are accepted within v1 for forward-compatible additive evolution. Bounds, required fields, identifiers, hashes, and mutually exclusive attachment forms remain validated.
 
+Messages may contain `text`, binary `attachments`, and/or structured `content`.
+Structured entries use `{ "type", "data" }` and support `location`, `contact`,
+`poll`, `edit`, `delete`, and `protocol`, so channel-native events do not need
+to be flattened into fake text or discarded. Whitespace-only `text` is
+normalized away and does not invalidate an otherwise populated structured
+message.
+
 ## Media
 
 Small payloads may use `inline_base64`, but production channels should upload media separately:
@@ -64,6 +71,24 @@ curl --fail-with-body \
 
 The artifact endpoint accepts raw binary bodies up to 64 MiB by default and sends them to the broker through its binary protocol. The handoff then references the returned `artifact_id`; media is not base64-expanded inside the task message.
 
+Named artifact uploads are idempotent when the existing bytes have the same
+length and SHA-256. The broker returns the original immutable metadata for an
+identical retry and rejects an ID collision containing different bytes.
+
+The bridge also serves authenticated artifact reads, so a channel adapter does
+not need to deploy the separate HTTP gateway merely to resolve reply media:
+
+```bash
+curl --fail-with-body \
+  --header "Authorization: Bearer $INGRESS_BEARER" \
+  --output reply-media.bin \
+  http://127.0.0.1:8891/v1/artifacts/ARTIFACT_ID
+```
+
+The response preserves the broker content type and includes `X-Artifact-Id`
+and `X-Content-Sha256`. The bridge verifies the length and digest before
+returning bytes.
+
 ## Ordering and Routing
 
 The bridge derives an affinity key from `channel:account_id:session_id` unless `routing.affinity_key` is supplied. The orchestrator:
@@ -76,7 +101,7 @@ Set `routing.agent_id` for a hard pin. A hard pin is enforced by the orchestrato
 
 ## Reply Contract
 
-Workers publish `interop.chat.reply.v1` JSON to `interop.chat.replies`. Required identity fields are `delivery_id`, `correlation_id`, `source_runtime`, `target_runtime`, `session`, and `in_reply_to_task_id`. The message contains text and/or broker artifact references.
+Workers publish `interop.chat.reply.v1` JSON to `interop.chat.replies`. Required identity fields are `delivery_id`, `correlation_id`, `source_runtime`, `target_runtime`, `session`, and `in_reply_to_task_id`. The message contains text, structured content, and/or broker artifact references.
 
 The bridge POSTs the unchanged envelope to the configured egress URL with:
 
@@ -94,4 +119,4 @@ A 2xx response is the delivery acknowledgement. Any other response or transport 
 - Egress is durable and at least once, not exactly once.
 - A corrupt or unsupported reply blocks cursor advancement and is visible in structured logs; operators must correct or explicitly supersede it.
 
-Run `make test-adapter-conformance` to verify these guarantees against an isolated live broker, bridge, orchestrator, and intentionally failing destination. The test covers authentication, replay identity, affinity ordering, raw 2 MiB media, explicit backpressure, at-least-once retry, and restart recovery.
+Run `make test-adapter-conformance` to verify these guarantees against an isolated live broker, bridge, orchestrator, and intentionally failing destination. The test covers authentication, replay identity, affinity ordering, idempotent raw 2 MiB media upload and bridge download, explicit backpressure, at-least-once retry, and restart recovery.

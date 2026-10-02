@@ -533,6 +533,7 @@ async fn process_interop_assignment(
                     byte_length: attachment.byte_length,
                 })
                 .collect(),
+            content: handoff.message.content.clone(),
         },
         metadata: serde_json::json!({
             "correlation_id": handoff.correlation_id,
@@ -567,6 +568,7 @@ async fn process_interop_assignment(
         message: InteropChatMessage {
             text: outbound.message.text,
             attachments: Vec::new(),
+            content: Vec::new(),
         },
         metadata: outbound.metadata,
         created_at: Utc::now(),
@@ -602,7 +604,7 @@ async fn process_inbound_message(
         .message_id
         .clone()
         .unwrap_or_else(|| Uuid::now_v7().to_string());
-    let user_text = envelope.message.text.clone().unwrap_or_default();
+    let user_text = render_user_message(&envelope.message)?;
 
     sessions.append_turn(
         &session_id,
@@ -825,6 +827,7 @@ async fn process_inbound_message(
             role: Some("assistant".to_owned()),
             text: Some(assistant_text),
             attachments: Vec::new(),
+            content: Vec::new(),
         },
         in_reply_to_message_id: Some(inbound_message_id.clone()),
         metadata: serde_json::json!({
@@ -861,6 +864,22 @@ async fn process_inbound_message(
     .await?;
 
     Ok(outbound)
+}
+
+fn render_user_message(message: &NanobotMessageRef) -> anyhow::Result<String> {
+    let text = message.text.clone().unwrap_or_default();
+    if message.content.is_empty() {
+        return Ok(text);
+    }
+    let structured = serde_json::to_string(&message.content)
+        .context("failed to serialize structured chat content")?;
+    if text.is_empty() {
+        Ok(format!("Structured channel content:\n{structured}"))
+    } else {
+        Ok(format!(
+            "{text}\n\nStructured channel content:\n{structured}"
+        ))
+    }
 }
 
 fn provider_identity(provider: &ProviderBackend) -> Option<(&'static str, &str, &str)> {
@@ -1549,6 +1568,7 @@ async fn await_task(name: &str, handle: tokio::task::JoinHandle<()>) {
 mod tests {
     use super::*;
     use crate::provider::{AnthropicConfig, OpenAiConfig};
+    use expressways_protocol::{InteropChatContent, InteropChatContentKind};
     use std::time::Instant;
 
     #[test]
@@ -1561,6 +1581,22 @@ mod tests {
         assert!(!lower.contains("http"));
         assert!(!lower.contains("api key"));
         assert!(!lower.contains("token"));
+    }
+
+    #[test]
+    fn structured_channel_content_is_visible_to_the_provider() {
+        let message = NanobotMessageRef {
+            text: None,
+            content: vec![InteropChatContent {
+                kind: InteropChatContentKind::Location,
+                data: serde_json::json!({"latitude": 28.6139, "longitude": 77.2090}),
+            }],
+            ..NanobotMessageRef::default()
+        };
+        let rendered = render_user_message(&message).expect("render structured content");
+        assert!(rendered.contains("Structured channel content"));
+        assert!(rendered.contains("location"));
+        assert!(rendered.contains("28.6139"));
     }
 
     #[test]

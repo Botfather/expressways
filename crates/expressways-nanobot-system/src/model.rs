@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use expressways_protocol::InteropChatContent;
 use serde::{Deserialize, Serialize};
 
 pub const SYSTEM_SCHEMA_VERSION: &str = "nanobot.expressways.v1";
@@ -45,6 +46,8 @@ pub struct NanobotMessageRef {
     pub text: Option<String>,
     #[serde(default)]
     pub attachments: Vec<NanobotAttachmentRef>,
+    #[serde(default)]
+    pub content: Vec<InteropChatContent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

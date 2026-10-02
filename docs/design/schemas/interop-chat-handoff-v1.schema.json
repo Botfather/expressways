@@ -83,6 +83,13 @@
           "items": {
             "$ref": "#/$defs/attachment_ref"
           }
+        },
+        "content": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/structured_content"
+          }
         }
       }
     },
@@ -120,6 +127,20 @@
     }
   },
   "$defs": {
+    "structured_content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "data"],
+      "properties": {
+        "type": {
+          "enum": ["location", "contact", "poll", "edit", "delete", "protocol"]
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
     "attachment_ref": {
       "type": "object",
       "additionalProperties": true,

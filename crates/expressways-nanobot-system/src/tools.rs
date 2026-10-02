@@ -190,6 +190,7 @@ impl ToolRegistry {
                 role: Some("user".to_owned()),
                 text: Some(prompt),
                 attachments: Vec::new(),
+                content: Vec::new(),
             },
             metadata: serde_json::json!({
                 "spawned_from_session_id": parent_session.session_id,

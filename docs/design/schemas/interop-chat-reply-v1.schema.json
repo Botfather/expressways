@@ -46,6 +46,11 @@
         "attachments": {
           "type": "array",
           "items": { "$ref": "interop-chat-handoff-v1.schema.json#/$defs/attachment_ref" }
+        },
+        "content": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "interop-chat-handoff-v1.schema.json#/$defs/structured_content" }
         }
       }
     }

@@ -13,9 +13,9 @@ use expressways_protocol::{
     Classification, ControlCommand, ControlRequest, ControlResponse,
     INTEROP_CHAT_HANDOFF_SCHEMA_VERSION, INTEROP_CHAT_HANDOFF_TASK_TYPE,
     INTEROP_CHAT_REPLIES_TOPIC, INTEROP_CHAT_REPLY_SCHEMA_VERSION, INTEROP_CHAT_REQUESTS_TOPIC,
-    InteropChatAttachmentRef, InteropChatHandoffV1, InteropChatMessage, InteropChatReplyV1,
-    InteropChatRouting, InteropChatSession, RetentionClass, TaskPayload, TaskRequirements,
-    TaskRetryPolicy, TaskWorkItem, TopicSpec,
+    InteropChatAttachmentRef, InteropChatContent, InteropChatHandoffV1, InteropChatMessage,
+    InteropChatReplyV1, InteropChatRouting, InteropChatSession, RetentionClass, TaskPayload,
+    TaskRequirements, TaskRetryPolicy, TaskWorkItem, TopicSpec,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,6 +34,8 @@ const MAX_DISPLAY_NAME_BYTES: usize = 1_024;
 const MAX_MESSAGE_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 256 * 1024;
 const MAX_ATTACHMENTS: usize = 64;
+const MAX_STRUCTURED_CONTENT: usize = 64;
+const MAX_STRUCTURED_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_AGENT_HINTS: usize = 256;
 const MAX_ROUTING_LABELS: usize = 128;
 const MAX_ARTIFACT_ID_BYTES: usize = 128;
@@ -217,6 +219,8 @@ struct IncomingMessage {
     text: Option<String>,
     #[serde(default)]
     attachments: Vec<IncomingAttachment>,
+    #[serde(default)]
+    content: Vec<InteropChatContent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,7 +286,8 @@ struct HttpRequest {
 struct HttpResponse {
     status_code: u16,
     reason: &'static str,
-    content_type: &'static str,
+    content_type: String,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -534,7 +539,7 @@ async fn handle_connection(
     .await
     {
         Ok(request) => match process_request(runtime, request).await {
-            Ok(accepted) => json_response(202, &accepted),
+            Ok(response) => response,
             Err(error) => error_json_response(error.status_code, error.message),
         },
         Err(error) => error_json_response(400, format!("invalid http request: {error}")),
@@ -549,12 +554,7 @@ async fn handle_connection(
 async fn process_request(
     runtime: BridgeRuntime,
     request: HttpRequest,
-) -> Result<serde_json::Value, HttpError> {
-    if request.method != "POST" {
-        return Err(HttpError::method_not_allowed(
-            "only POST requests are supported for this endpoint",
-        ));
-    }
+) -> Result<HttpResponse, HttpError> {
     if !bearer_authorized(&request.headers, runtime.ingress_bearer.as_deref()) {
         return Err(HttpError::unauthorized(
             "missing or invalid Authorization bearer token",
@@ -562,6 +562,11 @@ async fn process_request(
     }
 
     if request.path == runtime.webhook_path {
+        if request.method != "POST" {
+            return Err(HttpError::method_not_allowed(
+                "the webhook endpoint only supports POST",
+            ));
+        }
         if request.body.len() > runtime.max_request_bytes {
             return Err(HttpError::bad_request(
                 "webhook request body exceeds configured limit",
@@ -571,17 +576,32 @@ async fn process_request(
             serde_json::from_slice::<BridgeWebhookRequest>(&request.body).map_err(|error| {
                 HttpError::bad_request(format!("failed to parse webhook json: {error}"))
             })?;
-        return serde_json::to_value(submit_webhook(runtime, webhook).await?)
-            .map_err(|error| HttpError::upstream(format!("failed to encode response: {error}")));
+        return Ok(json_response(202, &submit_webhook(runtime, webhook).await?));
     }
     if request.path == runtime.artifact_path {
+        if request.method != "POST" {
+            return Err(HttpError::method_not_allowed(
+                "the artifact collection endpoint only supports POST",
+            ));
+        }
         if request.body.is_empty() || request.body.len() > runtime.max_artifact_request_bytes {
             return Err(HttpError::bad_request(
                 "artifact body must be non-empty and within the configured artifact limit",
             ));
         }
-        return serde_json::to_value(upload_artifact(runtime, request).await?)
-            .map_err(|error| HttpError::upstream(format!("failed to encode response: {error}")));
+        return Ok(json_response(
+            202,
+            &upload_artifact(runtime, request).await?,
+        ));
+    }
+    let artifact_prefix = format!("{}/", runtime.artifact_path.trim_end_matches('/'));
+    if let Some(artifact_id) = request.path.strip_prefix(&artifact_prefix) {
+        if request.method != "GET" {
+            return Err(HttpError::method_not_allowed(
+                "artifact resources only support GET",
+            ));
+        }
+        return download_artifact(runtime, artifact_id).await;
     }
     Err(HttpError::not_found(format!(
         "unsupported path `{}`",
@@ -677,8 +697,12 @@ async fn submit_webhook(
             reply_to_message_id: webhook.session.reply_to_message_id,
         },
         message: InteropChatMessage {
-            text: webhook.message.text,
+            text: webhook
+                .message
+                .text
+                .and_then(|text| (!text.trim().is_empty()).then_some(text)),
             attachments,
+            content: webhook.message.content,
         },
         routing: routing.map(|routing| InteropChatRouting {
             agent_id: routing.agent_id,
@@ -901,21 +925,53 @@ fn validate_webhook(webhook: &BridgeWebhookRequest) -> Result<(), HttpError> {
         webhook.principal.as_deref(),
         MAX_IDENTIFIER_BYTES,
     )?;
-    validate_optional_text(
-        "message.text",
-        webhook.message.text.as_deref(),
-        MAX_MESSAGE_TEXT_BYTES,
-    )?;
+    if webhook
+        .message
+        .text
+        .as_ref()
+        .is_some_and(|text| text.len() > MAX_MESSAGE_TEXT_BYTES)
+    {
+        return Err(HttpError::bad_request(format!(
+            "message.text exceeds {MAX_MESSAGE_TEXT_BYTES} bytes"
+        )));
+    }
 
-    if webhook.message.text.is_none() && webhook.message.attachments.is_empty() {
+    if !webhook
+        .message
+        .text
+        .as_ref()
+        .is_some_and(|text| !text.trim().is_empty())
+        && webhook.message.attachments.is_empty()
+        && webhook.message.content.is_empty()
+    {
         return Err(HttpError::bad_request(
-            "message must contain text or at least one attachment",
+            "message must contain text, an attachment, or structured content",
         ));
     }
     if webhook.message.attachments.len() > MAX_ATTACHMENTS {
         return Err(HttpError::bad_request(format!(
             "message has too many attachments; maximum is {MAX_ATTACHMENTS}"
         )));
+    }
+    if webhook.message.content.len() > MAX_STRUCTURED_CONTENT {
+        return Err(HttpError::bad_request(format!(
+            "message has too many structured content entries; maximum is {MAX_STRUCTURED_CONTENT}"
+        )));
+    }
+    for (index, content) in webhook.message.content.iter().enumerate() {
+        if !content.data.is_object() {
+            return Err(HttpError::bad_request(format!(
+                "message.content[{index}].data must be a JSON object"
+            )));
+        }
+        let bytes = serde_json::to_vec(&content.data).map_err(|error| {
+            HttpError::bad_request(format!("message.content[{index}] is invalid: {error}"))
+        })?;
+        if bytes.len() > MAX_STRUCTURED_CONTENT_BYTES {
+            return Err(HttpError::bad_request(format!(
+                "message.content[{index}].data exceeds {MAX_STRUCTURED_CONTENT_BYTES} bytes"
+            )));
+        }
     }
     validate_unique_text_list(
         "preferred_agents",
@@ -1155,6 +1211,61 @@ async fn upload_artifact(
     }
 }
 
+async fn download_artifact(
+    runtime: BridgeRuntime,
+    artifact_id: &str,
+) -> Result<HttpResponse, HttpError> {
+    validate_required_text("artifact_id", artifact_id, MAX_ARTIFACT_ID_BYTES)?;
+    let mut client = Client::connect(runtime.endpoint)
+        .await
+        .map_err(|error| HttpError::upstream(format!("failed to connect to broker: {error}")))?;
+    let (response, bytes) = client
+        .send_with_attachment(
+            ControlRequest {
+                capability_token: runtime.capability_token,
+                command: ControlCommand::GetArtifact {
+                    artifact_id: artifact_id.to_owned(),
+                },
+            },
+            None,
+        )
+        .await
+        .map_err(|error| HttpError::upstream(format!("failed to fetch artifact: {error}")))?;
+    match response {
+        ControlResponse::Artifact { artifact } => {
+            let body = bytes.ok_or_else(|| HttpError::upstream("broker omitted artifact bytes"))?;
+            let actual_sha256 = format!("{:x}", Sha256::digest(&body));
+            if artifact.artifact_id != artifact_id
+                || artifact.byte_length != body.len() as u64
+                || !artifact.sha256.eq_ignore_ascii_case(&actual_sha256)
+            {
+                return Err(HttpError::upstream(
+                    "broker returned artifact bytes that failed integrity validation",
+                ));
+            }
+            Ok(HttpResponse {
+                status_code: 200,
+                reason: status_reason(200),
+                content_type: artifact.content_type,
+                headers: vec![
+                    ("X-Artifact-Id".to_owned(), artifact.artifact_id),
+                    ("X-Content-Sha256".to_owned(), artifact.sha256),
+                ],
+                body,
+            })
+        }
+        ControlResponse::Error { code, message } if code == "artifact_not_found" => {
+            Err(HttpError::not_found(message))
+        }
+        ControlResponse::Error { code, message } => Err(HttpError::upstream(format!(
+            "broker rejected artifact download: {code}: {message}"
+        ))),
+        other => Err(HttpError::upstream(format!(
+            "unexpected broker response while fetching artifact: {other:?}"
+        ))),
+    }
+}
+
 async fn run_egress(runtime: BridgeRuntime) {
     let Some(egress_url) = runtime.egress_url.clone() else {
         return;
@@ -1282,8 +1393,21 @@ fn validate_reply(reply: &InteropChatReplyV1) -> anyhow::Result<()> {
             bail!("reply {field} must contain 1..={MAX_IDENTIFIER_BYTES} bytes");
         }
     }
-    if reply.message.text.is_none() && reply.message.attachments.is_empty() {
-        bail!("reply message must contain text or attachments");
+    if reply.message.text.is_none()
+        && reply.message.attachments.is_empty()
+        && reply.message.content.is_empty()
+    {
+        bail!("reply message must contain text, attachments, or structured content");
+    }
+    if reply.message.content.len() > MAX_STRUCTURED_CONTENT {
+        bail!("reply message has too many structured content entries");
+    }
+    for content in &reply.message.content {
+        if !content.data.is_object()
+            || serde_json::to_vec(&content.data)?.len() > MAX_STRUCTURED_CONTENT_BYTES
+        {
+            bail!("reply structured content must be a bounded JSON object");
+        }
     }
     Ok(())
 }
@@ -1625,7 +1749,8 @@ fn json_response<T: Serialize>(status_code: u16, value: &T) -> HttpResponse {
         Ok(body) => HttpResponse {
             status_code,
             reason: status_reason(status_code),
-            content_type: "application/json; charset=utf-8",
+            content_type: "application/json; charset=utf-8".to_owned(),
+            headers: Vec::new(),
             body,
         },
         Err(error) => error_json_response(500, format!("failed to encode response json: {error}")),
@@ -1638,7 +1763,8 @@ fn error_json_response(status_code: u16, message: String) -> HttpResponse {
     HttpResponse {
         status_code,
         reason: status_reason(status_code),
-        content_type: "application/json; charset=utf-8",
+        content_type: "application/json; charset=utf-8".to_owned(),
+        headers: Vec::new(),
         body,
     }
 }
@@ -1659,7 +1785,7 @@ fn encode_http_response(response: &HttpResponse) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(
         format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n",
             response.status_code,
             response.reason,
             response.content_type,
@@ -1667,6 +1793,16 @@ fn encode_http_response(response: &HttpResponse) -> Vec<u8> {
         )
         .as_bytes(),
     );
+    for (name, value) in &response.headers {
+        if name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+    }
+    bytes.extend_from_slice(b"\r\n");
     bytes.extend_from_slice(&response.body);
     bytes
 }
@@ -1819,6 +1955,28 @@ mod tests {
             serde_json::from_value(raw.clone()).expect("valid webhook");
         validate_webhook(&webhook).expect("bounded webhook");
 
+        let content_only = serde_json::json!({
+            "schema_version": INTEROP_CHAT_HANDOFF_SCHEMA_VERSION,
+            "idempotency_key": "pigeon-location-1",
+            "source_runtime": "pigeon",
+            "session": {
+                "session_id": "session-1",
+                "channel": "whatsapp",
+                "account_id": "account-1",
+                "sender_id": "sender-1"
+            },
+            "message": {
+                "text": "   ",
+                "content": [{
+                    "type": "location",
+                    "data": { "latitude": 28.6139, "longitude": 77.2090 }
+                }]
+            }
+        });
+        let content_only: BridgeWebhookRequest =
+            serde_json::from_value(content_only).expect("parse structured content");
+        validate_webhook(&content_only).expect("structured content-only handoff");
+
         let mut unknown = raw;
         unknown["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<BridgeWebhookRequest>(unknown).is_ok());
@@ -1906,6 +2064,7 @@ mod tests {
             message: InteropChatMessage {
                 text: Some("hello back".to_owned()),
                 attachments: Vec::new(),
+                content: Vec::new(),
             },
             metadata: serde_json::json!({}),
             created_at: Utc::now(),

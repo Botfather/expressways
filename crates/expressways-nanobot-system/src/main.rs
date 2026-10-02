@@ -632,6 +632,7 @@ async fn main() -> anyhow::Result<()> {
                     role: Some("user".to_owned()),
                     text: Some(text),
                     attachments: Vec::new(),
+                    content: Vec::new(),
                 },
                 metadata,
                 received_at: Utc::now(),
@@ -752,6 +753,7 @@ async fn main() -> anyhow::Result<()> {
                         role: Some("user".to_owned()),
                         text: Some(text.clone()),
                         attachments: Vec::new(),
+                        content: Vec::new(),
                     },
                     metadata: serde_json::json!({
                         "scheduled": true,
