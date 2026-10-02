@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
-import { onRegistryStreamEvent } from './api'
+import { onRegistryStreamEvent, provisionLocalCredentials } from './api'
 import { useMonitorStore } from './store/monitorStore'
 import type {
   ConfigAuditEntryView,
+  CredentialProvisionResult,
   ConfigComponentView,
   ConfigConsoleSnapshot,
   ConfigFormFieldKind,
@@ -326,6 +327,10 @@ function App() {
   const [visibleDiffs, setVisibleDiffs] = useState<Record<string, boolean>>({})
   const [visibleBackups, setVisibleBackups] = useState<Record<string, boolean>>({})
   const [guidedFlowRunning, setGuidedFlowRunning] = useState(false)
+  const [credentialBundleRoot, setCredentialBundleRoot] = useState('')
+  const [credentialProvisioning, setCredentialProvisioning] = useState(false)
+  const [credentialRefreshToken, setCredentialRefreshToken] = useState(false)
+  const [credentialResult, setCredentialResult] = useState<CredentialProvisionResult | null>(null)
   const [toast, setToast] = useState<ToastState | null>(null)
   const hasUnsavedChanges =
     draftSettings.transport !== settings.transport ||
@@ -631,6 +636,28 @@ function App() {
       })
     } finally {
       setGuidedFlowRunning(false)
+    }
+  }
+
+  const provisionPackagedCredentials = async () => {
+    if (!credentialBundleRoot.trim() || credentialProvisioning) {
+      return
+    }
+    setCredentialProvisioning(true)
+    try {
+      const result = await provisionLocalCredentials(
+        credentialBundleRoot.trim(),
+        credentialRefreshToken,
+      )
+      setCredentialResult(result)
+      setToast({ tone: 'success', message: result.message })
+    } catch (provisionError) {
+      setToast({
+        tone: 'error',
+        message: provisionError instanceof Error ? provisionError.message : String(provisionError),
+      })
+    } finally {
+      setCredentialProvisioning(false)
     }
   }
 
@@ -1798,6 +1825,47 @@ function App() {
           </Panel>
 
           <Panel title="Operator Workflow">
+            <div className="mb-4 rounded-xl border border-leaf/25 bg-leaf/5 p-3">
+              <p className="font-heading text-base text-ink">Packaged Credential Provisioning</p>
+              <p className="mt-1 text-xs text-ink/75">
+                Select the extracted Expressways bundle root. Provisioning validates its broker config,
+                refuses partial or symlinked credential paths, and never returns private keys or token contents to the UI.
+              </p>
+              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                <input
+                  value={credentialBundleRoot}
+                  onChange={(event) => setCredentialBundleRoot(event.target.value)}
+                  placeholder="/path/to/extracted/expressways-bundle"
+                  aria-label="Expressways bundle root"
+                  className="min-w-0 flex-1 rounded-lg border border-ink/20 bg-white px-3 py-2 font-mono text-xs text-ink"
+                />
+                <button
+                  type="button"
+                  onClick={() => void provisionPackagedCredentials()}
+                  className="rounded-lg bg-leaf px-3 py-2 font-mono text-xs uppercase tracking-[0.12em] text-white"
+                  disabled={credentialProvisioning || !credentialBundleRoot.trim()}
+                >
+                  {credentialProvisioning ? 'Provisioning...' : 'Provision Credentials'}
+                </button>
+              </div>
+              <label className="mt-2 inline-flex items-center gap-2 text-xs text-ink/75">
+                <input
+                  type="checkbox"
+                  checked={credentialRefreshToken}
+                  onChange={(event) => setCredentialRefreshToken(event.target.checked)}
+                />
+                Reissue the 30-day token when a complete credential set already exists
+              </label>
+              {credentialResult ? (
+                <div className="mt-3 rounded-lg border border-leaf/20 bg-white p-2 text-xs text-ink/80">
+                  <p>{credentialResult.message}</p>
+                  <p className="mt-1 font-mono text-[11px]">Token: {credentialResult.tokenPath}</p>
+                  {credentialResult.expiresAt ? (
+                    <p className="font-mono text-[11px]">Expires: {credentialResult.expiresAt}</p>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
             <div className="mb-3 flex flex-wrap gap-2">
               <button
                 type="button"

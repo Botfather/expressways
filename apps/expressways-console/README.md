@@ -44,6 +44,8 @@ Configuration files and rollback snapshots are limited to 1 MiB, read without fo
 
 It also includes operator controls for M1 workflows:
 
+- packaged credential provisioning for an explicitly selected bundle root,
+  without returning key or token contents to the webview,
 - `Service Lifecycle` panel for `start|stop|restart|status`,
 - `Operator Workflow` panel for `bootstrap_local`, `generate_admin_token`, `verify_first_run`, and `export_support_bundle`,
 - guided first-run flow with action history and command output capture.

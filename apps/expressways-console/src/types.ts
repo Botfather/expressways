@@ -339,3 +339,14 @@ export interface OperatorActionResult {
   stderr: string
   executedAtMs: number
 }
+
+export interface CredentialProvisionResult {
+  bundleRoot: string
+  created: boolean
+  privateKeyPath: string
+  publicKeyPath: string
+  tokenPath: string
+  tokenId: string | null
+  expiresAt: string | null
+  message: string
+}

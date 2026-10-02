@@ -43,6 +43,15 @@ pnpm dev:tauri
 
 See the [console README](../../apps/expressways-console/README.md) for its current capabilities.
 
+The packaged console's **Packaged Credential Provisioning** panel accepts an
+explicit extracted bundle root. It validates the bundle's issuer and principal
+configuration and creates `var/auth/issuer.private`, `issuer.public`, and a
+30-day `developer.token` with owner-only permissions for secret files. Existing
+complete credentials are left untouched; partial sets and symlinked credential
+directories fail closed. An explicit checkbox reissues the bounded-lifetime
+token from the existing issuer without rotating keys. Secret contents never
+cross into the webview.
+
 ## Release Bundles
 
 When project releases are published, select the macOS arm64, Linux x86-64, or Windows x86-64 bundle and verify its SHA-256 checksum and detached signature metadata before extracting it. Release bundles contain the broker, `expresswaysctl`, HTTP gateway, orchestrator, Nanobot runtime, chat bridge, example configuration, and lifecycle helpers. They do not contain credentials.

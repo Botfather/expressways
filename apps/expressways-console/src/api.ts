@@ -11,6 +11,7 @@ import type {
   ConfigRestartServicesResult,
   OperatorAction,
   OperatorActionResult,
+  CredentialProvisionResult,
   ServiceControlAction,
   ServiceControlResult,
   MonitorSnapshot,
@@ -173,5 +174,14 @@ export async function runOperatorAction(
     input: {
       action,
     },
+  })
+}
+
+export async function provisionLocalCredentials(
+  bundleRoot: string,
+  refreshToken: boolean,
+): Promise<CredentialProvisionResult> {
+  return invoke<CredentialProvisionResult>('operator_provision_credentials', {
+    input: { bundleRoot, refreshToken },
   })
 }

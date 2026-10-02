@@ -7,15 +7,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use chrono::{Duration, Utc};
+use expressways_auth::{CapabilityIssuer, write_secret_file};
 use expressways_client::{Client, Endpoint};
 use expressways_protocol::{
-    AdopterStatusView, AgentCard, AgentQuery, AuthStateView, BrokerMetricsView, ControlCommand,
-    ControlRequest, ControlResponse, RegistryEvent, StoredMessage, StreamFrame,
+    Action, AdopterStatusView, AgentCard, AgentQuery, AuthStateView, BrokerMetricsView,
+    CapabilityClaims, CapabilityScope, ControlCommand, ControlRequest, ControlResponse,
+    RegistryEvent, StoredMessage, StreamFrame,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -332,6 +336,52 @@ struct OperatorActionResult {
     stdout: String,
     stderr: String,
     executed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialProvisionInput {
+    bundle_root: String,
+    #[serde(default)]
+    refresh_token: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialProvisionResult {
+    bundle_root: String,
+    created: bool,
+    private_key_path: String,
+    public_key_path: String,
+    token_path: String,
+    token_id: Option<String>,
+    expires_at: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisionBrokerConfig {
+    auth: ProvisionAuthConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisionAuthConfig {
+    issuers: Vec<ProvisionIssuerConfig>,
+    principals: Vec<ProvisionPrincipalConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisionIssuerConfig {
+    key_id: String,
+    public_key_path: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisionPrincipalConfig {
+    id: String,
+    status: String,
+    allowed_key_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1089,6 +1139,241 @@ async fn operator_run_action(input: OperatorActionInput) -> Result<OperatorActio
         },
     )?;
     Ok(result)
+}
+
+#[tauri::command]
+async fn operator_provision_credentials(
+    input: CredentialProvisionInput,
+) -> Result<CredentialProvisionResult, String> {
+    let result = provision_local_credentials(&input.bundle_root, input.refresh_token)?;
+    let now = system_time_to_millis(SystemTime::now()).unwrap_or(0);
+    append_config_audit_entry(
+        Path::new(&result.bundle_root),
+        ConfigAuditEntryView {
+            entry_id: next_config_audit_entry_id(now),
+            recorded_at_ms: now,
+            actor: config_audit_actor(),
+            category: "operator".to_owned(),
+            action: "provision_credentials".to_owned(),
+            component_id: None,
+            section_key: None,
+            service_id: None,
+            command_type: None,
+            success: Some(true),
+            status_code: Some(0),
+            summary: result.message.clone(),
+            diff: None,
+        },
+    )?;
+    Ok(result)
+}
+
+fn provision_local_credentials(
+    bundle_root: &str,
+    refresh_token: bool,
+) -> Result<CredentialProvisionResult, String> {
+    let requested_root = bundle_root.trim();
+    if requested_root.is_empty() {
+        return Err("bundle root is required".to_owned());
+    }
+    let root = fs::canonicalize(requested_root)
+        .map_err(|error| format!("failed to resolve bundle root `{requested_root}`: {error}"))?;
+    let root_metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("failed to inspect bundle root {}: {error}", root.display()))?;
+    if !root_metadata.is_dir() {
+        return Err(format!(
+            "bundle root is not a directory: {}",
+            root.display()
+        ));
+    }
+
+    let config_path = root.join("configs/expressways.example.toml");
+    let config_text = read_bounded_utf8_regular_file(&config_path, MAX_CONFIG_COMPONENT_BYTES)
+        .map_err(|error| format!("failed to read {}: {error}", config_path.display()))?;
+    let config: ProvisionBrokerConfig = toml::from_str(&config_text)
+        .map_err(|error| format!("failed to parse {}: {error}", config_path.display()))?;
+    let issuer = config
+        .auth
+        .issuers
+        .iter()
+        .find(|issuer| issuer.key_id == "dev")
+        .ok_or_else(|| "broker config does not define issuer `dev`".to_owned())?;
+    if issuer.status != "active" {
+        return Err(format!(
+            "issuer `dev` must be active before provisioning (found `{}`)",
+            issuer.status
+        ));
+    }
+    if issuer.public_key_path != "./var/auth/issuer.public" {
+        return Err(format!(
+            "issuer `dev` public_key_path must be ./var/auth/issuer.public for packaged provisioning (found `{}`)",
+            issuer.public_key_path
+        ));
+    }
+    let principal = config
+        .auth
+        .principals
+        .iter()
+        .find(|principal| principal.id == "local:developer")
+        .ok_or_else(|| "broker config does not define principal `local:developer`".to_owned())?;
+    if principal.status != "active" || !principal.allowed_key_ids.iter().any(|key| key == "dev") {
+        return Err("principal `local:developer` must be active and allow issuer `dev`".to_owned());
+    }
+
+    for relative in ["var", "var/auth"] {
+        let path = root.join(relative);
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(format!(
+                "refusing to provision through symlinked directory {}",
+                path.display()
+            ));
+        }
+    }
+    let auth_dir = root.join("var/auth");
+    fs::create_dir_all(&auth_dir)
+        .map_err(|error| format!("failed to create {}: {error}", auth_dir.display()))?;
+    let canonical_auth = fs::canonicalize(&auth_dir)
+        .map_err(|error| format!("failed to resolve {}: {error}", auth_dir.display()))?;
+    if !canonical_auth.starts_with(&root) {
+        return Err("credential directory escapes the selected bundle root".to_owned());
+    }
+
+    let private_key_path = auth_dir.join("issuer.private");
+    let public_key_path = auth_dir.join("issuer.public");
+    let token_path = auth_dir.join("developer.token");
+    let paths = [&private_key_path, &public_key_path, &token_path];
+    let existing = paths.iter().filter(|path| path.exists()).count();
+    if existing == paths.len() {
+        for path in paths {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "credential path is not a regular file: {}",
+                    path.display()
+                ));
+            }
+        }
+        let existing_issuer = CapabilityIssuer::from_private_key_file("dev", &private_key_path)
+            .map_err(|error| format!("existing private key is invalid: {error}"))?;
+        if refresh_token {
+            let token_id = Uuid::now_v7();
+            let issued_at = Utc::now();
+            let expires_at = issued_at + Duration::days(30);
+            let token =
+                issue_local_operator_token(&existing_issuer, token_id, issued_at, expires_at)?;
+            atomic_replace_private_file(&token_path, token.as_bytes()).map_err(|error| {
+                format!(
+                    "failed to replace developer token {}: {error}",
+                    token_path.display()
+                )
+            })?;
+            return Ok(CredentialProvisionResult {
+                bundle_root: root.display().to_string(),
+                created: false,
+                private_key_path: private_key_path.display().to_string(),
+                public_key_path: public_key_path.display().to_string(),
+                token_path: token_path.display().to_string(),
+                token_id: Some(token_id.to_string()),
+                expires_at: Some(expires_at.to_rfc3339()),
+                message: "Reissued the 30-day developer capability without rotating issuer keys."
+                    .to_owned(),
+            });
+        }
+        return Ok(CredentialProvisionResult {
+            bundle_root: root.display().to_string(),
+            created: false,
+            private_key_path: private_key_path.display().to_string(),
+            public_key_path: public_key_path.display().to_string(),
+            token_path: token_path.display().to_string(),
+            token_id: None,
+            expires_at: None,
+            message: "Credentials already exist; no secret files were changed.".to_owned(),
+        });
+    }
+    if existing != 0 {
+        return Err(
+            "credential set is partial; preserve or remove it manually before provisioning"
+                .to_owned(),
+        );
+    }
+
+    let token_id = Uuid::now_v7();
+    let issued_at = Utc::now();
+    let expires_at = issued_at + Duration::days(30);
+    let capability_issuer = CapabilityIssuer::generate("dev");
+    let provision_result = (|| -> Result<(), String> {
+        capability_issuer
+            .write_private_key(&private_key_path)
+            .map_err(|error| format!("failed to write private key: {error}"))?;
+        capability_issuer
+            .write_public_key(&public_key_path)
+            .map_err(|error| format!("failed to write public key: {error}"))?;
+        let token =
+            issue_local_operator_token(&capability_issuer, token_id, issued_at, expires_at)?;
+        write_secret_file(&token_path, token.as_bytes())
+            .map_err(|error| format!("failed to write developer token: {error}"))?;
+        Ok(())
+    })();
+    if let Err(error) = provision_result {
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+
+    Ok(CredentialProvisionResult {
+        bundle_root: root.display().to_string(),
+        created: true,
+        private_key_path: private_key_path.display().to_string(),
+        public_key_path: public_key_path.display().to_string(),
+        token_path: token_path.display().to_string(),
+        token_id: Some(token_id.to_string()),
+        expires_at: Some(expires_at.to_rfc3339()),
+        message: "Created owner-protected local issuer keys and a 30-day developer capability."
+            .to_owned(),
+    })
+}
+
+fn issue_local_operator_token(
+    issuer: &CapabilityIssuer,
+    token_id: Uuid,
+    issued_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+) -> Result<String, String> {
+    issuer
+        .issue(CapabilityClaims {
+            token_id,
+            principal: "local:developer".to_owned(),
+            audience: "expressways".to_owned(),
+            issued_at,
+            expires_at,
+            scopes: local_operator_scopes(),
+        })
+        .map_err(|error| format!("failed to issue developer capability: {error}"))
+}
+
+fn local_operator_scopes() -> Vec<CapabilityScope> {
+    vec![
+        CapabilityScope {
+            resource: "system:broker".to_owned(),
+            actions: vec![Action::Health, Action::Admin],
+        },
+        CapabilityScope {
+            resource: "topic:*".to_owned(),
+            actions: vec![Action::Admin, Action::Publish, Action::Consume],
+        },
+        CapabilityScope {
+            resource: "artifact:*".to_owned(),
+            actions: vec![Action::Admin, Action::Publish, Action::Consume],
+        },
+        CapabilityScope {
+            resource: "registry:agents*".to_owned(),
+            actions: vec![Action::Admin],
+        },
+    ]
 }
 
 fn config_root_path() -> PathBuf {
@@ -3794,7 +4079,8 @@ pub fn run() {
             config_console_rollback_component,
             config_console_restart_services,
             config_console_service_action,
-            operator_run_action
+            operator_run_action,
+            operator_provision_credentials
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -4403,6 +4689,77 @@ reclaim_target_bytes = 117440512
             "rollback reliability below M2 target: {success_rate:.2}%"
         );
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn packaged_credential_provisioning_is_secure_idempotent_and_never_returns_secrets() {
+        let unique = Uuid::now_v7();
+        let root = std::env::temp_dir().join(format!("expressways-provision-{unique}"));
+        let config_dir = root.join("configs");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repository_root = manifest_root
+            .ancestors()
+            .nth(3)
+            .expect("repository root")
+            .to_path_buf();
+        fs::copy(
+            repository_root.join("configs/expressways.example.toml"),
+            config_dir.join("expressways.example.toml"),
+        )
+        .expect("copy config");
+
+        let first = provision_local_credentials(root.to_str().expect("root utf8"), false)
+            .expect("provision credentials");
+        assert!(first.created);
+        assert!(first.token_id.is_some());
+        assert!(first.expires_at.is_some());
+        let private = root.join("var/auth/issuer.private");
+        let public = root.join("var/auth/issuer.public");
+        let token = root.join("var/auth/developer.token");
+        assert!(private.is_file() && public.is_file() && token.is_file());
+        assert!(
+            !first
+                .message
+                .contains(&fs::read_to_string(&token).expect("read token"))
+        );
+        CapabilityIssuer::from_private_key_file("dev", &private).expect("valid private key");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&private)
+                    .expect("private metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&token)
+                    .expect("token metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let second = provision_local_credentials(root.to_str().expect("root utf8"), false)
+            .expect("idempotent provision");
+        assert!(!second.created);
+        assert!(second.token_id.is_none());
+        let original_token = fs::read_to_string(&token).expect("original token");
+        let refreshed = provision_local_credentials(root.to_str().expect("root utf8"), true)
+            .expect("refresh token");
+        assert!(!refreshed.created);
+        assert!(refreshed.token_id.is_some());
+        assert_ne!(
+            fs::read_to_string(&token).expect("refreshed token"),
+            original_token
+        );
         fs::remove_dir_all(root).ok();
     }
 }

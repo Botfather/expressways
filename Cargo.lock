@@ -1235,6 +1235,8 @@ name = "expressways-console"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
+ "expressways-auth",
  "expressways-client",
  "expressways-protocol",
  "libc",
@@ -1246,6 +1248,7 @@ dependencies = [
  "tauri-plugin-log",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
+ "uuid",
 ]
 
 [[package]]

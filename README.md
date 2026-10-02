@@ -664,6 +664,13 @@ scripts/upgrade-bundle.sh verify /path/to/extracted-new-bundle
 scripts/upgrade-bundle.sh apply /path/to/extracted-new-bundle
 ```
 
+The desktop console also provides packaged first-run credential provisioning:
+select the extracted bundle root and it creates owner-protected issuer material
+and a 30-day local capability after validating the broker config. Existing
+complete credentials are preserved, partial or symlinked locations fail
+closed, and secret contents are never returned to the webview. A separate
+explicit option renews the bounded-lifetime token without rotating issuer keys.
+
 By default this uses `local:developer` (registered in `configs/expressways.example.toml`) and writes `./var/auth/admin.token`.
 The target validates principal registration, status, policy-rule presence, and key compatibility before issuing the token.
 You can override the principal when needed:

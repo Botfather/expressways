@@ -21,6 +21,7 @@ const apiMocks = vi.hoisted(() => ({
   restartConfigServices: vi.fn(),
   runConfigServiceAction: vi.fn(),
   runOperatorAction: vi.fn(),
+  provisionLocalCredentials: vi.fn(),
 }))
 
 vi.mock('../api', () => apiMocks)
@@ -333,6 +334,16 @@ describe('Config Console Integration', () => {
       stderr: '',
       executedAtMs: Date.now(),
     })
+    apiMocks.provisionLocalCredentials.mockResolvedValue({
+      bundleRoot: '/opt/expressways',
+      created: true,
+      privateKeyPath: '/opt/expressways/var/auth/issuer.private',
+      publicKeyPath: '/opt/expressways/var/auth/issuer.public',
+      tokenPath: '/opt/expressways/var/auth/developer.token',
+      tokenId: 'token-1',
+      expiresAt: '2026-11-02T00:00:00Z',
+      message: 'Created owner-protected credentials.',
+    })
 
     seedMonitorState(configSnapshot)
   })
@@ -419,5 +430,23 @@ describe('Config Console Integration', () => {
         'Raw TOML has unsaved changes. Apply or reset raw draft before saving form sections.',
       ),
     ).toBeInTheDocument()
+  })
+
+  it('provisions packaged credentials for an explicitly selected bundle without displaying secrets', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: 'Config Console' }))
+    const rootInput = screen.getByRole('textbox', { name: 'Expressways bundle root' })
+    await user.type(rootInput, '/opt/expressways')
+    await user.click(screen.getByRole('button', { name: 'Provision Credentials' }))
+
+    await waitFor(() =>
+      expect(apiMocks.provisionLocalCredentials).toHaveBeenCalledWith('/opt/expressways', false),
+    )
+    expect(
+      (await screen.findAllByText('Created owner-protected credentials.')).length,
+    ).toBeGreaterThan(0)
+    expect(screen.getByText('Token: /opt/expressways/var/auth/developer.token')).toBeInTheDocument()
   })
 })
