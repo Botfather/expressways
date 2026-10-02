@@ -640,6 +640,21 @@ Or use the Makefile shortcut to generate an admin token:
 make generate-admin-token
 ```
 
+Packaged bundles can register the standard stack for automatic, least-privilege
+per-user startup after credentials are generated:
+
+```bash
+scripts/install-user-service.sh install   # macOS LaunchAgent or Linux systemd user unit
+```
+
+```powershell
+.\scripts\install-user-service.ps1 install  # Windows logon task
+```
+
+Both uninstallers stop the managed stack and preserve `var/` deliberately.
+See [installation](docs/operations/installation.md) for status and removal
+commands.
+
 By default this uses `local:developer` (registered in `configs/expressways.example.toml`) and writes `./var/auth/admin.token`.
 The target validates principal registration, status, policy-rule presence, and key compatibility before issuing the token.
 You can override the principal when needed:

@@ -10,6 +10,8 @@ REQUIRED_COMMON_SUFFIXES=(
   "/configs/expressways.example.toml"
   "/scripts/expressways-service.sh"
   "/scripts/expressways-service.ps1"
+  "/scripts/install-user-service.sh"
+  "/scripts/install-user-service.ps1"
   "/LICENSE"
   "/README.md"
   "/release-notes.md"
@@ -69,6 +71,10 @@ check_artifact() {
   # Ensure the service script is executable in the archive for replay convenience.
   if ! tar -tvzf "$artifact" | awk '$NF ~ /\/scripts\/expressways-service\.sh$/ {print $1}' | grep -q 'x'; then
     echo "scripts/expressways-service.sh is not marked executable in $artifact"
+    return 1
+  fi
+  if ! tar -tvzf "$artifact" | awk '$NF ~ /\/scripts\/install-user-service\.sh$/ {print $1}' | grep -q 'x'; then
+    echo "scripts/install-user-service.sh is not marked executable in $artifact"
     return 1
   fi
 

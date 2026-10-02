@@ -63,6 +63,9 @@ jobs:
       - name: Test Packaged Service Lifecycle
         run: bash scripts/test-service-lifecycle.sh
 
+      - name: Test Per-user Service Installers
+        run: bash scripts/test-user-service-installers.sh
+
       - name: Check Rust Advisories, Licenses, and Sources
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -94,6 +97,15 @@ jobs:
           -p expressways-nanobot-system
           -p expressways-interop-bridge
           --bins
+
+      - name: Render Native Per-user Service Definition (macOS)
+        if: runner.os == 'macOS'
+        run: EXPRESSWAYS_SERVICE_PLATFORM=macos scripts/install-user-service.sh render "$RUNNER_TEMP/expressways.plist"
+
+      - name: Render Native Per-user Service Definition (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install-user-service.ps1 render "$env:RUNNER_TEMP\expressways.xml"
 
   config-rollback-reliability:
     runs-on: ubuntu-latest

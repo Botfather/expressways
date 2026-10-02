@@ -67,8 +67,33 @@ On Windows PowerShell, use the equivalent helper:
 
 The broker can start without a capability token. The gateway can then start and will authenticate each request with the caller's token. The orchestrator and Nanobot runtime require `var/auth/developer.token`; generate it with `expresswaysctl` before starting the whole stack. Override `CONFIG_PATH`, `BROKER_ADDRESS`, `HTTP_LISTEN`, or `TOKEN_FILE` in the environment when using non-default paths or ports. Logs and PID records are kept beneath `var/agent/service-control`.
 
+After credentials are provisioned, install automatic per-user startup without
+administrator privileges:
+
+```bash
+scripts/install-user-service.sh install   # macOS LaunchAgent or Linux systemd --user
+scripts/install-user-service.sh status
+```
+
+On Windows PowerShell:
+
+```powershell
+.\scripts\install-user-service.ps1 install
+.\scripts\install-user-service.ps1 status
+```
+
+The registration points at this exact extracted bundle. Move or upgrade the
+bundle only through the supported upgrade transaction once available; moving
+it manually leaves the native startup definition pointing at the old path.
+Uninstalling the startup definition stops the stack but deliberately preserves
+configuration, audit records, credentials, and runtime data.
+
 The example configuration binds to loopback and is for local evaluation. Review identity, policy, quotas, storage limits, audit paths, listener exposure, file ownership, backups, and secret distribution before adapting it to another environment.
 
 ## Uninstall
 
-Source builds do not install system-wide files automatically. Stop running processes, remove any service definition you created, and then remove the checkout and explicitly selected runtime directories. Back up audit and regulated data first. Never delete `./var` blindly when it contains data subject to retention requirements.
+Remove the per-user startup definition with `scripts/install-user-service.sh
+uninstall` or `.\scripts\install-user-service.ps1 uninstall`, then remove the
+bundle and explicitly selected runtime directories. Back up audit and regulated
+data first. Never delete `./var` blindly when it contains data subject to
+retention requirements.
