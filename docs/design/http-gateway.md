@@ -44,10 +44,20 @@ The capability must grant the action and resource used by the route, and the bro
 | `GET /v1/topics/{topic}/events?offset=0` | resumable SSE consume loop | `consume` on `topic:{topic}` |
 | `POST /v1/tasks` | `publish` to `tasks` | `publish` on `topic:tasks` |
 | `GET /v1/agents` | `list_agents` | `admin` on `registry:agents` |
+| `POST /v1/agents` | `register_agent` | `admin` on `registry:agents:{agent_id}` |
+| `POST /v1/agents/{agent_id}/heartbeat` | `heartbeat_agent` | `admin` on that registry entry |
+| `DELETE /v1/agents/{agent_id}` | `remove_agent` | `admin` on that registry entry |
+| `GET /v1/agents/events` | resumable registry SSE | `admin` on `registry:agents` |
 | `POST /v1/artifacts` | `put_artifact` | artifact publish scope |
 | `GET /v1/artifacts/{artifact_id}` | `get_artifact` | consume on that artifact |
 
 Agent query parameters are `skill`, `topic`, `principal`, and `include_stale`. Consume limits must be between 1 and 10,000; the broker may enforce a smaller principal-specific quota.
+
+## Agent lifecycle and discovery
+
+`POST /v1/agents` accepts the shared `AgentRegistration` JSON contract. The authenticated broker principal—not any HTTP field—owns the resulting card. The same principal can refresh liveness through the heartbeat route; removal remains subject to the broker's ownership and developer-recovery rules.
+
+`GET /v1/agents/events` streams `registry_event` SSE records for registered, heartbeated, removed, and cleaned-up cards. It accepts the same discovery filters as `GET /v1/agents`, plus `cursor`, `max_events` (default `100`, maximum `500`), and `wait_timeout_ms` (default `25000`). SSE IDs are registry cursors; reconnect with `Last-Event-ID` without incrementing it. `cursor` events advance across filtered or idle portions of the bounded journal. A `410 Gone` response means the cursor expired and the client must resynchronize with `GET /v1/agents` before reopening the stream.
 
 ## Stream topic events
 

@@ -12,13 +12,13 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use expressways_client::{Client, Endpoint, normalize_capability_token};
 use expressways_protocol::{
-    AgentQuery, Classification, ControlCommand, ControlRequest, ControlResponse, RetentionClass,
-    StoredMessage, TASKS_TOPIC, TaskWorkItem,
+    AgentQuery, AgentRegistration, Classification, ControlCommand, ControlRequest, ControlResponse,
+    RegistryEvent, RetentionClass, StoredMessage, TASKS_TOPIC, TaskWorkItem,
 };
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
@@ -106,6 +106,18 @@ struct TopicStreamState {
     _permit: OwnedSemaphorePermit,
 }
 
+struct AgentStreamState {
+    app: AppState,
+    token: String,
+    query: AgentQuery,
+    cursor: u64,
+    max_events: usize,
+    wait_timeout_ms: u64,
+    pending: VecDeque<Event>,
+    terminal: bool,
+    _permit: OwnedSemaphorePermit,
+}
+
 #[derive(Debug, Deserialize)]
 struct AgentQueryParams {
     skill: Option<String>,
@@ -113,6 +125,21 @@ struct AgentQueryParams {
     principal: Option<String>,
     #[serde(default)]
     include_stale: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentEventsQuery {
+    skill: Option<String>,
+    topic: Option<String>,
+    principal: Option<String>,
+    #[serde(default)]
+    include_stale: bool,
+    cursor: Option<u64>,
+    #[serde(default = "default_agent_event_limit")]
+    max_events: usize,
+    #[serde(default = "default_stream_wait_timeout_ms")]
+    wait_timeout_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,7 +211,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/topics/{topic}/messages", post(publish).get(consume))
         .route("/v1/topics/{topic}/events", get(stream_topic))
         .route("/v1/tasks", post(submit_task))
-        .route("/v1/agents", get(list_agents))
+        .route("/v1/agents", get(list_agents).post(register_agent))
+        .route("/v1/agents/events", get(stream_agents))
+        .route("/v1/agents/{agent_id}", delete(remove_agent))
+        .route("/v1/agents/{agent_id}/heartbeat", post(heartbeat_agent))
         .route(
             "/v1/artifacts",
             post(put_artifact).layer(DefaultBodyLimit::max(artifact_limit)),
@@ -288,14 +318,7 @@ async fn stream_topic(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, GatewayError> {
     validate_path_identifier("topic", &topic)?;
     validate_consume_limit(query.limit)?;
-    if !(MIN_STREAM_WAIT_TIMEOUT_MS..=MAX_STREAM_WAIT_TIMEOUT_MS).contains(&query.wait_timeout_ms) {
-        return Err(GatewayError::bad_request(
-            "invalid_wait_timeout",
-            format!(
-                "wait_timeout_ms must be between {MIN_STREAM_WAIT_TIMEOUT_MS} and {MAX_STREAM_WAIT_TIMEOUT_MS}"
-            ),
-        ));
-    }
+    validate_stream_wait_timeout(query.wait_timeout_ms)?;
     let offset = resolve_stream_offset(query.offset, &headers)?;
     let token = bearer_token(&headers)?;
     let permit = state
@@ -508,6 +531,234 @@ async fn list_agents(
     .await
 }
 
+async fn register_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(registration): Json<AgentRegistration>,
+) -> Result<Json<ControlResponse>, GatewayError> {
+    proxy_json(
+        &state,
+        &headers,
+        ControlCommand::RegisterAgent { registration },
+    )
+    .await
+}
+
+async fn heartbeat_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ControlResponse>, GatewayError> {
+    validate_path_identifier("agent_id", &agent_id)?;
+    proxy_json(
+        &state,
+        &headers,
+        ControlCommand::HeartbeatAgent { agent_id },
+    )
+    .await
+}
+
+async fn remove_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ControlResponse>, GatewayError> {
+    validate_path_identifier("agent_id", &agent_id)?;
+    proxy_json(&state, &headers, ControlCommand::RemoveAgent { agent_id }).await
+}
+
+async fn stream_agents(
+    State(state): State<AppState>,
+    Query(query): Query<AgentEventsQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, GatewayError> {
+    if query.max_events == 0 || query.max_events > 500 {
+        return Err(GatewayError::bad_request(
+            "invalid_max_events",
+            "max_events must be between 1 and 500",
+        ));
+    }
+    validate_stream_wait_timeout(query.wait_timeout_ms)?;
+    let requested_cursor = resolve_registry_cursor(query.cursor, &headers)?;
+    let token = bearer_token(&headers)?;
+    let permit = state
+        .stream_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            GatewayError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream_capacity_exceeded",
+                "the HTTP gateway has reached its concurrent event stream limit",
+            )
+        })?;
+    let agent_query = AgentQuery {
+        skill: query.skill,
+        topic: query.topic,
+        principal: query.principal,
+        include_stale: query.include_stale,
+    };
+
+    // A zero-wait watch validates auth, policy, query, and cursor before HTTP 200.
+    let (response, attachment) = send(
+        &state,
+        token.clone(),
+        ControlCommand::WatchAgents {
+            query: agent_query.clone(),
+            cursor: requested_cursor,
+            max_events: query.max_events,
+            wait_timeout_ms: 0,
+        },
+        None,
+    )
+    .await?;
+    if attachment.is_some() {
+        return Err(upstream_protocol_error(
+            "unexpected broker response attachment",
+        ));
+    }
+    let (events, cursor, timed_out) = extract_registry_events(response)?;
+    let stream_state = AgentStreamState {
+        app: state,
+        token,
+        query: agent_query,
+        cursor,
+        max_events: query.max_events,
+        wait_timeout_ms: query.wait_timeout_ms,
+        pending: registry_sse_events(events, cursor, timed_out)?,
+        terminal: false,
+        _permit: permit,
+    };
+    let stream = futures_util::stream::unfold(stream_state, next_agent_event);
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
+}
+
+async fn next_agent_event(
+    mut stream: AgentStreamState,
+) -> Option<(Result<Event, Infallible>, AgentStreamState)> {
+    if stream.terminal {
+        return None;
+    }
+    if let Some(event) = stream.pending.pop_front() {
+        return Some((Ok(event), stream));
+    }
+
+    let result = send(
+        &stream.app,
+        stream.token.clone(),
+        ControlCommand::WatchAgents {
+            query: stream.query.clone(),
+            cursor: Some(stream.cursor),
+            max_events: stream.max_events,
+            wait_timeout_ms: stream.wait_timeout_ms,
+        },
+        None,
+    )
+    .await;
+    match result {
+        Ok((response, None)) => match extract_registry_events(response) {
+            Ok((events, cursor, timed_out)) => {
+                stream.cursor = cursor;
+                match registry_sse_events(events, cursor, timed_out) {
+                    Ok(events) => stream.pending = events,
+                    Err(error) => {
+                        stream.terminal = true;
+                        return Some((Ok(sse_error_event(&error.code, &error.message)), stream));
+                    }
+                }
+            }
+            Err(error) => {
+                stream.terminal = true;
+                return Some((Ok(sse_error_event(&error.code, &error.message)), stream));
+            }
+        },
+        Ok((_, Some(_))) => {
+            stream.terminal = true;
+            return Some((
+                Ok(sse_error_event(
+                    "broker_protocol_error",
+                    "unexpected broker response attachment",
+                )),
+                stream,
+            ));
+        }
+        Err(error) => {
+            stream.terminal = true;
+            return Some((Ok(sse_error_event(&error.code, &error.message)), stream));
+        }
+    }
+    stream.pending.pop_front().map(|event| (Ok(event), stream))
+}
+
+fn extract_registry_events(
+    response: ControlResponse,
+) -> Result<(Vec<RegistryEvent>, u64, bool), GatewayError> {
+    match response {
+        ControlResponse::RegistryEvents {
+            events,
+            cursor,
+            timed_out,
+        } => Ok((events, cursor, timed_out)),
+        ControlResponse::Error { code, message } => Err(broker_error(code, message)),
+        _ => Err(upstream_protocol_error(
+            "broker returned an unexpected registry watch response",
+        )),
+    }
+}
+
+fn registry_sse_events(
+    events: Vec<RegistryEvent>,
+    cursor: u64,
+    timed_out: bool,
+) -> Result<VecDeque<Event>, GatewayError> {
+    let final_event_sequence = events.last().map(|event| event.sequence);
+    let mut pending = VecDeque::with_capacity(events.len().saturating_add(1));
+    for event in events {
+        let data = serde_json::to_string(&event).map_err(|error| {
+            upstream_protocol_error(format!("failed to encode registry event: {error}"))
+        })?;
+        pending.push_back(
+            Event::default()
+                .event("registry_event")
+                .id(event.sequence.to_string())
+                .data(data),
+        );
+    }
+    if final_event_sequence != Some(cursor) {
+        let data = serde_json::json!({ "cursor": cursor, "timed_out": timed_out }).to_string();
+        pending.push_back(
+            Event::default()
+                .event("cursor")
+                .id(cursor.to_string())
+                .data(data),
+        );
+    }
+    Ok(pending)
+}
+
+fn resolve_registry_cursor(
+    requested_cursor: Option<u64>,
+    headers: &HeaderMap,
+) -> Result<Option<u64>, GatewayError> {
+    if requested_cursor.is_some() {
+        return Ok(requested_cursor);
+    }
+    unique_optional_header(headers, "last-event-id")?
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                GatewayError::bad_request(
+                    "invalid_last_event_id",
+                    "Last-Event-ID must be an unsigned registry cursor",
+                )
+            })
+        })
+        .transpose()
+}
+
 async fn put_artifact(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -696,8 +947,9 @@ fn broker_error(code: String, message: String) -> GatewayError {
         "authentication_failed" | "invalid_capability" => StatusCode::UNAUTHORIZED,
         "policy_denied" | "capability_denied" => StatusCode::FORBIDDEN,
         "not_found" | "topic_not_found" | "artifact_not_found" => StatusCode::NOT_FOUND,
+        "watch_cursor_expired" => StatusCode::GONE,
         "quota_exceeded" => StatusCode::TOO_MANY_REQUESTS,
-        "service_degraded" => StatusCode::SERVICE_UNAVAILABLE,
+        "service_degraded" | "registry_event_sequence_exhausted" => StatusCode::SERVICE_UNAVAILABLE,
         code if code.starts_with("invalid_") => StatusCode::BAD_REQUEST,
         _ => StatusCode::BAD_GATEWAY,
     };
@@ -789,6 +1041,18 @@ fn validate_consume_limit(limit: usize) -> Result<(), GatewayError> {
     Ok(())
 }
 
+fn validate_stream_wait_timeout(wait_timeout_ms: u64) -> Result<(), GatewayError> {
+    if !(MIN_STREAM_WAIT_TIMEOUT_MS..=MAX_STREAM_WAIT_TIMEOUT_MS).contains(&wait_timeout_ms) {
+        return Err(GatewayError::bad_request(
+            "invalid_wait_timeout",
+            format!(
+                "wait_timeout_ms must be between {MIN_STREAM_WAIT_TIMEOUT_MS} and {MAX_STREAM_WAIT_TIMEOUT_MS}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn insert_header(
     headers: &mut HeaderMap,
     name: HeaderName,
@@ -835,6 +1099,10 @@ fn default_consume_limit() -> usize {
     100
 }
 
+fn default_agent_event_limit() -> usize {
+    100
+}
+
 fn default_stream_wait_timeout_ms() -> u64 {
     25_000
 }
@@ -854,7 +1122,9 @@ mod tests {
     use axum::body::Body;
     use chrono::Utc;
     use expressways_client::CustomEndpoint;
-    use expressways_protocol::{ArtifactMetadata, ControlWireEnvelope};
+    use expressways_protocol::{
+        AgentCard, AgentEndpoint, ArtifactMetadata, ControlWireEnvelope, RegistryEventKind,
+    };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     type ObservedRequests = Arc<Mutex<Vec<(ControlRequest, Option<Vec<u8>>)>>>;
@@ -908,6 +1178,49 @@ mod tests {
             HeaderValue::from_static("Bearer caller-capability"),
         );
         headers
+    }
+
+    fn agent_registration() -> AgentRegistration {
+        AgentRegistration {
+            agent_id: "agent-http".to_owned(),
+            display_name: "HTTP Agent".to_owned(),
+            version: "1.0.0".to_owned(),
+            summary: "registered through HTTP".to_owned(),
+            skills: vec!["chat.reply".to_owned()],
+            subscriptions: vec!["topic:tasks".to_owned()],
+            publications: vec!["topic:task_events".to_owned()],
+            schemas: Vec::new(),
+            endpoint: AgentEndpoint {
+                transport: "http".to_owned(),
+                address: "http://127.0.0.1:9000".to_owned(),
+            },
+            classification: Classification::Internal,
+            retention_class: RetentionClass::Operational,
+            ttl_seconds: Some(60),
+        }
+    }
+
+    fn agent_card() -> AgentCard {
+        let registration = agent_registration();
+        let now = Utc::now();
+        AgentCard {
+            agent_id: registration.agent_id,
+            principal: "local:test".to_owned(),
+            display_name: registration.display_name,
+            version: registration.version,
+            summary: registration.summary,
+            skills: registration.skills,
+            subscriptions: registration.subscriptions,
+            publications: registration.publications,
+            schemas: registration.schemas,
+            endpoint: registration.endpoint,
+            classification: registration.classification,
+            retention_class: registration.retention_class,
+            ttl_seconds: 60,
+            updated_at: now,
+            last_seen_at: now,
+            expires_at: now + chrono::Duration::seconds(60),
+        }
     }
 
     #[test]
@@ -982,6 +1295,42 @@ mod tests {
         assert_eq!(error.code, "broker_protocol_error");
     }
 
+    #[test]
+    fn registry_stream_resumes_at_the_cursor_without_incrementing() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", HeaderValue::from_static("41"));
+        assert_eq!(
+            resolve_registry_cursor(None, &headers).expect("resume"),
+            Some(41)
+        );
+        assert_eq!(
+            resolve_registry_cursor(Some(7), &headers).expect("explicit cursor"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn registry_stream_emits_cursor_progress_after_filtered_events() {
+        let events = vec![RegistryEvent {
+            sequence: 2,
+            timestamp: Utc::now(),
+            kind: RegistryEventKind::Registered,
+            card: agent_card(),
+        }];
+        assert_eq!(
+            registry_sse_events(events, 5, false)
+                .expect("registry events")
+                .len(),
+            2
+        );
+        assert_eq!(
+            registry_sse_events(Vec::new(), 5, true)
+                .expect("cursor event")
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn health_forwards_the_callers_capability_to_the_broker() {
         let (broker, observed) = fake_broker(ControlResponse::Health {
@@ -1003,6 +1352,34 @@ mod tests {
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].0.capability_token, "caller-capability");
         assert!(matches!(observed[0].0.command, ControlCommand::Health));
+    }
+
+    #[tokio::test]
+    async fn registration_forwards_the_callers_identity_and_card() {
+        let card = agent_card();
+        let (broker, observed) =
+            fake_broker(ControlResponse::AgentRegistered { card: card.clone() });
+        let state = AppState {
+            broker,
+            max_artifact_bytes: DEFAULT_ARTIFACT_LIMIT,
+            request_timeout: Duration::from_secs(1),
+            request_slots: Arc::new(Semaphore::new(1)),
+            stream_slots: Arc::new(Semaphore::new(1)),
+        };
+        let response = register_agent(State(state), bearer_headers(), Json(agent_registration()))
+            .await
+            .expect("registration response");
+        assert!(matches!(
+            response.0,
+            ControlResponse::AgentRegistered { .. }
+        ));
+        let observed = observed.lock().expect("observed lock");
+        assert_eq!(observed[0].0.capability_token, "caller-capability");
+        assert!(matches!(
+            &observed[0].0.command,
+            ControlCommand::RegisterAgent { registration }
+                if registration.agent_id == "agent-http"
+        ));
     }
 
     #[tokio::test]

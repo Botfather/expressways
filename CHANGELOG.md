@@ -13,6 +13,7 @@ All notable user-visible changes will be documented here. The format follows [Ke
 - An authenticated loopback HTTP gateway for broker health, topic I/O, tasks, agent discovery, and integrity-checked artifact transfer.
 - Resumable, authenticated topic event streaming over Server-Sent Events with bounded stream capacity and cursor recovery.
 - A bounded `watch_topic` broker operation so idle event streams avoid repeated network requests and audit records.
+- HTTP agent registration, heartbeat, removal, discovery, and resumable registry event streaming for non-Rust harnesses.
 
 ### Security
 
