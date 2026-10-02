@@ -1,4 +1,4 @@
-.PHONY: backup-runtime benchmark bootstrap-local check check-docs check-hygiene export-support-bundle generate-admin-token generate-token help prepare-local-dirs rehearse-clean-machine rehearse-config-rollback-reliability rehearse-dr-restore-clean-env rehearse-key-rotation rehearse-m3-live-suite rehearse-reliability-denials rehearse-rollback restore-runtime run-expressways run-orchestrator run-dashboard run-stack run-ollama-agent run-gateway run-http-api run-ollama-stack summarize-pilot-runs summarize-rollback-reliability-trend test-adapter-conformance test-http-conformance test-local-backbone-profile test-user-service-installers validate-support-bundle verify-first-run
+.PHONY: backup-runtime benchmark bootstrap-local check check-docs check-hygiene export-support-bundle generate-admin-token generate-token help prepare-local-dirs rehearse-clean-machine rehearse-config-rollback-reliability rehearse-dr-restore-clean-env rehearse-key-rotation rehearse-m3-live-suite rehearse-reliability-denials rehearse-rollback restore-runtime run-expressways run-orchestrator run-dashboard run-stack run-ollama-agent run-gateway run-http-api run-ollama-stack summarize-pilot-runs summarize-rollback-reliability-trend test-adapter-conformance test-bundle-upgrade test-http-conformance test-local-backbone-profile test-user-service-installers validate-support-bundle verify-first-run
 
 EXPRESSWAYS_CONFIG ?= configs/expressways.example.toml
 BROKER_ADDRESS ?= 127.0.0.1:7766
@@ -48,6 +48,7 @@ help:
 	@echo "  make test-adapter-conformance Run live chat adapter auth, replay, ordering, media, and recovery checks"
 	@echo "  make test-local-backbone-profile Run the complete local HTTP/chat/LLM-tool/recovery profile"
 	@echo "  make test-user-service-installers Validate native per-user startup definitions"
+	@echo "  make test-bundle-upgrade Verify checksum-gated upgrade commit and automatic rollback"
 	@echo "  make run-ollama-stack  Start broker, orchestrator, Ollama worker, and gateway"
 	@echo "  make bootstrap-local   Generate local issuer and guarded admin token"
 	@echo "  make generate-admin-token Generate a local admin-scope capability token (default principal: $(ADMIN_PRINCIPAL))"
@@ -92,6 +93,9 @@ test-local-backbone-profile:
 
 test-user-service-installers:
 	bash scripts/test-user-service-installers.sh
+
+test-bundle-upgrade:
+	bash scripts/test-bundle-upgrade.sh
 
 prepare-local-dirs:
 	@mkdir -p ./tmp ./var/auth ./var/agent ./var/benchmarks ./var/orchestrator

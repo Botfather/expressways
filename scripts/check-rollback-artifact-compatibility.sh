@@ -12,6 +12,8 @@ REQUIRED_COMMON_SUFFIXES=(
   "/scripts/expressways-service.ps1"
   "/scripts/install-user-service.sh"
   "/scripts/install-user-service.ps1"
+  "/scripts/upgrade-bundle.sh"
+  "/scripts/upgrade-bundle.ps1"
   "/LICENSE"
   "/README.md"
   "/release-notes.md"
@@ -75,6 +77,10 @@ check_artifact() {
   fi
   if ! tar -tvzf "$artifact" | awk '$NF ~ /\/scripts\/install-user-service\.sh$/ {print $1}' | grep -q 'x'; then
     echo "scripts/install-user-service.sh is not marked executable in $artifact"
+    return 1
+  fi
+  if ! tar -tvzf "$artifact" | awk '$NF ~ /\/scripts\/upgrade-bundle\.sh$/ {print $1}' | grep -q 'x'; then
+    echo "scripts/upgrade-bundle.sh is not marked executable in $artifact"
     return 1
   fi
 

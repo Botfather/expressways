@@ -60,7 +60,7 @@ The supported HTTP API exposes broker health, publish/consume, resumable topic S
 
 ### Desktop lifecycle
 
-Release bundles now build the broker, CLI, HTTP gateway, orchestrator, Nanobot runtime, and chat bridge for macOS arm64, Linux x86-64, and Windows x86-64, with native lifecycle helpers for ordered stack startup, shutdown, status, and restart. Bundled installers register that stack as a per-user macOS LaunchAgent, Linux systemd user unit, or least-privilege Windows logon task without deleting runtime state on uninstall. Completion still requires an upgrade transaction, credential provisioning UI, and recovery integration. The desktop console should operate the same broker rather than carrying a second source of truth.
+Release bundles now build the broker, CLI, HTTP gateway, orchestrator, Nanobot runtime, and chat bridge for macOS arm64, Linux x86-64, and Windows x86-64, with native lifecycle helpers for ordered stack startup, shutdown, status, and restart. Bundled installers register that stack as a per-user macOS LaunchAgent, Linux systemd user unit, or least-privilege Windows logon task without deleting runtime state on uninstall. Checksum-gated upgrade transactions preserve runtime state and operator config, retain the previous managed payload, and automatically restore it when authenticated post-upgrade health validation fails. Completion still requires credential provisioning UI and recovery integration. The desktop console should operate the same broker rather than carrying a second source of truth.
 
 ### Adapter SDK and conformance suite
 

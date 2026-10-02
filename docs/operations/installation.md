@@ -82,11 +82,33 @@ On Windows PowerShell:
 .\scripts\install-user-service.ps1 status
 ```
 
-The registration points at this exact extracted bundle. Move or upgrade the
-bundle only through the supported upgrade transaction once available; moving
-it manually leaves the native startup definition pointing at the old path.
+The registration points at this exact extracted bundle. Moving it manually
+leaves the native startup definition pointing at the old path.
 Uninstalling the startup definition stops the stack but deliberately preserves
 configuration, audit records, credentials, and runtime data.
+
+## Transactional Bundle Upgrades
+
+Extract the new bundle beside the installed bundle, then verify and apply it:
+
+```bash
+scripts/upgrade-bundle.sh verify /path/to/extracted-new-bundle
+scripts/upgrade-bundle.sh apply /path/to/extracted-new-bundle
+```
+
+```powershell
+.\scripts\upgrade-bundle.ps1 verify C:\path\to\extracted-new-bundle
+.\scripts\upgrade-bundle.ps1 apply C:\path\to\extracted-new-bundle
+```
+
+The transaction verifies every file listed by the incoming bundle checksum
+manifest before stopping the stack. It preserves `var/` and the active
+`configs/expressways.example.toml`, snapshots the previous managed binaries and
+scripts, starts the new stack, and requires an authenticated broker health
+check. Failed startup or health validation automatically restores and verifies
+the previous payload. The new example config is saved as
+`configs/expressways.example.toml.dist` for manual review rather than replacing
+operator policy.
 
 The example configuration binds to loopback and is for local evaluation. Review identity, policy, quotas, storage limits, audit paths, listener exposure, file ownership, backups, and secret distribution before adapting it to another environment.
 

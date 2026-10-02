@@ -655,6 +655,15 @@ Both uninstallers stop the managed stack and preserve `var/` deliberately.
 See [installation](docs/operations/installation.md) for status and removal
 commands.
 
+Bundle upgrades are checksum-gated transactions with authenticated health
+validation and automatic rollback; they preserve runtime data and the active
+operator config:
+
+```bash
+scripts/upgrade-bundle.sh verify /path/to/extracted-new-bundle
+scripts/upgrade-bundle.sh apply /path/to/extracted-new-bundle
+```
+
 By default this uses `local:developer` (registered in `configs/expressways.example.toml`) and writes `./var/auth/admin.token`.
 The target validates principal registration, status, policy-rule presence, and key compatibility before issuing the token.
 You can override the principal when needed:

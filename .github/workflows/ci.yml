@@ -66,6 +66,9 @@ jobs:
       - name: Test Per-user Service Installers
         run: bash scripts/test-user-service-installers.sh
 
+      - name: Test Bundle Upgrade Transaction
+        run: bash scripts/test-bundle-upgrade.sh
+
       - name: Check Rust Advisories, Licenses, and Sources
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -106,6 +109,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/install-user-service.ps1 render "$env:RUNNER_TEMP\expressways.xml"
+
+      - name: Test Native Bundle Upgrade Transaction (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-bundle-upgrade.ps1
 
   config-rollback-reliability:
     runs-on: ubuntu-latest
