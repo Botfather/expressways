@@ -591,9 +591,6 @@ That means if you build with a subset of adopter features, you should update `ad
 
 - `docs/design`: architecture and baseline operational contracts.
 - `docs/adr`: scope and design decisions.
-- `docs/plans`: execution planning.
-- `docs/plans/productization-execution-plan.md`: productization milestones, ownership lanes, and acceptance gates.
-- `docs/plans/productization/`: week-by-week productization artifacts (contract, checklist, support policy, release channels).
 - `docs/reviews`: critical review material.
 
 ## Quick Start
