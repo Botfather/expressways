@@ -15,6 +15,7 @@ All notable user-visible changes will be documented here. The format follows [Ke
 - A bounded `watch_topic` broker operation so idle event streams avoid repeated network requests and audit records.
 - HTTP agent registration, heartbeat, removal, discovery, and resumable registry event streaming for non-Rust harnesses.
 - A versioned OpenAPI 3.1 contract and isolated live HTTP conformance suite with restart durability checks.
+- Cross-platform backbone release bundles with Windows coverage, all core runtime binaries, and native stack lifecycle helpers.
 
 ### Security
 

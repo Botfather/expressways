@@ -54,10 +54,40 @@ jobs:
       - name: Test HTTP Gateway Conformance
         run: bash scripts/test-http-gateway-conformance.sh
 
+      - name: Test Packaged Service Lifecycle
+        run: bash scripts/test-service-lifecycle.sh
+
       - name: Check Rust Advisories, Licenses, and Sources
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses sources
+
+  backbone-platform-build:
+    name: Backbone Binaries (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Packaged Backbone Binaries
+        run: >-
+          cargo build
+          -p expressways-server
+          -p expressways-client
+          -p expressways-http-gateway
+          -p expressways-orchestrator
+          -p expressways-nanobot-system
+          -p expressways-interop-bridge
+          --bins
 
   config-rollback-reliability:
     runs-on: ubuntu-latest

@@ -57,9 +57,15 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             artifact_name: expressways-desktop-macos-aarch64
+            binary_suffix: ""
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact_name: expressways-desktop-linux-x86_64
+            binary_suffix: ""
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            artifact_name: expressways-desktop-windows-x86_64
+            binary_suffix: ".exe"
 
     steps:
       - name: Checkout
@@ -87,8 +93,16 @@ jobs:
           fi
           echo "path=./tmp-release-notes.md" >> "$GITHUB_OUTPUT"
 
-      - name: Build broker and CLI binaries
-        run: cargo build --release --target ${{ matrix.target }} -p expressways-server -p expressways-client --bin expresswaysctl
+      - name: Build local backbone binaries
+        run: >-
+          cargo build --release --target ${{ matrix.target }}
+          -p expressways-server
+          -p expressways-client
+          -p expressways-http-gateway
+          -p expressways-orchestrator
+          -p expressways-nanobot-system
+          -p expressways-interop-bridge
+          --bins
 
       - name: Stage artifact directory
         shell: bash
@@ -96,10 +110,19 @@ jobs:
           set -euo pipefail
           STAGE_ROOT="dist/${{ matrix.artifact_name }}"
           mkdir -p "$STAGE_ROOT/bin" "$STAGE_ROOT/configs" "$STAGE_ROOT/scripts"
-          cp "target/${{ matrix.target }}/release/expressways-server" "$STAGE_ROOT/bin/"
-          cp "target/${{ matrix.target }}/release/expresswaysctl" "$STAGE_ROOT/bin/"
+          BINARY_SUFFIX='${{ matrix.binary_suffix }}'
+          for binary in \
+            expressways-server \
+            expresswaysctl \
+            expressways-http-gateway \
+            expressways-orchestrator \
+            expressways-nanobot-system \
+            expressways-interop-bridge; do
+            cp "target/${{ matrix.target }}/release/${binary}${BINARY_SUFFIX}" "$STAGE_ROOT/bin/"
+          done
           cp "configs/expressways.example.toml" "$STAGE_ROOT/configs/"
           cp "scripts/expressways-service.sh" "$STAGE_ROOT/scripts/"
+          cp "scripts/expressways-service.ps1" "$STAGE_ROOT/scripts/"
           chmod +x "$STAGE_ROOT/scripts/expressways-service.sh"
           cp "LICENSE" "$STAGE_ROOT/LICENSE"
           cp "README.md" "$STAGE_ROOT/README.md"
@@ -107,24 +130,12 @@ jobs:
 
           (
             cd "$STAGE_ROOT"
+            mapfile -t payload_files < <(find bin configs scripts -type f | sort)
+            payload_files+=("LICENSE" "README.md" "release-notes.md")
             if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum \
-                "bin/expressways-server" \
-                "bin/expresswaysctl" \
-                "configs/expressways.example.toml" \
-                "scripts/expressways-service.sh" \
-                "LICENSE" \
-                "README.md" \
-                "release-notes.md" > checksums.txt
+              sha256sum "${payload_files[@]}" > checksums.txt
             else
-              shasum -a 256 \
-                "bin/expressways-server" \
-                "bin/expresswaysctl" \
-                "configs/expressways.example.toml" \
-                "scripts/expressways-service.sh" \
-                "LICENSE" \
-                "README.md" \
-                "release-notes.md" > checksums.txt
+              shasum -a 256 "${payload_files[@]}" > checksums.txt
             fi
           )
 

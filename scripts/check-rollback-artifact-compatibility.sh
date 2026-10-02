@@ -6,15 +6,23 @@ if [[ $# -lt 1 ]]; then
   exit 1
 fi
 
-REQUIRED_SUFFIXES=(
-  "/bin/expressways-server"
-  "/bin/expresswaysctl"
+REQUIRED_COMMON_SUFFIXES=(
   "/configs/expressways.example.toml"
   "/scripts/expressways-service.sh"
+  "/scripts/expressways-service.ps1"
   "/LICENSE"
   "/README.md"
   "/release-notes.md"
   "/checksums.txt"
+)
+
+REQUIRED_BINARIES=(
+  "expressways-server"
+  "expresswaysctl"
+  "expressways-http-gateway"
+  "expressways-orchestrator"
+  "expressways-nanobot-system"
+  "expressways-interop-bridge"
 )
 
 check_artifact() {
@@ -43,9 +51,17 @@ check_artifact() {
   fi
 
   local suffix
-  for suffix in "${REQUIRED_SUFFIXES[@]}"; do
+  for suffix in "${REQUIRED_COMMON_SUFFIXES[@]}"; do
     if ! echo "$listing" | grep -Eq ".+${suffix}$"; then
       echo "Missing required rollback path suffix ${suffix} in $artifact"
+      return 1
+    fi
+  done
+
+  local binary
+  for binary in "${REQUIRED_BINARIES[@]}"; do
+    if ! echo "$listing" | grep -Eq ".+/bin/${binary}(\.exe)?$"; then
+      echo "Missing required backbone binary ${binary} in $artifact"
       return 1
     fi
   done
