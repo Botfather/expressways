@@ -1105,7 +1105,7 @@ name = "expressways-auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "ed25519-dalek",
  "expressways-protocol",
@@ -1142,7 +1142,7 @@ name = "expressways-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "expressways-audit",
@@ -1166,7 +1166,7 @@ dependencies = [
 name = "expressways-console"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "expressways-client",
  "expressways-protocol",
  "libc",
@@ -1185,7 +1185,7 @@ name = "expressways-interop-bridge-example"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "expressways-client",
@@ -1251,7 +1251,7 @@ dependencies = [
 name = "expressways-protocol"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "serde",
  "serde_json",
@@ -1263,7 +1263,7 @@ name = "expressways-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "expressways-adopter-api",
