@@ -57,6 +57,9 @@ jobs:
       - name: Test Adapter Conformance
         run: bash scripts/test-adapter-conformance.sh
 
+      - name: Test Complete Local Backbone Profile
+        run: bash scripts/test-local-backbone-profile.sh
+
       - name: Test Packaged Service Lifecycle
         run: bash scripts/test-service-lifecycle.sh
 

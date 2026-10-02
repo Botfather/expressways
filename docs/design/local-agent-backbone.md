@@ -68,7 +68,13 @@ The supported adapter SDK provides durable monotonic cursor storage, determinist
 
 ### End-to-end deployment profile
 
-A single documented local profile must start the broker, orchestrator, one runtime, the HTTP gateway, and an example channel adapter; run a request through an LLM/tool-capable agent; deliver the correlated reply; restart components; and prove that acknowledged work is not lost or duplicated silently.
+`scripts/test-local-backbone-profile.sh` starts the broker, orchestrator, HTTP
+gateway, supported chat bridge, Nanobot interop worker, destination adapter,
+and a bounded OpenAI-compatible provider. It forces an actual guarded
+`read_file` tool call, verifies the correlated chat reply, accepts durable work
+while the worker is stopped, and restarts both the worker and bridge to prove
+queued work is recovered and acknowledged replies are not silently duplicated.
+Run it with `make test-local-backbone-profile`; CI runs the same profile.
 
 ## Scale boundary
 

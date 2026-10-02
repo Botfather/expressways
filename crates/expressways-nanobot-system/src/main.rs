@@ -22,7 +22,7 @@ use expressways_nanobot_system::runtime::{
 use expressways_nanobot_system::tools::publish_json;
 use expressways_protocol::{
     Classification, ControlCommand, ControlRequest, ControlResponse, INTEROP_CHAT_REPLIES_TOPIC,
-    INTEROP_CHAT_REQUESTS_TOPIC, RetentionClass, TASK_EVENTS_TOPIC,
+    INTEROP_CHAT_REQUESTS_TOPIC, INTEROP_CHAT_RESULTS_TOPIC, RetentionClass,
 };
 use reqwest::Client as HttpClient;
 use serde::Serialize;
@@ -123,7 +123,7 @@ enum Command {
         interop_worker: bool,
         #[arg(long, default_value = INTEROP_CHAT_REQUESTS_TOPIC)]
         tasks_topic: String,
-        #[arg(long, default_value = TASK_EVENTS_TOPIC)]
+        #[arg(long, default_value = INTEROP_CHAT_RESULTS_TOPIC)]
         task_events_topic: String,
         #[arg(long, default_value = INTEROP_CHAT_REPLIES_TOPIC)]
         replies_topic: String,

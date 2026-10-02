@@ -933,6 +933,13 @@ bridge can safely deduplicate retries after a crash:
 OPENAI_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-interop --state-dir ./var/agent/nanobot-interop --interop-worker --provider openai --provider-model gpt-4o-mini --workspace-root "$(pwd)" --allow-exec-program git
 ```
 
+Run the isolated complete profile—broker, orchestrator, HTTP API, chat bridge,
+LLM/tool agent, destination delivery, and restart recovery—with:
+
+```bash
+make test-local-backbone-profile
+```
+
 Nanobot file access and process execution are default-deny: at least one canonical `--workspace-root` is required for `read_file`, and `exec` accepts only exact program names supplied with `--allow-exec-program`. An empty executable allowlist disables `exec`. Subprocesses receive only a minimal `PATH`/locale environment, output capture is capped at 1 MiB per stream, and timed-out processes are terminated instead of continuing in the background.
 
 Run the runtime with native OpenAI provider:
