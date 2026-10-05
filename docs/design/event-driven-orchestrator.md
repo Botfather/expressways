@@ -62,7 +62,7 @@ Every event includes:
 
 ### Interop Topic Convention
 
-For OpenClaw and ZeroClaw bridge deployments, use:
+For chat bridge deployments, use:
 
 - `interop.chat.requests` for inbound handoff tasks,
 - `interop.chat.results` for intermediate worker results,
@@ -70,7 +70,7 @@ For OpenClaw and ZeroClaw bridge deployments, use:
 
 Canonical handoff payload shape is documented in:
 
-- [openclaw-zeroclaw-interop.md](openclaw-zeroclaw-interop.md)
+- [chat-interop.md](chat-interop.md)
 
 ## Components
 

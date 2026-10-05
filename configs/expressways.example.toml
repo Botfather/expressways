@@ -84,17 +84,17 @@ allowed_key_ids = ["dev"]
 quota_profile = "agent"
 
 [[auth.principals]]
-id = "local:bridge-openclaw"
+id = "local:bridge-ingress"
 kind = "service"
-display_name = "OpenClaw Bridge Ingress"
+display_name = "Interop Request Ingress Bridge"
 status = "active"
 allowed_key_ids = ["dev"]
 quota_profile = "bridge"
 
 [[auth.principals]]
-id = "local:bridge-zeroclaw"
+id = "local:interop-runtime"
 kind = "service"
-display_name = "ZeroClaw Bridge Runtime"
+display_name = "Interop Worker Runtime"
 status = "active"
 allowed_key_ids = ["dev"]
 quota_profile = "bridge"
@@ -214,22 +214,22 @@ resource = "registry:agents*"
 actions = ["admin"]
 
 [[policy.rules]]
-principal = "local:bridge-openclaw"
+principal = "local:bridge-ingress"
 resource = "topic:interop.chat.requests"
 actions = ["publish", "admin"]
 
 [[policy.rules]]
-principal = "local:bridge-openclaw"
+principal = "local:bridge-ingress"
 resource = "artifact:*"
 actions = ["publish", "consume"]
 
 [[policy.rules]]
-principal = "local:bridge-zeroclaw"
+principal = "local:interop-runtime"
 resource = "topic:interop.chat*"
 actions = ["publish", "consume", "admin"]
 
 [[policy.rules]]
-principal = "local:bridge-zeroclaw"
+principal = "local:interop-runtime"
 resource = "artifact:*"
 actions = ["publish", "consume"]
 

@@ -15,6 +15,8 @@ CONFIG_PATH="$CONFORMANCE_ROOT/expressways.toml"
 PRIVATE_KEY="$CONFORMANCE_ROOT/issuer.private"
 PUBLIC_KEY="$CONFORMANCE_ROOT/issuer.public"
 TOKEN_FILE="$CONFORMANCE_ROOT/developer.token"
+INGRESS_TOKEN_FILE="$CONFORMANCE_ROOT/bridge-ingress.token"
+EGRESS_TOKEN_FILE="$CONFORMANCE_ROOT/bridge-egress.token"
 BRIDGE_STATE="$CONFORMANCE_ROOT/bridge-state.json"
 MEDIA_FILE="$CONFORMANCE_ROOT/media.bin"
 EGRESS_RECORDS="$CONFORMANCE_ROOT/egress.jsonl"
@@ -101,6 +103,8 @@ sed \
   -e "s|path = \"./var/registry/agents.json\"|path = \"${CONFORMANCE_ROOT}/registry/agents.json\"|" \
   -e "s|revocation_path = \"./var/auth/revocations.json\"|revocation_path = \"${CONFORMANCE_ROOT}/auth/revocations.json\"|" \
   -e "s|public_key_path = \"./var/auth/issuer.public\"|public_key_path = \"${PUBLIC_KEY}\"|" \
+  -e 's|publish_requests_per_window = 50|publish_requests_per_window = 20|' \
+  -e '/name = "bridge"/,/^$/ s|backpressure_mode = "delay"|backpressure_mode = "reject"|' \
   configs/expressways.example.toml > "$CONFIG_PATH"
 
 target/debug/expresswaysctl issue-token \
@@ -114,6 +118,26 @@ target/debug/expresswaysctl issue-token \
   --scope 'artifact:*:publish,consume,admin' \
   --scope 'registry:agents*:admin' \
   --output "$TOKEN_FILE" >/dev/null
+
+target/debug/expresswaysctl issue-token \
+  --key-id dev \
+  --private-key "$PRIVATE_KEY" \
+  --principal local:bridge-ingress \
+  --audience expressways \
+  --expires-in-seconds 3600 \
+  --scope 'topic:interop.chat.requests:admin,publish' \
+  --scope 'artifact:*:publish,consume' \
+  --output "$INGRESS_TOKEN_FILE" >/dev/null
+
+target/debug/expresswaysctl issue-token \
+  --key-id dev \
+  --private-key "$PRIVATE_KEY" \
+  --principal local:bridge-egress \
+  --audience expressways \
+  --expires-in-seconds 3600 \
+  --scope 'topic:interop.chat.replies:admin,consume' \
+  --scope 'artifact:*:consume' \
+  --output "$EGRESS_TOKEN_FILE" >/dev/null
 
 ctl() {
   target/debug/expresswaysctl --transport tcp --address "$BROKER_ADDRESS" "$@"
@@ -147,7 +171,8 @@ start_bridge() {
     --transport tcp \
     --address "$BROKER_ADDRESS" \
     --listen "127.0.0.1:${BRIDGE_PORT}" \
-    --token-file "$TOKEN_FILE" \
+    --ingress-token-file "$INGRESS_TOKEN_FILE" \
+    --egress-token-file "$EGRESS_TOKEN_FILE" \
     --ingress-bearer "$INGRESS_BEARER" \
     --egress-url "$EGRESS_URL/v1/replies" \
     --egress-bearer "$EGRESS_BEARER" \
@@ -172,6 +197,15 @@ stop_bridge() {
 }
 
 start_bridge
+
+ingress_denial="$(ctl consume --token-file "$INGRESS_TOKEN_FILE" \
+  --topic interop.chat.replies --offset 0 --limit 1 2>&1)"
+grep -q 'access_denied' <<<"$ingress_denial" \
+  || fail_with_logs "ingress credential unexpectedly consumed the reply topic"
+egress_denial="$(ctl publish --token-file "$EGRESS_TOKEN_FILE" \
+  --topic interop.chat.requests --payload '{}' 2>&1)"
+grep -q 'access_denied' <<<"$egress_denial" \
+  || fail_with_logs "egress credential unexpectedly published to the request topic"
 
 unauthorized_status="$(curl -sS -o /dev/null -w '%{http_code}' \
   -X POST -H 'Content-Type: application/json' --data '{}' \
@@ -228,7 +262,7 @@ webhook_payload() {
     '{
       schema_version:"interop.chat.handoff.v1",
       idempotency_key:$key,
-      source_runtime:"pigeon",
+      source_runtime:"channel-adapter",
       session:{
         session_id:"conversation-1",
         channel:"whatsapp",
@@ -358,7 +392,7 @@ reply_payload() {
       delivery_id:$delivery_id,
       correlation_id:$correlation_id,
       source_runtime:"adapter-conformance-agent",
-      target_runtime:"pigeon",
+      target_runtime:"channel-adapter",
       session:{
         session_id:"conversation-1",
         channel:"whatsapp",
@@ -431,7 +465,7 @@ jq -e '.cursors["interop.chat.replies"] == 2' "$BRIDGE_STATE" >/dev/null \
 structured_payload="$(jq -cn '{
   schema_version:"interop.chat.handoff.v1",
   idempotency_key:"adapter-location-1",
-  source_runtime:"pigeon",
+  source_runtime:"channel-adapter",
   session:{
     session_id:"conversation-structured",
     channel:"whatsapp",

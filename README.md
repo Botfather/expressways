@@ -618,7 +618,7 @@ Start with:
 - [docs/design/phase-1-system-design.md](docs/design/phase-1-system-design.md)
 - [docs/design/http-gateway.md](docs/design/http-gateway.md)
 - [docs/design/security-compliance-baseline.md](docs/design/security-compliance-baseline.md)
-- [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md)
+- [docs/design/chat-interop.md](docs/design/chat-interop.md)
 - [docs/design/nanobot-parity-on-expressways.md](docs/design/nanobot-parity-on-expressways.md)
 - [docs/adr/0001-phase-1-scope.md](docs/adr/0001-phase-1-scope.md)
 
@@ -1096,7 +1096,7 @@ cargo run --release -p expressways-bench -- suite --spawn-server --server-bin ta
 
 ## Interop Deployment
 
-For OpenClaw and ZeroClaw on the same system, use Expressways as the audited coordination layer between runtime-specific ingress and egress services.
+Use Expressways as the audited coordination layer between channel ingress, worker runtimes, and reply egress services.
 
 Use this convention:
 
@@ -1108,25 +1108,25 @@ Use this convention:
 
 Full interop contract:
 
-- [docs/design/openclaw-zeroclaw-interop.md](docs/design/openclaw-zeroclaw-interop.md)
+- [docs/design/chat-interop.md](docs/design/chat-interop.md)
 
 Issue bridge tokens:
 
 ```bash
-cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-openclaw --audience expressways --scope system:broker:health --scope 'topic:interop.chat.requests:admin,publish' --scope 'topic:interop.chat.replies:admin,consume' --scope 'artifact:*:publish,consume' --output ./var/auth/bridge-openclaw.token
-cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-zeroclaw --audience expressways --scope system:broker:health --scope 'topic:interop.chat*:admin,publish,consume' --scope 'artifact:*:publish,consume' --output ./var/auth/bridge-zeroclaw.token
+cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-ingress --audience expressways --scope 'topic:interop.chat.requests:admin,publish' --scope 'artifact:*:publish,consume' --output ./var/auth/bridge-ingress.token
+cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:interop-runtime --audience expressways --scope 'topic:interop.chat*:admin,publish,consume' --scope 'artifact:*:publish,consume' --output ./var/auth/interop-runtime.token
 cargo run -p expressways-client --bin expresswaysctl -- issue-token --key-id dev --private-key ./var/auth/issuer.private --principal local:bridge-egress --audience expressways --scope system:broker:health --scope 'topic:interop.chat.replies:admin,consume' --scope 'artifact:*:consume' --output ./var/auth/bridge-egress.token
 ```
 
 Run the webhook ingress bridge:
 
 ```bash
-cargo run -p expressways-interop-bridge -- --transport tcp --address 127.0.0.1:7766 --listen 127.0.0.1:8891 --token-file ./var/auth/bridge-openclaw.token --ingress-bearer-file ./var/auth/bridge-ingress.secret --egress-url https://pigeon.example/v1/expressways/replies --egress-bearer-file ./var/auth/pigeon-egress.token --state-path ./var/agent/interop-bridge-state.json --tasks-topic interop.chat.requests --task-type interop.chat.handoff --default-skill chat.reply
+cargo run -p expressways-interop-bridge -- --transport tcp --address 127.0.0.1:7766 --listen 127.0.0.1:8891 --ingress-token-file ./var/auth/bridge-ingress.token --egress-token-file ./var/auth/bridge-egress.token --ingress-bearer-file ./var/auth/bridge-ingress.secret --egress-url https://channel.example/v1/expressways/replies --egress-bearer-file ./var/auth/channel-egress.token --state-path ./var/agent/interop-bridge-state.json --tasks-topic interop.chat.requests --task-type interop.chat.handoff --default-skill chat.reply
 ```
 
-Non-loopback bridge listeners require an ingress bearer. Prefer secret files so credentials are not exposed in process arguments. JSON webhooks default to 1 MiB, while the separate raw artifact endpoint accepts up to 64 MiB without base64 inflation. Identical named artifact retries return the existing immutable artifact, and authenticated `GET /v1/artifacts/{id}` reads let reply adapters resolve media through the bridge without a second HTTP service. Messages can also carry bounded structured locations, contacts, polls, edits, deletes, and protocol events when no text or attachment exists. The request reader caps headers at 64 KiB, rejects overflowing lengths, and grows storage only as bytes arrive. Versioned webhook records accept additive unknown fields while continuing to bound and validate known identifiers, metadata, attachments, routing, retry policy, and integrity claims. Durable egress persists its reply cursor and advances it only after a 2xx acknowledgement. See the [supported chat interoperability contract](docs/design/openclaw-zeroclaw-interop.md) for idempotency, affinity ordering, media upload, and reply semantics.
+Non-loopback bridge listeners require an ingress bearer. The ingress and egress broker credentials are separate so each principal receives only the permissions its direction needs. Prefer secret files so credentials are not exposed in process arguments. JSON webhooks default to 1 MiB, while the separate raw artifact endpoint accepts up to 64 MiB without base64 inflation. Identical named artifact retries return the existing immutable artifact, and authenticated `GET /v1/artifacts/{id}` reads let reply adapters resolve media through the bridge without a second HTTP service. Messages can also carry bounded structured locations, contacts, polls, edits, deletes, and protocol events when no text or attachment exists. The request reader caps headers at 64 KiB, rejects overflowing lengths, and grows storage only as bytes arrive. Versioned webhook records accept additive unknown fields while continuing to bound and validate known identifiers, metadata, attachments, routing, retry policy, and integrity claims. Durable egress persists its reply cursor and advances it only after a 2xx acknowledgement. See the [supported chat interoperability contract](docs/design/chat-interop.md) for idempotency, affinity ordering, media upload, and reply semantics.
 
-Submit a sample OpenClaw-style handoff:
+Submit a sample channel handoff:
 
 ```bash
 curl -X POST http://127.0.0.1:8891/v1/webhook/handoff \
@@ -1134,9 +1134,9 @@ curl -X POST http://127.0.0.1:8891/v1/webhook/handoff \
   -H 'Content-Type: application/json' \
   -d '{
     "schema_version": "interop.chat.handoff.v1",
-    "idempotency_key": "openclaw-whatsapp-message-1001",
-    "source_runtime": "openclaw",
-    "target_runtime": "zeroclaw",
+    "idempotency_key": "channel-message-1001",
+    "source_runtime": "channel-adapter",
+    "target_runtime": "worker-runtime",
     "session": {
       "session_id": "chat-42",
       "channel": "whatsapp",
@@ -1342,7 +1342,7 @@ Controls:
 - trusted issuers,
 - principal definitions.
 
-The sample config includes bridge principals (`local:bridge-openclaw`, `local:bridge-zeroclaw`, `local:bridge-egress`, and `local:nanobot-bridge`) plus a dedicated runtime principal (`local:nanobot-runtime`) so OpenClaw, ZeroClaw, and Nanobot-style adapters can run with least-privilege service identities.
+The sample config includes role-based interop principals (`local:bridge-ingress`, `local:interop-runtime`, and `local:bridge-egress`) plus the dedicated principals used by the optional Nanobot-compatible subsystem. Each service can therefore run with a least-privilege identity.
 
 ### `[quotas]`
 

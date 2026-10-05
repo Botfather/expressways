@@ -107,7 +107,9 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     egress_batch_size: usize,
     #[command(flatten)]
-    token: TokenArgs,
+    ingress_token: IngressTokenArgs,
+    #[command(flatten)]
+    egress_token: EgressTokenArgs,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -117,17 +119,26 @@ enum TransportKind {
 }
 
 #[derive(Debug, Args, Clone)]
-struct TokenArgs {
-    #[arg(long, conflicts_with = "token_file")]
-    token: Option<String>,
+struct IngressTokenArgs {
+    #[arg(long, conflicts_with = "ingress_token_file")]
+    ingress_token: Option<String>,
     #[arg(long)]
-    token_file: Option<PathBuf>,
+    ingress_token_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct EgressTokenArgs {
+    #[arg(long, conflicts_with = "egress_token_file")]
+    egress_token: Option<String>,
+    #[arg(long)]
+    egress_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 struct BridgeRuntime {
     endpoint: Endpoint,
-    capability_token: String,
+    ingress_capability_token: String,
+    egress_capability_token: Option<String>,
     listen: String,
     webhook_path: String,
     artifact_path: String,
@@ -364,9 +375,15 @@ async fn main() -> anyhow::Result<()> {
             )
         })?;
     }
+    let ingress_capability_token = resolve_ingress_token(cli.ingress_token)?;
+    let egress_capability_token = resolve_egress_token(cli.egress_token)?;
+    if cli.egress_url.is_some() && egress_capability_token.is_none() {
+        bail!("egress_token or egress_token_file is required when egress_url is configured");
+    }
     let runtime = BridgeRuntime {
         endpoint: endpoint_from_cli(cli.transport, cli.address, cli.socket)?,
-        capability_token: resolve_token(cli.token)?,
+        ingress_capability_token,
+        egress_capability_token,
         listen: cli.listen,
         webhook_path: cli.webhook_path,
         artifact_path: cli.artifact_path,
@@ -621,7 +638,7 @@ async fn submit_webhook(
 
     ensure_topic(
         &mut client,
-        &runtime.capability_token,
+        &runtime.ingress_capability_token,
         &runtime.tasks_topic,
         runtime.topic_retention_class.clone(),
         runtime.topic_classification.clone(),
@@ -639,7 +656,7 @@ async fn submit_webhook(
 
     let (attachments, uploaded_artifacts) = materialize_attachments(
         &mut client,
-        &runtime.capability_token,
+        &runtime.ingress_capability_token,
         &webhook.message.attachments,
         classification.clone(),
         artifact_retention,
@@ -745,7 +762,7 @@ async fn submit_webhook(
 
     let publish_response = client
         .send(ControlRequest {
-            capability_token: runtime.capability_token.clone(),
+            capability_token: runtime.ingress_capability_token.clone(),
             command: ControlCommand::Publish {
                 topic: runtime.tasks_topic.clone(),
                 classification: Some(classification),
@@ -1176,7 +1193,7 @@ async fn upload_artifact(
     let (response, attachment) = client
         .send_with_attachment(
             ControlRequest {
-                capability_token: runtime.capability_token,
+                capability_token: runtime.ingress_capability_token,
                 command: ControlCommand::PutArtifact {
                     artifact_id,
                     content_type,
@@ -1222,7 +1239,7 @@ async fn download_artifact(
     let (response, bytes) = client
         .send_with_attachment(
             ControlRequest {
-                capability_token: runtime.capability_token,
+                capability_token: runtime.ingress_capability_token,
                 command: ControlCommand::GetArtifact {
                     artifact_id: artifact_id.to_owned(),
                 },
@@ -1311,12 +1328,16 @@ async fn deliver_reply_batch(
     egress_url: &str,
     state: &mut CursorStore,
 ) -> anyhow::Result<usize> {
+    let egress_capability_token = runtime
+        .egress_capability_token
+        .as_deref()
+        .context("egress broker capability token is not configured")?;
     let mut client = Client::connect(runtime.endpoint.clone())
         .await
         .context("connect to broker for reply egress")?;
     ensure_topic(
         &mut client,
-        &runtime.capability_token,
+        egress_capability_token,
         &runtime.replies_topic,
         runtime.topic_retention_class.clone(),
         runtime.topic_classification.clone(),
@@ -1325,7 +1346,7 @@ async fn deliver_reply_batch(
     .map_err(|error| anyhow::anyhow!(error.message))?;
     let response = client
         .send(ControlRequest {
-            capability_token: runtime.capability_token.clone(),
+            capability_token: egress_capability_token.to_owned(),
             command: ControlCommand::Consume {
                 topic: runtime.replies_topic.clone(),
                 offset: state.next_offset(&runtime.replies_topic)?,
@@ -1828,15 +1849,26 @@ fn endpoint_from_cli(
     }
 }
 
-fn resolve_token(args: TokenArgs) -> anyhow::Result<String> {
-    if let Some(token) = args.token {
+fn resolve_ingress_token(args: IngressTokenArgs) -> anyhow::Result<String> {
+    if let Some(token) = args.ingress_token {
         return expressways_client::normalize_capability_token(&token);
     }
-    if let Some(path) = args.token_file {
+    if let Some(path) = args.ingress_token_file {
         return expressways_client::read_capability_token_file(&path);
     }
 
-    bail!("a capability token is required via --token or --token-file")
+    bail!("an ingress capability token is required via --ingress-token or --ingress-token-file")
+}
+
+fn resolve_egress_token(args: EgressTokenArgs) -> anyhow::Result<Option<String>> {
+    if let Some(token) = args.egress_token {
+        return expressways_client::normalize_capability_token(&token).map(Some);
+    }
+    if let Some(path) = args.egress_token_file {
+        return expressways_client::read_capability_token_file(&path).map(Some);
+    }
+
+    Ok(None)
 }
 
 fn resolve_optional_secret(
@@ -1877,7 +1909,7 @@ mod tests {
 
     #[test]
     fn parse_request_target_discards_query() {
-        let parsed = split_request_target("/v1/webhook/handoff?source=openclaw");
+        let parsed = split_request_target("/v1/webhook/handoff?source=channel-adapter");
         assert_eq!(parsed, "/v1/webhook/handoff");
     }
 
@@ -1941,8 +1973,8 @@ mod tests {
     fn webhook_schema_and_fanout_are_strictly_bounded() {
         let raw = serde_json::json!({
             "schema_version": INTEROP_CHAT_HANDOFF_SCHEMA_VERSION,
-            "idempotency_key": "pigeon-message-1",
-            "source_runtime": "openclaw",
+            "idempotency_key": "channel-message-1",
+            "source_runtime": "channel-adapter",
             "session": {
                 "session_id": "session-1",
                 "channel": "chat",
@@ -1957,8 +1989,8 @@ mod tests {
 
         let content_only = serde_json::json!({
             "schema_version": INTEROP_CHAT_HANDOFF_SCHEMA_VERSION,
-            "idempotency_key": "pigeon-location-1",
-            "source_runtime": "pigeon",
+            "idempotency_key": "channel-location-1",
+            "source_runtime": "channel-adapter",
             "session": {
                 "session_id": "session-1",
                 "channel": "whatsapp",
@@ -2025,12 +2057,12 @@ mod tests {
     #[test]
     fn identifiers_are_deterministic_and_an_identity_is_required() {
         assert_eq!(
-            deterministic_task_id("pigeon-message-1"),
-            deterministic_task_id("pigeon-message-1")
+            deterministic_task_id("channel-message-1"),
+            deterministic_task_id("channel-message-1")
         );
         let raw = serde_json::json!({
             "schema_version": INTEROP_CHAT_HANDOFF_SCHEMA_VERSION,
-            "source_runtime": "pigeon",
+            "source_runtime": "channel-adapter",
             "session": {
                 "session_id": "session-1",
                 "channel": "whatsapp",
@@ -2050,7 +2082,7 @@ mod tests {
             delivery_id: "delivery-1".to_owned(),
             correlation_id: "correlation-1".to_owned(),
             source_runtime: "agent".to_owned(),
-            target_runtime: "pigeon".to_owned(),
+            target_runtime: "channel-adapter".to_owned(),
             session: InteropChatSession {
                 session_id: "session-1".to_owned(),
                 channel: "whatsapp".to_owned(),

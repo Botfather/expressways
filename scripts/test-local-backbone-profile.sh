@@ -158,7 +158,8 @@ curl -fsS -H "Authorization: Bearer ${CAPABILITY_TOKEN}" "$GATEWAY_URL/v1/health
 start_bridge() {
   target/debug/expressways-interop-bridge \
     --transport tcp --address "$BROKER_ADDRESS" --listen "127.0.0.1:${BRIDGE_PORT}" \
-    --token-file "$TOKEN_FILE" --ingress-bearer "$INGRESS_BEARER" \
+    --ingress-token-file "$TOKEN_FILE" --egress-token-file "$TOKEN_FILE" \
+    --ingress-bearer "$INGRESS_BEARER" \
     --egress-url "$EGRESS_URL/v1/replies" --egress-bearer "$EGRESS_BEARER" \
     --state-path "$BRIDGE_STATE" --egress-poll-interval-ms 50 \
     >>"$PROFILE_ROOT/bridge.log" 2>&1 &
@@ -201,7 +202,7 @@ post_message() {
   jq -cn --arg id "$id" '{
     schema_version:"interop.chat.handoff.v1",
     idempotency_key:$id,
-    source_runtime:"pigeon",
+    source_runtime:"channel-adapter",
     session:{session_id:"backbone-chat",channel:"whatsapp",account_id:"local",sender_id:"user",message_id:$id},
     message:{text:"Read the proof file and report the result.",attachments:[]},
     skill:"interop-chat"

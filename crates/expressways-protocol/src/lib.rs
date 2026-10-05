@@ -1318,7 +1318,7 @@ mod tests {
             schema_version: INTEROP_CHAT_HANDOFF_SCHEMA_VERSION.to_owned(),
             correlation_id: "corr-1".to_owned(),
             reply_topic: INTEROP_CHAT_REPLIES_TOPIC.to_owned(),
-            source_runtime: "pigeon".to_owned(),
+            source_runtime: "channel-adapter".to_owned(),
             target_runtime: Some("nanobot".to_owned()),
             session: InteropChatSession {
                 session_id: "chat-1".to_owned(),

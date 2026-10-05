@@ -2,7 +2,7 @@
 
 ## Status
 
-The `expressways-interop-bridge` binary is the supported, versioned integration path for channel owners such as Pigeon, OpenClaw, and ZeroClaw. It provides authenticated ingress, broker-managed media upload, ordered task handoff, and durable at-least-once reply delivery.
+The `expressways-interop-bridge` binary is the supported, versioned integration path for channel adapters and worker runtimes. It provides authenticated ingress, broker-managed media upload, ordered task handoff, and durable at-least-once reply delivery.
 
 ## Topics and Versions
 
@@ -24,12 +24,15 @@ Durable two-way mode is the normal operating mode:
 
 ```bash
 cargo run -p expressways-interop-bridge -- \
-  --token-file ./var/auth/developer.token \
+  --ingress-token-file ./var/auth/bridge-ingress.token \
+  --egress-token-file ./var/auth/bridge-egress.token \
   --ingress-bearer-file ./var/auth/interop-ingress.token \
-  --egress-url https://pigeon.example/v1/expressways/replies \
-  --egress-bearer-file ./var/auth/pigeon-egress.token \
+  --egress-url https://channel.example/v1/expressways/replies \
+  --egress-bearer-file ./var/auth/channel-egress.token \
   --state-path ./var/agent/interop-bridge-state.json
 ```
+
+The ingress credential needs only request-topic publish/admin and artifact publish/consume permissions. The egress credential needs only reply-topic consume/admin and artifact consume permissions. The bridge refuses to start durable egress without the second credential.
 
 The bridge consumes replies from its persisted offset. It advances that offset only after the channel endpoint returns a 2xx response and the new cursor is atomically synced to disk. Failures are retried without advancing the cursor, so delivery is at least once. The receiving channel must deduplicate the `Idempotency-Key` header or the reply envelope's `delivery_id`.
 
@@ -63,7 +66,7 @@ curl --fail-with-body \
   --request POST \
   --header "Authorization: Bearer $INGRESS_BEARER" \
   --header "Content-Type: application/pdf" \
-  --header "X-Artifact-Id: pigeon-message-123-document" \
+  --header "X-Artifact-Id: channel-message-123-document" \
   --header "X-Content-Sha256: $SHA256" \
   --data-binary @document.pdf \
   http://127.0.0.1:8891/v1/artifacts

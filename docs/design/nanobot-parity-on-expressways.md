@@ -128,7 +128,7 @@ Primary advantages:
 
 1. Security and governance are stronger than ad-hoc local buses because identity, policy, quota, and audit are enforced by the broker before each operation.
 2. Operations are clearer because runtime behavior is visible in broker metrics, topic state, registry heartbeats, and audit logs.
-3. Multi-runtime coexistence is easier because OpenClaw/ZeroClaw/Nanobot-style adapters can share one governed coordination substrate.
+3. Multi-runtime coexistence is easier because channel adapters and worker runtimes can share one governed coordination substrate.
 4. Failure handling is safer because Expressways degraded-mode and retention controls reduce silent data loss patterns in local prototypes.
 
 Tradeoffs:

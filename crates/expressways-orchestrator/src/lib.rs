@@ -1831,9 +1831,9 @@ mod tests {
         let beta = card("beta", "summarize");
         apply_snapshot(&mut state, vec![alpha.clone(), beta], 4);
         let mut first = task("task-1", "summarize", 3);
-        first.requirements.affinity_key = Some("pigeon:chat-1".to_owned());
+        first.requirements.affinity_key = Some("channel:chat-1".to_owned());
         let mut second = task("task-2", "summarize", 3);
-        second.requirements.affinity_key = Some("pigeon:chat-1".to_owned());
+        second.requirements.affinity_key = Some("channel:chat-1".to_owned());
         assert!(ingest_task(&mut state, first, 0));
         assert!(ingest_task(&mut state, second, 1));
 
@@ -1898,9 +1898,9 @@ mod tests {
         let alpha = card("alpha", "summarize");
         apply_snapshot(&mut state, vec![alpha.clone()], 1);
         let mut first = task("task-1", "summarize", 3);
-        first.requirements.affinity_key = Some("pigeon:chat-1".to_owned());
+        first.requirements.affinity_key = Some("channel:chat-1".to_owned());
         let mut second = task("task-2", "summarize", 3);
-        second.requirements.affinity_key = Some("pigeon:chat-1".to_owned());
+        second.requirements.affinity_key = Some("channel:chat-1".to_owned());
         assert!(ingest_task(&mut state, first, 0));
         assert!(ingest_task(&mut state, second, 1));
         let assignment =
