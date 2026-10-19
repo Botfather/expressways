@@ -3,5 +3,7 @@ set -euo pipefail
 
 trap 'exit 0' TERM INT
 while true; do
-  sleep 1
+  # Wait on a background sleep so TERM runs the trap at once, like the real binaries.
+  sleep 1 &
+  wait $!
 done
