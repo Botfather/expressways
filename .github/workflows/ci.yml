@@ -166,7 +166,7 @@ jobs:
 
       - name: Upload Config Rollback Reliability Evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: config-rollback-reliability-${{ github.run_id }}
           path: |
@@ -204,7 +204,7 @@ jobs:
 
       - name: Upload Reliability and Denial Rehearsal Evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reliability-denials-rehearsal-${{ github.run_id }}
           path: |
@@ -240,7 +240,7 @@ jobs:
 
       - name: Upload M3 Live Rehearsal Evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: m3-live-rehearsal-suite-${{ github.run_id }}
           path: |
@@ -281,7 +281,7 @@ jobs:
 
       - name: Upload DR Restore Rehearsal Evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dr-restore-clean-env-${{ github.run_id }}
           path: |
@@ -317,7 +317,7 @@ jobs:
 
       - name: Upload Key Rotation Rehearsal Evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: key-rotation-rehearsal-${{ github.run_id }}
           path: |
