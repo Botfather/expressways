@@ -435,6 +435,10 @@ jq -s -e '
   and (.[0].idempotency_key == "delivery-1" and .[1].idempotency_key == "delivery-1")
   and all(.[]; .authorization == "Bearer adapter-egress-conformance")
 ' "$EGRESS_RECORDS" >/dev/null || fail_with_logs "egress retry or authentication contract was invalid"
+for _ in $(seq 1 100); do
+  jq -e '.cursors["interop.chat.replies"] == 1' "$BRIDGE_STATE" >/dev/null 2>&1 && break
+  sleep 0.1
+done
 jq -e '.cursors["interop.chat.replies"] == 1' "$BRIDGE_STATE" >/dev/null \
   || fail_with_logs "durable reply cursor did not advance after acknowledgement"
 
@@ -459,6 +463,10 @@ for _ in $(seq 1 100); do
 done
 [[ "$(curl -fsS "$EGRESS_URL/health" | jq -r '.attempts')" == "3" ]] \
   || fail_with_logs "reply queued during downtime was not delivered once after restart"
+for _ in $(seq 1 100); do
+  jq -e '.cursors["interop.chat.replies"] == 2' "$BRIDGE_STATE" >/dev/null 2>&1 && break
+  sleep 0.1
+done
 jq -e '.cursors["interop.chat.replies"] == 2' "$BRIDGE_STATE" >/dev/null \
   || fail_with_logs "restart recovery did not persist the second reply cursor"
 
