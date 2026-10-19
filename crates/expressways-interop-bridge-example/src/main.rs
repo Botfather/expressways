@@ -953,11 +953,11 @@ fn validate_webhook(webhook: &BridgeWebhookRequest) -> Result<(), HttpError> {
         )));
     }
 
-    if !webhook
+    if webhook
         .message
         .text
         .as_ref()
-        .is_some_and(|text| !text.trim().is_empty())
+        .is_none_or(|text| text.trim().is_empty())
         && webhook.message.attachments.is_empty()
         && webhook.message.content.is_empty()
     {
