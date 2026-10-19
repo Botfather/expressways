@@ -27,7 +27,9 @@ function ConvertTo-XmlText([string]$Value) {
 function New-TaskXml {
     $EscapedScript = ConvertTo-XmlText $LifecycleScript
     $EscapedRoot = ConvertTo-XmlText $Root
-    $UserId = ConvertTo-XmlText ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    # Windows PowerShell 5.1 has no $IsWindows, so only pwsh on Linux or macOS (where render is a preview) skips WindowsIdentity.
+    $UserName = if ($IsWindows -eq $false) { [Environment]::UserName } else { [System.Security.Principal.WindowsIdentity]::GetCurrent().Name }
+    $UserId = ConvertTo-XmlText $UserName
     return @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
