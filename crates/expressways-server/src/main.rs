@@ -1104,9 +1104,12 @@ where
         }
         .encode_with_attachment(None)?;
     }
-    tokio::time::timeout(send_timeout, framed.send(packet.into()))
-        .await
-        .context("timed out sending response frame")??;
+    tokio::time::timeout(
+        send_timeout,
+        framed.send(tokio_util::bytes::Bytes::from(packet)),
+    )
+    .await
+    .context("timed out sending response frame")??;
     Ok(())
 }
 
@@ -1123,10 +1126,13 @@ where
     }
     .encode_with_attachment(None)
     .map_err(StreamSendError::from)?;
-    tokio::time::timeout(send_timeout, framed.send(serialized.into()))
-        .await
-        .map_err(|_| StreamSendError::TimedOut)?
-        .map_err(|error| StreamSendError::Failed(error.into()))?;
+    tokio::time::timeout(
+        send_timeout,
+        framed.send(tokio_util::bytes::Bytes::from(serialized)),
+    )
+    .await
+    .map_err(|_| StreamSendError::TimedOut)?
+    .map_err(|error| StreamSendError::Failed(error.into()))?;
     Ok(())
 }
 
@@ -3768,7 +3774,10 @@ mod tests {
         let mut client = Framed::new(client_stream, LengthDelimitedCodec::new());
 
         client
-            .send(vec![0u8; MIN_FRAME_BYTES + 1].into())
+            .send(tokio_util::bytes::Bytes::from(vec![
+                0u8;
+                MIN_FRAME_BYTES + 1
+            ]))
             .await
             .expect("send oversized frame");
         drop(client);
@@ -3998,7 +4007,7 @@ mod tests {
         .encode_with_attachment(None)
         .expect("encode request packet");
         client
-            .send(packet.into())
+            .send(tokio_util::bytes::Bytes::from(packet))
             .await
             .expect("send request packet");
     }

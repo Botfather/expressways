@@ -1475,7 +1475,9 @@ where
         attachment_length: 0,
     }
     .encode_with_attachment(attachment.as_deref())?;
-    transport.send(payload.into()).await?;
+    transport
+        .send(tokio_util::bytes::Bytes::from(payload))
+        .await?;
 
     let frame = transport
         .next()
@@ -1505,7 +1507,9 @@ where
         attachment_length: 0,
     }
     .encode_with_attachment(None)?;
-    transport.send(payload.into()).await?;
+    transport
+        .send(tokio_util::bytes::Bytes::from(payload))
+        .await?;
 
     let frame = transport
         .next()
