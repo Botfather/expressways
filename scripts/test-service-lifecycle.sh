@@ -65,11 +65,13 @@ PID_DIR="$FIXTURE_ROOT/var/agent/service-control" \
 SUPERVISOR_PID=$!
 
 SERVER_PID_FILE="$FIXTURE_ROOT/var/agent/service-control/expressways-server.pid"
-for _ in $(seq 1 50); do
-  [[ -s "$SERVER_PID_FILE" ]] && break
+# Wait for the whole stack: killing the broker inside start_service's stay-up check stops the supervisor.
+STACK_STARTED="Service nanobot-runtime started"
+for _ in $(seq 1 100); do
+  grep -Fq "$STACK_STARTED" "$FIXTURE_ROOT/supervisor.log" && break
   sleep 0.1
 done
-[[ -s "$SERVER_PID_FILE" ]] || { cat "$FIXTURE_ROOT/supervisor.log"; exit 1; }
+grep -Fq "$STACK_STARTED" "$FIXTURE_ROOT/supervisor.log" || { cat "$FIXTURE_ROOT/supervisor.log"; exit 1; }
 ORIGINAL_SERVER_PID="$(cat "$SERVER_PID_FILE")"
 kill "$ORIGINAL_SERVER_PID"
 for _ in $(seq 1 50); do

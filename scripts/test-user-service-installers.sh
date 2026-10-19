@@ -30,10 +30,18 @@ grep -Fq 'WantedBy=default.target' "$LINUX_UNIT"
 
 if command -v pwsh >/dev/null 2>&1; then
   pwsh -NoProfile -NonInteractive -File scripts/install-user-service.ps1 render "$WINDOWS_XML" >/dev/null
-  grep -Fq '<LogonTrigger>' "$WINDOWS_XML"
-  grep -Fq '<RunLevel>LeastPrivilege</RunLevel>' "$WINDOWS_XML"
-  grep -Fq 'expressways-service.ps1&quot; supervise' "$WINDOWS_XML"
-  grep -Fq '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>' "$WINDOWS_XML"
+  # The task XML is UTF-16, which GNU grep cannot match as text.
+  WINDOWS_XML_TEXT="$(iconv -f UTF-16 -t UTF-8 "$WINDOWS_XML")"
+  for expected in \
+    '<LogonTrigger>' \
+    '<RunLevel>LeastPrivilege</RunLevel>' \
+    'expressways-service.ps1&quot; supervise' \
+    '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'; do
+    grep -Fq "$expected" <<<"$WINDOWS_XML_TEXT" || {
+      printf 'Windows task definition is missing: %s\n--- rendered ---\n%s\n' "$expected" "$WINDOWS_XML_TEXT" >&2
+      exit 1
+    }
+  done
 fi
 
 printf 'Per-user service definitions passed: macOS LaunchAgent, Linux systemd user unit, and available Windows rendering checks.\n'
