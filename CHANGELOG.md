@@ -19,6 +19,9 @@ All notable user-visible changes will be documented here. The format follows [Ke
 - A shared adapter SDK for monotonic durable cursors, deterministic replay identities, and verified raw artifact transfer.
 - A live adapter conformance suite covering authentication, replay, affinity ordering, raw media, backpressure, destination retry, and restart recovery.
 - A corrected heavy-media configuration contract with 64 MiB publish quotas and bounded frame headroom for artifact envelopes.
+- Nanobot runtime model providers `--provider gemini` (Google Gemini `generateContent` API, key from `--provider-api-key` or `GEMINI_API_KEY`) and `--provider openai-compatible` (local or self-hosted OpenAI-compatible servers such as Ollama, LM Studio and vLLM; requires `--provider-base-url` and `--provider-model`, optional key from `--provider-api-key` or `OPENAI_COMPATIBLE_API_KEY`), both with streaming support.
+- A `probe-provider` nanobot command that sends one test prompt with the `--provider*` flags and exits with a distinct code per failure kind (authentication failed, host unreachable, model not found, rate limited, timeout, and others).
+- Classified provider failures: `provider_error` logs and runtime events now carry an `error_kind` field, and failover events carry `from_error_kind`/`to_error_kind`.
 
 ### Security
 
@@ -27,6 +30,7 @@ All notable user-visible changes will be documented here. The format follows [Ke
 
 ### Changed
 
+- The nanobot runtime now rejects a `--provider-base-url` or `--fallback-provider-base-url` that is not an `http://` or `https://` URL with a host.
 - Storage serialization now uses bincode 2's bounded legacy configuration to preserve the existing alpha segment representation while preventing unbounded decoder input.
 
 ## [0.1.0] - Unreleased

@@ -94,6 +94,24 @@ Use Anthropic as external model provider:
 ANTHROPIC_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider anthropic --provider-model claude-3-5-sonnet-latest
 ```
 
+Use Google Gemini as external model provider:
+
+```bash
+GEMINI_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider gemini --provider-model gemini-2.5-flash
+```
+
+Use a local or self-hosted OpenAI-compatible server (Ollama, LM Studio, vLLM); the key is optional and read from `OPENAI_COMPATIBLE_API_KEY`:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai-compatible --provider-base-url http://127.0.0.1:11434 --provider-model llama3.2
+```
+
+Check a provider configuration before starting the runtime with `probe-provider` (same `--provider*` flags; exit codes per failure kind are listed in the README):
+
+```bash
+cargo run -p expressways-nanobot-system -- probe-provider --provider openai-compatible --provider-base-url http://127.0.0.1:11434 --provider-model llama3.2
+```
+
 These integrations call provider APIs directly (no external model gateway required). Prefer the provider environment variables over command-line key arguments so credentials do not appear in process listings.
 
 Ingress test message:

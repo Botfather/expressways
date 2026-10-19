@@ -984,7 +984,7 @@ Run the runtime with native OpenAI provider:
 OPENAI_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-max-attempts 3 --provider-base-backoff-ms 200 --provider-max-backoff-ms 2000 --provider-jitter-ms 75 --provider-circuit-failure-threshold 3 --provider-circuit-cooldown-seconds 30 --workspace-root "$(pwd)" --allow-exec-program git --allow-exec-program ls
 ```
 
-Enable provider text streaming into `nanobot.outbound.stream` (OpenAI or Anthropic):
+Enable provider text streaming into `nanobot.outbound.stream` (any external provider):
 
 ```bash
 OPENAI_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai --provider-model gpt-4o-mini --provider-streaming true
@@ -997,8 +997,51 @@ Run the runtime with native Anthropic provider:
 ANTHROPIC_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider anthropic --provider-model claude-3-5-sonnet-latest --workspace-root "$(pwd)" --allow-exec-program git --allow-exec-program ls
 ```
 
-`--provider-api-key` falls back to `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for matching providers.
+Run the runtime with Google Gemini (native `generateContent` API; the key is sent in the `x-goog-api-key` header):
+
+```bash
+GEMINI_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider gemini --provider-model gemini-2.5-flash --workspace-root "$(pwd)" --allow-exec-program git
+```
+
+Run the runtime against a local or self-hosted OpenAI-compatible server (Ollama, LM Studio, vLLM). `--provider-base-url` (scheme, host and port; `/v1` is appended when missing) and `--provider-model` are required; the API key is optional:
+
+```bash
+cargo run -p expressways-nanobot-system -- --transport tcp --address 127.0.0.1:7766 run-runtime --token-file ./var/auth/developer.token --agent-id nanobot-runtime --state-dir ./var/agent/nanobot-runtime --provider openai-compatible --provider-base-url http://127.0.0.1:11434 --provider-model llama3.2 --workspace-root "$(pwd)" --allow-exec-program git
+```
+
+| `--provider` | API key (`--provider-api-key` falls back to) | Default `--provider-model` | Default `--provider-base-url` |
+| --- | --- | --- | --- |
+| `rule-based` | none | none | none |
+| `openai` | `OPENAI_API_KEY` (required) | `gpt-4o-mini` | `https://api.openai.com/v1` |
+| `anthropic` | `ANTHROPIC_API_KEY` (required) | `claude-3-5-sonnet-latest` | `https://api.anthropic.com` |
+| `gemini` | `GEMINI_API_KEY` (required) | `gemini-flash-latest` | `https://generativelanguage.googleapis.com/v1beta` |
+| `openai-compatible` | `OPENAI_COMPATIBLE_API_KEY` (optional) | required | required |
+
+The model must support tool/function calling. `openai-compatible` never reads `OPENAI_API_KEY`, so an OpenAI key is not sent to a local server.
 `--provider-max-attempts`, `--provider-base-backoff-ms`, `--provider-max-backoff-ms`, and `--provider-jitter-ms` tune retry behavior.
+Streaming (`--provider-streaming true`) works with every external provider. `--provider-failover` is limited to the `openai` and `anthropic` pair.
+
+Test a provider configuration without a broker. `probe-provider` takes the same `--provider*` flags, sends one prompt, prints a JSON report, and exits with a code per failure kind:
+
+```bash
+GEMINI_API_KEY='<provider-key>' cargo run -p expressways-nanobot-system -- probe-provider --provider gemini --provider-model gemini-2.5-flash --provider-max-attempts 1
+```
+
+| Exit code | `error_kind` | Meaning |
+| --- | --- | --- |
+| 0 | none | the provider answered |
+| 1 | none | invalid flags or missing configuration (for example no API key) |
+| 10 | `authentication_failed` | the API key was rejected (HTTP 401/403, or Gemini `API_KEY_INVALID`) |
+| 11 | `host_unreachable` | no connection to the base URL host and port |
+| 12 | `model_not_found` | the provider does not know `--provider-model` |
+| 13 | `rate_limited` | HTTP 429: rate limit or quota exhausted |
+| 14 | `timeout` | no answer within `--provider-timeout-seconds` |
+| 15 | `endpoint_not_found` | host reachable, but no chat endpoint at that path |
+| 16 | `server_error` | provider HTTP 5xx |
+| 17 | `request_rejected` | other HTTP 4xx |
+| 18 | `invalid_response` | the server answered with something the runtime could not parse |
+
+The same `error_kind` appears in the runtime's `provider_error` log lines and runtime events.
 
 Enable OpenAI primary with Anthropic failover:
 
@@ -1010,7 +1053,7 @@ Provider failures are returned to the user as a sanitized fallback response whil
 
 Provider event runbook:
 
-- `provider_error`: provider call failed; includes provider/model/base, attempts, elapsed, and error.
+- `provider_error`: provider call failed; includes provider/model/base, attempts, elapsed, error, and `error_kind`.
 - `provider_retry_recovered`: a provider call succeeded after internal retry.
 - `provider_circuit_open`: failure threshold reached; provider paused for cooldown.
 - `provider_circuit_blocked`: request skipped because the circuit is still cooling down.

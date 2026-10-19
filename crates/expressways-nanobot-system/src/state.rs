@@ -393,6 +393,7 @@ mod tests {
                 tool_name: None,
                 tool_args: None,
                 tool_result: None,
+                thought_signature: None,
             },
             SessionTurn {
                 timestamp: Utc::now(),
@@ -402,6 +403,7 @@ mod tests {
                 tool_name: Some("read_file".to_owned()),
                 tool_args: None,
                 tool_result: Some(serde_json::json!({"ok": true})),
+                thought_signature: None,
             },
             SessionTurn {
                 timestamp: Utc::now(),
@@ -411,6 +413,7 @@ mod tests {
                 tool_name: None,
                 tool_args: None,
                 tool_result: None,
+                thought_signature: None,
             },
         ];
 
@@ -439,6 +442,7 @@ mod tests {
             tool_name: None,
             tool_args: None,
             tool_result: None,
+            thought_signature: None,
         }
     }
 

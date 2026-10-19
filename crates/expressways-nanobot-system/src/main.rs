@@ -14,7 +14,9 @@ use expressways_nanobot_system::model::{
     NanobotSessionRef,
 };
 use expressways_nanobot_system::provider::{
-    AnthropicConfig, OpenAiConfig, ProviderBackend, ProviderRetryConfig,
+    AnthropicConfig, GeminiConfig, OpenAiConfig, ProviderBackend, ProviderRequest,
+    ProviderRetryConfig, ProviderStep, anthropic_next_step, gemini_next_step,
+    openai_compatible_next_step, openai_next_step,
 };
 use expressways_nanobot_system::runtime::{
     InteropWorkerConfig, RuntimeConfig, run_interop_worker, run_runtime,
@@ -51,13 +53,55 @@ enum TransportKind {
     Unix,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ProviderKind {
     RuleBased,
     #[value(name = "openai")]
     OpenAi,
+    /// Local or self-hosted OpenAI-compatible server (Ollama, LM Studio, vLLM).
+    #[value(name = "openai-compatible")]
+    OpenAiCompatible,
     #[value(name = "anthropic")]
     Anthropic,
+    #[value(name = "gemini")]
+    Gemini,
+}
+
+const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+const OPENAI_COMPATIBLE_API_KEY_ENV: &str = "OPENAI_COMPATIBLE_API_KEY";
+const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
+const DEFAULT_PROBE_PROMPT: &str = "Reply with the single word OK.";
+
+/// Model provider selection shared by `run-runtime` and `probe-provider`.
+#[derive(Debug, Args, Clone)]
+struct ProviderArgs {
+    #[arg(long, value_enum, default_value_t = ProviderKind::RuleBased)]
+    provider: ProviderKind,
+    /// Provider API base URL. Required for `openai-compatible`
+    /// (for example http://127.0.0.1:11434 for Ollama).
+    #[arg(long = "provider-base-url")]
+    provider_base_url: Option<String>,
+    #[arg(long = "provider-model")]
+    provider_model: Option<String>,
+    /// API key. Defaults to OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY
+    /// or OPENAI_COMPATIBLE_API_KEY depending on --provider.
+    #[arg(long = "provider-api-key")]
+    provider_api_key: Option<String>,
+    #[arg(long = "provider-timeout-seconds", default_value_t = 60)]
+    provider_timeout_seconds: u64,
+    #[arg(long = "provider-max-attempts", default_value_t = 3)]
+    provider_max_attempts: usize,
+    #[arg(long = "provider-base-backoff-ms", default_value_t = 200)]
+    provider_base_backoff_ms: u64,
+    #[arg(long = "provider-max-backoff-ms", default_value_t = 2_000)]
+    provider_max_backoff_ms: u64,
+    #[arg(long = "provider-jitter-ms", default_value_t = 75)]
+    provider_jitter_ms: u64,
+    #[arg(long = "provider-system-prompt")]
+    provider_system_prompt: Option<String>,
+    #[arg(long = "anthropic-api-version", default_value = "2023-06-01")]
+    anthropic_api_version: String,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -151,24 +195,8 @@ enum Command {
         instance_id: String,
         #[arg(long, default_value = DEFAULT_RUNTIME_SOURCE)]
         source_runtime: String,
-        #[arg(long, value_enum, default_value_t = ProviderKind::RuleBased)]
-        provider: ProviderKind,
-        #[arg(long = "provider-base-url")]
-        provider_base_url: Option<String>,
-        #[arg(long = "provider-model")]
-        provider_model: Option<String>,
-        #[arg(long = "provider-api-key")]
-        provider_api_key: Option<String>,
-        #[arg(long = "provider-timeout-seconds", default_value_t = 60)]
-        provider_timeout_seconds: u64,
-        #[arg(long = "provider-max-attempts", default_value_t = 3)]
-        provider_max_attempts: usize,
-        #[arg(long = "provider-base-backoff-ms", default_value_t = 200)]
-        provider_base_backoff_ms: u64,
-        #[arg(long = "provider-max-backoff-ms", default_value_t = 2_000)]
-        provider_max_backoff_ms: u64,
-        #[arg(long = "provider-jitter-ms", default_value_t = 75)]
-        provider_jitter_ms: u64,
+        #[command(flatten)]
+        provider_args: ProviderArgs,
         #[arg(long = "provider-circuit-failure-threshold", default_value_t = 3)]
         provider_circuit_failure_threshold: usize,
         #[arg(long = "provider-circuit-cooldown-seconds", default_value_t = 30)]
@@ -183,12 +211,21 @@ enum Command {
         fallback_provider_model: Option<String>,
         #[arg(long = "fallback-provider-api-key")]
         fallback_provider_api_key: Option<String>,
-        #[arg(long = "provider-system-prompt")]
-        provider_system_prompt: Option<String>,
-        #[arg(long = "anthropic-api-version", default_value = "2023-06-01")]
-        anthropic_api_version: String,
         #[arg(long, default_value_t = false)]
         once: bool,
+    },
+    /// Send one test prompt to the configured model provider and exit.
+    ///
+    /// Prints a JSON result. Exits 0 on success, 1 on a configuration error,
+    /// and a distinct code per failure kind: 10 authentication_failed,
+    /// 11 host_unreachable, 12 model_not_found, 13 rate_limited, 14 timeout,
+    /// 15 endpoint_not_found, 16 server_error, 17 request_rejected,
+    /// 18 invalid_response.
+    ProbeProvider {
+        #[command(flatten)]
+        provider_args: ProviderArgs,
+        #[arg(long, default_value = DEFAULT_PROBE_PROMPT)]
+        prompt: String,
     },
     Ingest {
         #[command(flatten)]
@@ -343,15 +380,7 @@ async fn main() -> anyhow::Result<()> {
             ensure_topics,
             instance_id,
             source_runtime,
-            provider,
-            provider_base_url,
-            provider_model,
-            provider_api_key,
-            provider_timeout_seconds,
-            provider_max_attempts,
-            provider_base_backoff_ms,
-            provider_max_backoff_ms,
-            provider_jitter_ms,
+            provider_args,
             provider_circuit_failure_threshold,
             provider_circuit_cooldown_seconds,
             provider_failover,
@@ -359,186 +388,21 @@ async fn main() -> anyhow::Result<()> {
             fallback_provider_base_url,
             fallback_provider_model,
             fallback_provider_api_key,
-            provider_system_prompt,
-            anthropic_api_version,
             once,
         } => {
             let capability_token = resolve_token(token)?;
-            let timeout = Duration::from_secs(provider_timeout_seconds.max(1));
-            let retry = ProviderRetryConfig {
-                max_attempts: provider_max_attempts,
-                base_backoff_ms: provider_base_backoff_ms,
-                max_backoff_ms: provider_max_backoff_ms,
-                jitter_ms: provider_jitter_ms,
-            }
-            .normalized();
-            let system_prompt_override = provider_system_prompt
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
-            let anthropic_api_version = if anthropic_api_version.trim().is_empty() {
-                AnthropicConfig::default_api_version()
-            } else {
-                anthropic_api_version
-            };
-            let provider_kind = provider;
-
-            let provider = match provider_kind {
-                ProviderKind::RuleBased => ProviderBackend::RuleBased,
-                ProviderKind::OpenAi => {
-                    let api_base = non_empty_or_default(
-                        provider_base_url,
-                        OpenAiConfig::default_api_base,
-                        "--provider-base-url",
-                    )?;
-                    let model = non_empty_or_default(
-                        provider_model,
-                        || "gpt-4o-mini".to_owned(),
-                        "--provider-model",
-                    )?;
-                    let api_key = non_empty_or_default(
-                        provider_api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok()),
-                        String::new,
-                        "--provider-api-key or OPENAI_API_KEY",
-                    )?;
-                    if api_key.trim().is_empty() {
-                        bail!("OpenAI provider requires --provider-api-key or OPENAI_API_KEY");
-                    }
-                    let http_client = build_http_client(timeout)
-                        .context("failed to build OpenAI provider HTTP client")?;
-
-                    ProviderBackend::OpenAi(OpenAiConfig {
-                        api_base,
-                        model,
-                        api_key: Some(api_key),
-                        timeout,
-                        retry,
-                        system_prompt: system_prompt_override
-                            .clone()
-                            .unwrap_or_else(OpenAiConfig::default_system_prompt),
-                        http_client,
-                    })
-                }
-                ProviderKind::Anthropic => {
-                    let api_base = non_empty_or_default(
-                        provider_base_url,
-                        AnthropicConfig::default_api_base,
-                        "--provider-base-url",
-                    )?;
-                    let model = non_empty_or_default(
-                        provider_model,
-                        || "claude-3-5-sonnet-latest".to_owned(),
-                        "--provider-model",
-                    )?;
-                    let api_key = non_empty_or_default(
-                        provider_api_key.or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
-                        String::new,
-                        "--provider-api-key or ANTHROPIC_API_KEY",
-                    )?;
-                    if api_key.trim().is_empty() {
-                        bail!(
-                            "Anthropic provider requires --provider-api-key or ANTHROPIC_API_KEY"
-                        );
-                    }
-                    let http_client = build_http_client(timeout)
-                        .context("failed to build Anthropic provider HTTP client")?;
-
-                    ProviderBackend::Anthropic(AnthropicConfig {
-                        api_base,
-                        model,
-                        api_key: Some(api_key),
-                        timeout,
-                        retry,
-                        system_prompt: system_prompt_override
-                            .clone()
-                            .unwrap_or_else(AnthropicConfig::default_system_prompt),
-                        api_version: anthropic_api_version.clone(),
-                        http_client,
-                    })
-                }
-            };
+            let env = |name: &str| std::env::var(name).ok();
+            let provider = build_provider(&provider_args, &env)?;
             let fallback_provider = if provider_failover {
-                match provider_kind {
-                    ProviderKind::RuleBased => {
-                        bail!(
-                            "--provider-failover requires --provider openai or --provider anthropic"
-                        )
-                    }
-                    ProviderKind::OpenAi => {
-                        let api_base = non_empty_or_default(
-                            fallback_provider_base_url,
-                            AnthropicConfig::default_api_base,
-                            "--fallback-provider-base-url",
-                        )?;
-                        let model = non_empty_or_default(
-                            fallback_provider_model,
-                            || "claude-3-5-sonnet-latest".to_owned(),
-                            "--fallback-provider-model",
-                        )?;
-                        let api_key = non_empty_or_default(
-                            fallback_provider_api_key
-                                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
-                            String::new,
-                            "--fallback-provider-api-key or ANTHROPIC_API_KEY",
-                        )?;
-                        if api_key.trim().is_empty() {
-                            bail!(
-                                "Anthropic fallback requires --fallback-provider-api-key or ANTHROPIC_API_KEY"
-                            );
-                        }
-                        let http_client = build_http_client(timeout)
-                            .context("failed to build Anthropic fallback HTTP client")?;
-                        Some(ProviderBackend::Anthropic(AnthropicConfig {
-                            api_base,
-                            model,
-                            api_key: Some(api_key),
-                            timeout,
-                            retry,
-                            system_prompt: system_prompt_override
-                                .clone()
-                                .unwrap_or_else(AnthropicConfig::default_system_prompt),
-                            api_version: anthropic_api_version.clone(),
-                            http_client,
-                        }))
-                    }
-                    ProviderKind::Anthropic => {
-                        let api_base = non_empty_or_default(
-                            fallback_provider_base_url,
-                            OpenAiConfig::default_api_base,
-                            "--fallback-provider-base-url",
-                        )?;
-                        let model = non_empty_or_default(
-                            fallback_provider_model,
-                            || "gpt-4o-mini".to_owned(),
-                            "--fallback-provider-model",
-                        )?;
-                        let api_key = non_empty_or_default(
-                            fallback_provider_api_key
-                                .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
-                            String::new,
-                            "--fallback-provider-api-key or OPENAI_API_KEY",
-                        )?;
-                        if api_key.trim().is_empty() {
-                            bail!(
-                                "OpenAI fallback requires --fallback-provider-api-key or OPENAI_API_KEY"
-                            );
-                        }
-                        let http_client = build_http_client(timeout)
-                            .context("failed to build OpenAI fallback HTTP client")?;
-                        Some(ProviderBackend::OpenAi(OpenAiConfig {
-                            api_base,
-                            model,
-                            api_key: Some(api_key),
-                            timeout,
-                            retry,
-                            system_prompt: system_prompt_override
-                                .clone()
-                                .unwrap_or_else(OpenAiConfig::default_system_prompt),
-                            http_client,
-                        }))
-                    }
-                }
+                Some(build_fallback_provider(
+                    &provider_args,
+                    FallbackProviderArgs {
+                        base_url: fallback_provider_base_url,
+                        model: fallback_provider_model,
+                        api_key: fallback_provider_api_key,
+                    },
+                    &env,
+                )?)
             } else {
                 None
             };
@@ -595,6 +459,19 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 run_runtime(runtime).await
             }
+        }
+        Command::ProbeProvider {
+            provider_args,
+            prompt,
+        } => {
+            let env = |name: &str| std::env::var(name).ok();
+            let provider = build_provider(&provider_args, &env)?;
+            let (result, exit_code) = probe_provider(&provider, &prompt).await;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if exit_code != 0 {
+                std::process::exit(i32::from(exit_code));
+            }
+            Ok(())
         }
         Command::Ingest {
             token,
@@ -809,6 +686,7 @@ struct ProviderErrorSnapshot {
     session_id: Option<String>,
     message_id: Option<String>,
     error: String,
+    error_kind: Option<String>,
     model: Option<String>,
     api_base: Option<String>,
     attempts: Option<u64>,
@@ -890,6 +768,11 @@ fn summarize_provider_events(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                error_kind: event
+                    .detail
+                    .get("error_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
                 model: event
                     .detail
                     .get("model")
@@ -1023,6 +906,382 @@ fn non_empty_or_default(
     Ok(trimmed.to_owned())
 }
 
+struct ProviderSettings {
+    timeout: Duration,
+    retry: ProviderRetryConfig,
+    system_prompt: Option<String>,
+    anthropic_api_version: String,
+}
+
+impl ProviderSettings {
+    fn from_args(args: &ProviderArgs) -> Self {
+        Self {
+            timeout: Duration::from_secs(args.provider_timeout_seconds.max(1)),
+            retry: ProviderRetryConfig {
+                max_attempts: args.provider_max_attempts,
+                base_backoff_ms: args.provider_base_backoff_ms,
+                max_backoff_ms: args.provider_max_backoff_ms,
+                jitter_ms: args.provider_jitter_ms,
+            }
+            .normalized(),
+            system_prompt: args
+                .provider_system_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            anthropic_api_version: if args.anthropic_api_version.trim().is_empty() {
+                AnthropicConfig::default_api_version()
+            } else {
+                args.anthropic_api_version.clone()
+            },
+        }
+    }
+}
+
+/// Values and flag names for one provider slot (primary or fallback), so
+/// error messages name the flag the operator actually has to set.
+struct ProviderFlags {
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    flag_prefix: &'static str,
+    role: &'static str,
+}
+
+impl ProviderFlags {
+    fn primary(args: &ProviderArgs) -> Self {
+        Self {
+            base_url: args.provider_base_url.clone(),
+            model: args.provider_model.clone(),
+            api_key: args.provider_api_key.clone(),
+            flag_prefix: "provider",
+            role: "provider",
+        }
+    }
+
+    fn flag(&self, name: &str) -> String {
+        format!("--{}-{name}", self.flag_prefix)
+    }
+}
+
+struct FallbackProviderArgs {
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+}
+
+fn build_provider(
+    args: &ProviderArgs,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<ProviderBackend> {
+    let settings = ProviderSettings::from_args(args);
+    let flags = ProviderFlags::primary(args);
+    match args.provider {
+        ProviderKind::RuleBased => Ok(ProviderBackend::RuleBased),
+        ProviderKind::OpenAi => Ok(ProviderBackend::OpenAi(build_openai_config(
+            &settings, flags, env,
+        )?)),
+        ProviderKind::OpenAiCompatible => Ok(ProviderBackend::OpenAiCompatible(
+            build_openai_compatible_config(&settings, flags, env)?,
+        )),
+        ProviderKind::Anthropic => Ok(ProviderBackend::Anthropic(build_anthropic_config(
+            &settings, flags, env,
+        )?)),
+        ProviderKind::Gemini => Ok(ProviderBackend::Gemini(build_gemini_config(
+            &settings, flags, env,
+        )?)),
+    }
+}
+
+fn build_fallback_provider(
+    args: &ProviderArgs,
+    fallback: FallbackProviderArgs,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<ProviderBackend> {
+    let settings = ProviderSettings::from_args(args);
+    let flags = ProviderFlags {
+        base_url: fallback.base_url,
+        model: fallback.model,
+        api_key: fallback.api_key,
+        flag_prefix: "fallback-provider",
+        role: "fallback",
+    };
+    match args.provider {
+        ProviderKind::OpenAi => Ok(ProviderBackend::Anthropic(build_anthropic_config(
+            &settings, flags, env,
+        )?)),
+        ProviderKind::Anthropic => Ok(ProviderBackend::OpenAi(build_openai_config(
+            &settings, flags, env,
+        )?)),
+        ProviderKind::RuleBased | ProviderKind::OpenAiCompatible | ProviderKind::Gemini => {
+            bail!("--provider-failover requires --provider openai or --provider anthropic")
+        }
+    }
+}
+
+fn resolve_api_key(
+    flags: &ProviderFlags,
+    env: &dyn Fn(&str) -> Option<String>,
+    env_name: &str,
+) -> Option<String> {
+    flags
+        .api_key
+        .clone()
+        .or_else(|| env(env_name))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn require_api_key(
+    flags: &ProviderFlags,
+    env: &dyn Fn(&str) -> Option<String>,
+    env_name: &str,
+    label: &str,
+) -> anyhow::Result<String> {
+    match resolve_api_key(flags, env, env_name) {
+        Some(key) => Ok(key),
+        None => bail!(
+            "{label} {} requires {} or {env_name}",
+            flags.role,
+            flags.flag("api-key")
+        ),
+    }
+}
+
+fn resolve_base_url(
+    flags: &ProviderFlags,
+    default: impl FnOnce() -> String,
+) -> anyhow::Result<String> {
+    let flag = flags.flag("base-url");
+    let base_url = non_empty_or_default(flags.base_url.clone(), default, &flag)?;
+    validate_base_url(&base_url, &flag)?;
+    Ok(base_url)
+}
+
+fn validate_base_url(base_url: &str, flag: &str) -> anyhow::Result<()> {
+    let parsed = reqwest::Url::parse(base_url).ok();
+    let valid = parsed
+        .as_ref()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+    if !valid {
+        bail!(
+            "{flag} must be an http:// or https:// URL with a host (for example http://127.0.0.1:11434), got `{base_url}`"
+        );
+    }
+    Ok(())
+}
+
+fn build_openai_config(
+    settings: &ProviderSettings,
+    flags: ProviderFlags,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<OpenAiConfig> {
+    let api_base = resolve_base_url(&flags, OpenAiConfig::default_api_base)?;
+    let model = non_empty_or_default(
+        flags.model.clone(),
+        || "gpt-4o-mini".to_owned(),
+        &flags.flag("model"),
+    )?;
+    let api_key = require_api_key(&flags, env, OPENAI_API_KEY_ENV, "OpenAI")?;
+    Ok(OpenAiConfig {
+        api_base,
+        model,
+        api_key: Some(api_key),
+        timeout: settings.timeout,
+        retry: settings.retry,
+        system_prompt: settings
+            .system_prompt
+            .clone()
+            .unwrap_or_else(OpenAiConfig::default_system_prompt),
+        http_client: build_http_client(settings.timeout)
+            .context("failed to build OpenAI provider HTTP client")?,
+    })
+}
+
+fn build_openai_compatible_config(
+    settings: &ProviderSettings,
+    flags: ProviderFlags,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<OpenAiConfig> {
+    let base_url_flag = flags.flag("base-url");
+    let model_flag = flags.flag("model");
+    if flags
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        bail!(
+            "OpenAI-compatible provider requires {base_url_flag} with the server's host and port (for example http://127.0.0.1:11434)"
+        );
+    }
+    if flags
+        .model
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        bail!("OpenAI-compatible provider requires {model_flag} with the server's model name");
+    }
+    let api_base = resolve_base_url(&flags, String::new)?;
+    let model = non_empty_or_default(flags.model.clone(), String::new, &model_flag)?;
+    Ok(OpenAiConfig {
+        api_base,
+        model,
+        api_key: resolve_api_key(&flags, env, OPENAI_COMPATIBLE_API_KEY_ENV),
+        timeout: settings.timeout,
+        retry: settings.retry,
+        system_prompt: settings
+            .system_prompt
+            .clone()
+            .unwrap_or_else(OpenAiConfig::default_system_prompt),
+        http_client: build_http_client(settings.timeout)
+            .context("failed to build OpenAI-compatible provider HTTP client")?,
+    })
+}
+
+fn build_anthropic_config(
+    settings: &ProviderSettings,
+    flags: ProviderFlags,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<AnthropicConfig> {
+    let api_base = resolve_base_url(&flags, AnthropicConfig::default_api_base)?;
+    let model = non_empty_or_default(
+        flags.model.clone(),
+        || "claude-3-5-sonnet-latest".to_owned(),
+        &flags.flag("model"),
+    )?;
+    let api_key = require_api_key(&flags, env, ANTHROPIC_API_KEY_ENV, "Anthropic")?;
+    Ok(AnthropicConfig {
+        api_base,
+        model,
+        api_key: Some(api_key),
+        timeout: settings.timeout,
+        retry: settings.retry,
+        system_prompt: settings
+            .system_prompt
+            .clone()
+            .unwrap_or_else(AnthropicConfig::default_system_prompt),
+        api_version: settings.anthropic_api_version.clone(),
+        http_client: build_http_client(settings.timeout)
+            .context("failed to build Anthropic provider HTTP client")?,
+    })
+}
+
+fn build_gemini_config(
+    settings: &ProviderSettings,
+    flags: ProviderFlags,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<GeminiConfig> {
+    let api_base = resolve_base_url(&flags, GeminiConfig::default_api_base)?;
+    let model = non_empty_or_default(
+        flags.model.clone(),
+        GeminiConfig::default_model,
+        &flags.flag("model"),
+    )?;
+    let api_key = require_api_key(&flags, env, GEMINI_API_KEY_ENV, "Gemini")?;
+    Ok(GeminiConfig {
+        api_base,
+        model,
+        api_key: Some(api_key),
+        timeout: settings.timeout,
+        retry: settings.retry,
+        system_prompt: settings
+            .system_prompt
+            .clone()
+            .unwrap_or_else(GeminiConfig::default_system_prompt),
+        http_client: build_http_client(settings.timeout)
+            .context("failed to build Gemini provider HTTP client")?,
+    })
+}
+
+/// Run one provider call for `probe-provider`. Returns the JSON report and
+/// the process exit code (0 on success, the error kind's code otherwise).
+async fn probe_provider(provider: &ProviderBackend, prompt: &str) -> (serde_json::Value, u8) {
+    let request = ProviderRequest {
+        latest_user_text: prompt.to_owned(),
+        history: Vec::new(),
+        memory_summary: None,
+        pending_tool_result: None,
+    };
+    let (name, model, api_base, result) = match provider {
+        ProviderBackend::RuleBased => {
+            return (
+                serde_json::json!({
+                    "ok": true,
+                    "provider": "rule-based",
+                    "detail": "the rule-based provider has no model endpoint to test",
+                }),
+                0,
+            );
+        }
+        ProviderBackend::OpenAi(config) => (
+            "openai",
+            &config.model,
+            &config.api_base,
+            openai_next_step(&request, config).await,
+        ),
+        ProviderBackend::OpenAiCompatible(config) => (
+            "openai-compatible",
+            &config.model,
+            &config.api_base,
+            openai_compatible_next_step(&request, config).await,
+        ),
+        ProviderBackend::Anthropic(config) => (
+            "anthropic",
+            &config.model,
+            &config.api_base,
+            anthropic_next_step(&request, config).await,
+        ),
+        ProviderBackend::Gemini(config) => (
+            "gemini",
+            &config.model,
+            &config.api_base,
+            gemini_next_step(&request, config).await,
+        ),
+    };
+    match result {
+        Ok(invocation) => {
+            let reply = match invocation.step {
+                ProviderStep::Respond { text } => serde_json::json!({ "text": text }),
+                ProviderStep::ToolCalls { calls } => serde_json::json!({
+                    "tool_calls": calls.into_iter().map(|call| call.name).collect::<Vec<_>>()
+                }),
+            };
+            (
+                serde_json::json!({
+                    "ok": true,
+                    "provider": name,
+                    "model": model,
+                    "api_base": api_base,
+                    "attempts": invocation.stats.attempts,
+                    "elapsed_ms": invocation.stats.elapsed_ms,
+                    "reply": reply,
+                }),
+                0,
+            )
+        }
+        Err(error) => (
+            serde_json::json!({
+                "ok": false,
+                "provider": name,
+                "model": model,
+                "api_base": api_base,
+                "error_kind": error.kind.as_str(),
+                "exit_code": error.kind.exit_code(),
+                "hint": error.kind.hint(),
+                "error": error.message,
+                "attempts": error.stats.attempts,
+                "elapsed_ms": error.stats.elapsed_ms,
+            }),
+            error.kind.exit_code(),
+        ),
+    }
+}
+
 async fn consume_messages(
     endpoint: &Endpoint,
     capability_token: &str,
@@ -1100,7 +1359,8 @@ mod tests {
                 "api_base": "https://api.openai.com/v1",
                 "attempts": 1,
                 "elapsed_ms": 204,
-                "error": "timeout"
+                "error": "timeout",
+                "error_kind": "timeout"
             },
             "timestamp": Utc::now(),
         });
@@ -1146,6 +1406,12 @@ mod tests {
             "timeout".to_owned()
         );
         assert_eq!(summary.latest_error_by_provider["openai"].offset, 8);
+        assert_eq!(
+            summary.latest_error_by_provider["openai"]
+                .error_kind
+                .as_deref(),
+            Some("timeout")
+        );
         assert_eq!(summary.offset_next, 9);
     }
 
@@ -1188,5 +1454,291 @@ mod tests {
         assert!(!summary.counts_by_provider.contains_key("openai"));
         assert!(summary.latest_error_by_provider.contains_key("anthropic"));
         assert_eq!(summary.session_filter.as_deref(), Some("b"));
+    }
+
+    fn parse_provider_args(extra: &[&str]) -> ProviderArgs {
+        let mut argv = vec!["expressways-nanobot-system", "probe-provider"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).expect("parse cli").command {
+            Command::ProbeProvider { provider_args, .. } => provider_args,
+            other => panic!("expected probe-provider, got {other:?}"),
+        }
+    }
+
+    fn env_from(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn run_runtime_accepts_new_provider_names() {
+        for provider in [
+            "gemini",
+            "openai-compatible",
+            "openai",
+            "anthropic",
+            "rule-based",
+        ] {
+            let cli = Cli::try_parse_from([
+                "expressways-nanobot-system",
+                "run-runtime",
+                "--token",
+                "t",
+                "--provider",
+                provider,
+            ])
+            .unwrap_or_else(|error| panic!("parse {provider}: {error}"));
+            assert!(matches!(cli.command, Command::RunRuntime { .. }));
+        }
+    }
+
+    #[test]
+    fn selects_gemini_with_env_key_and_defaults() {
+        let args = parse_provider_args(&["--provider", "gemini"]);
+        let provider = build_provider(&args, &env_from(&[("GEMINI_API_KEY", "g-key")]))
+            .expect("gemini provider");
+        let ProviderBackend::Gemini(config) = provider else {
+            panic!("expected gemini backend");
+        };
+        assert_eq!(config.api_key.as_deref(), Some("g-key"));
+        assert_eq!(config.model, GeminiConfig::default_model());
+        assert_eq!(config.api_base, GeminiConfig::default_api_base());
+
+        let args = parse_provider_args(&[
+            "--provider",
+            "gemini",
+            "--provider-model",
+            "gemini-2.5-pro",
+            "--provider-api-key",
+            "flag-key",
+        ]);
+        let ProviderBackend::Gemini(config) =
+            build_provider(&args, &env_from(&[("GEMINI_API_KEY", "g-key")])).expect("gemini")
+        else {
+            panic!("expected gemini backend");
+        };
+        assert_eq!(config.api_key.as_deref(), Some("flag-key"));
+        assert_eq!(config.model, "gemini-2.5-pro");
+    }
+
+    #[test]
+    fn gemini_without_key_names_the_env_var() {
+        let args = parse_provider_args(&["--provider", "gemini"]);
+        let error = build_provider(&args, &env_from(&[("OPENAI_API_KEY", "o-key")]))
+            .expect_err("missing gemini key");
+        assert_eq!(
+            error.to_string(),
+            "Gemini provider requires --provider-api-key or GEMINI_API_KEY"
+        );
+    }
+
+    #[test]
+    fn selects_openai_compatible_with_optional_key() {
+        let args = parse_provider_args(&[
+            "--provider",
+            "openai-compatible",
+            "--provider-base-url",
+            "http://127.0.0.1:11434",
+            "--provider-model",
+            "llama3.2",
+        ]);
+        let ProviderBackend::OpenAiCompatible(config) =
+            build_provider(&args, &env_from(&[("OPENAI_API_KEY", "must-not-leak")]))
+                .expect("openai-compatible provider")
+        else {
+            panic!("expected openai-compatible backend");
+        };
+        assert_eq!(config.api_base, "http://127.0.0.1:11434");
+        assert_eq!(config.model, "llama3.2");
+        assert_eq!(
+            config.api_key, None,
+            "OPENAI_API_KEY must not be sent to local servers"
+        );
+
+        let ProviderBackend::OpenAiCompatible(config) = build_provider(
+            &args,
+            &env_from(&[("OPENAI_COMPATIBLE_API_KEY", "local-key")]),
+        )
+        .expect("openai-compatible provider") else {
+            panic!("expected openai-compatible backend");
+        };
+        assert_eq!(config.api_key.as_deref(), Some("local-key"));
+    }
+
+    #[test]
+    fn openai_compatible_requires_base_url_and_model() {
+        let no_env = env_from(&[]);
+        let args = parse_provider_args(&[
+            "--provider",
+            "openai-compatible",
+            "--provider-model",
+            "llama3.2",
+        ]);
+        let error = build_provider(&args, &no_env).expect_err("missing base url");
+        assert!(error.to_string().contains("--provider-base-url"), "{error}");
+
+        let args = parse_provider_args(&[
+            "--provider",
+            "openai-compatible",
+            "--provider-base-url",
+            "http://127.0.0.1:1234",
+        ]);
+        let error = build_provider(&args, &no_env).expect_err("missing model");
+        assert!(error.to_string().contains("--provider-model"), "{error}");
+
+        let args = parse_provider_args(&[
+            "--provider",
+            "openai-compatible",
+            "--provider-base-url",
+            "localhost:11434",
+            "--provider-model",
+            "llama3.2",
+        ]);
+        let error = build_provider(&args, &no_env).expect_err("scheme-less url");
+        assert!(error.to_string().contains("http:// or https://"), "{error}");
+    }
+
+    #[test]
+    fn existing_providers_keep_their_key_env_vars() {
+        let args = parse_provider_args(&["--provider", "openai"]);
+        assert!(matches!(
+            build_provider(&args, &env_from(&[("OPENAI_API_KEY", "o")])),
+            Ok(ProviderBackend::OpenAi(_))
+        ));
+        let args = parse_provider_args(&["--provider", "anthropic"]);
+        assert!(matches!(
+            build_provider(&args, &env_from(&[("ANTHROPIC_API_KEY", "a")])),
+            Ok(ProviderBackend::Anthropic(_))
+        ));
+        let error = build_provider(&args, &env_from(&[])).expect_err("missing anthropic key");
+        assert_eq!(
+            error.to_string(),
+            "Anthropic provider requires --provider-api-key or ANTHROPIC_API_KEY"
+        );
+    }
+
+    #[test]
+    fn failover_is_limited_to_openai_and_anthropic() {
+        let env = env_from(&[("OPENAI_API_KEY", "o"), ("ANTHROPIC_API_KEY", "a")]);
+        let fallback = || FallbackProviderArgs {
+            base_url: None,
+            model: None,
+            api_key: None,
+        };
+        let args = parse_provider_args(&["--provider", "openai"]);
+        assert!(matches!(
+            build_fallback_provider(&args, fallback(), &env),
+            Ok(ProviderBackend::Anthropic(_))
+        ));
+        for provider in ["gemini", "openai-compatible", "rule-based"] {
+            let args = parse_provider_args(&["--provider", provider]);
+            let error =
+                build_fallback_provider(&args, fallback(), &env).expect_err("unsupported failover");
+            assert!(error.to_string().contains("--provider-failover"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_reports_unreachable_host_with_exit_code() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port");
+        let address = listener.local_addr().expect("local addr");
+        drop(listener);
+        let base_url = format!("http://{address}");
+        let args = parse_provider_args(&[
+            "--provider",
+            "openai-compatible",
+            "--provider-base-url",
+            &base_url,
+            "--provider-model",
+            "llama3.2",
+            "--provider-max-attempts",
+            "1",
+        ]);
+        let provider = build_provider(&args, &env_from(&[])).expect("provider");
+        let (report, exit_code) = probe_provider(&provider, DEFAULT_PROBE_PROMPT).await;
+        assert_eq!(exit_code, 11);
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["provider"], "openai-compatible");
+        assert_eq!(report["error_kind"], "host_unreachable");
+        assert_eq!(report["exit_code"], 11);
+    }
+
+    #[tokio::test]
+    async fn probe_reports_success_and_auth_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let address = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let replies = [
+                (
+                    "200 OK",
+                    r#"{"candidates":[{"content":{"parts":[{"text":"OK"}]}}]}"#,
+                ),
+                (
+                    "401 Unauthorized",
+                    r#"{"error":{"code":401,"status":"UNAUTHENTICATED"}}"#,
+                ),
+            ];
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = vec![0u8; 65536];
+                let mut read = 0;
+                loop {
+                    let count = socket.read(&mut buffer[read..]).await.expect("read");
+                    read += count;
+                    let text = String::from_utf8_lossy(&buffer[..read]);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if read >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    if count == 0 {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.expect("write");
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base_url = format!("http://{address}");
+        let args = parse_provider_args(&[
+            "--provider",
+            "gemini",
+            "--provider-base-url",
+            &base_url,
+            "--provider-max-attempts",
+            "1",
+        ]);
+        let provider =
+            build_provider(&args, &env_from(&[("GEMINI_API_KEY", "g")])).expect("provider");
+
+        let (report, exit_code) = probe_provider(&provider, DEFAULT_PROBE_PROMPT).await;
+        assert_eq!(exit_code, 0, "{report}");
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["reply"]["text"], "OK");
+
+        let (report, exit_code) = probe_provider(&provider, DEFAULT_PROBE_PROMPT).await;
+        assert_eq!(exit_code, 10, "{report}");
+        assert_eq!(report["error_kind"], "authentication_failed");
+        server.await.expect("mock server");
     }
 }

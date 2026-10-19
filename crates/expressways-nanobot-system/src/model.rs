@@ -164,6 +164,10 @@ pub struct SessionTurn {
     pub tool_args: Option<serde_json::Value>,
     #[serde(default)]
     pub tool_result: Option<serde_json::Value>,
+    /// Provider-issued signature replayed with a tool call (Gemini thought
+    /// signatures). Absent for providers that do not issue one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

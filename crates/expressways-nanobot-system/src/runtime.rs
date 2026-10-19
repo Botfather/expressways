@@ -24,9 +24,11 @@ use crate::model::{
     SessionRole, SessionTurn,
 };
 use crate::provider::{
-    Provider, ProviderBackend, ProviderInvocationStats, ProviderRequest, ProviderStep,
-    RuleBasedProvider, ToolResultContext, anthropic_next_step, anthropic_next_step_streaming,
-    openai_next_step, openai_next_step_streaming,
+    Provider, ProviderBackend, ProviderErrorKind, ProviderInvocationStats, ProviderRequest,
+    ProviderStep, RuleBasedProvider, ToolResultContext, anthropic_next_step,
+    anthropic_next_step_streaming, gemini_next_step, gemini_next_step_streaming,
+    openai_compatible_next_step, openai_compatible_next_step_streaming, openai_next_step,
+    openai_next_step_streaming,
 };
 use crate::state::{MemoryStore, SessionStore, load_runtime_state, save_runtime_state};
 use crate::tools::{ToolContext, ToolRegistry, publish_json};
@@ -43,7 +45,7 @@ fn provider_event_detail(
     model: &str,
     api_base: &str,
     stats: ProviderInvocationStats,
-    error: Option<&str>,
+    error: Option<(ProviderErrorKind, &str)>,
 ) -> serde_json::Value {
     let mut detail = serde_json::Map::new();
     detail.insert(
@@ -60,10 +62,14 @@ fn provider_event_detail(
     );
     detail.insert("attempts".to_owned(), serde_json::json!(stats.attempts));
     detail.insert("elapsed_ms".to_owned(), serde_json::json!(stats.elapsed_ms));
-    if let Some(error) = error {
+    if let Some((kind, error)) = error {
         detail.insert(
             "error".to_owned(),
             serde_json::Value::String(error.to_owned()),
+        );
+        detail.insert(
+            "error_kind".to_owned(),
+            serde_json::Value::String(kind.as_str().to_owned()),
         );
     }
     serde_json::Value::Object(detail)
@@ -78,14 +84,18 @@ struct ProviderCircuit {
 #[derive(Debug, Clone, Default)]
 struct ProviderRuntimeState {
     openai: ProviderCircuit,
+    openai_compatible: ProviderCircuit,
     anthropic: ProviderCircuit,
+    gemini: ProviderCircuit,
 }
 
 impl ProviderRuntimeState {
     fn circuit_mut(&mut self, provider: &str) -> Option<&mut ProviderCircuit> {
         match provider {
             "openai" => Some(&mut self.openai),
+            "openai-compatible" => Some(&mut self.openai_compatible),
             "anthropic" => Some(&mut self.anthropic),
+            "gemini" => Some(&mut self.gemini),
             _ => None,
         }
     }
@@ -96,6 +106,7 @@ struct ProviderFailure {
     provider: &'static str,
     model: String,
     api_base: String,
+    kind: Option<ProviderErrorKind>,
     message: String,
     stats: ProviderInvocationStats,
 }
@@ -616,6 +627,7 @@ async fn process_inbound_message(
             tool_name: None,
             tool_args: None,
             tool_result: None,
+            thought_signature: None,
         },
     )?;
 
@@ -757,6 +769,7 @@ async fn process_inbound_message(
                             tool_name: Some(name.clone()),
                             tool_args: Some(args.clone()),
                             tool_result: None,
+                            thought_signature: call.thought_signature,
                         },
                     )?;
 
@@ -777,6 +790,7 @@ async fn process_inbound_message(
                             tool_name: Some(name.clone()),
                             tool_args: Some(args),
                             tool_result: Some(result.clone()),
+                            thought_signature: None,
                         },
                     )?;
 
@@ -806,6 +820,7 @@ async fn process_inbound_message(
             tool_name: None,
             tool_args: None,
             tool_result: None,
+            thought_signature: None,
         },
     )?;
     memory.append_note(
@@ -885,7 +900,11 @@ fn render_user_message(message: &NanobotMessageRef) -> anyhow::Result<String> {
 fn provider_identity(provider: &ProviderBackend) -> Option<(&'static str, &str, &str)> {
     match provider {
         ProviderBackend::OpenAi(config) => Some(("openai", &config.model, &config.api_base)),
+        ProviderBackend::OpenAiCompatible(config) => {
+            Some(("openai-compatible", &config.model, &config.api_base))
+        }
         ProviderBackend::Anthropic(config) => Some(("anthropic", &config.model, &config.api_base)),
+        ProviderBackend::Gemini(config) => Some(("gemini", &config.model, &config.api_base)),
         ProviderBackend::RuleBased => None,
     }
 }
@@ -938,6 +957,7 @@ async fn resolve_provider_step(
                     "from_provider": primary_failure.provider,
                     "to_provider": to_provider,
                     "from_error": primary_failure.message,
+                    "from_error_kind": primary_failure.kind.map(ProviderErrorKind::as_str),
                 }),
             )
             .await;
@@ -987,7 +1007,9 @@ async fn resolve_provider_step(
                             "from_provider": primary_failure.provider,
                             "to_provider": to_provider,
                             "from_error": primary_failure.message,
+                            "from_error_kind": primary_failure.kind.map(ProviderErrorKind::as_str),
                             "to_error": fallback_failure.message,
+                            "to_error_kind": fallback_failure.kind.map(ProviderErrorKind::as_str),
                         }),
                     )
                     .await;
@@ -1058,6 +1080,7 @@ async fn attempt_external_provider(
             provider: provider_name,
             model: model.to_owned(),
             api_base: api_base.to_owned(),
+            kind: None,
             message: "provider circuit is open".to_owned(),
             stats: ProviderInvocationStats {
                 attempts: 0,
@@ -1066,155 +1089,106 @@ async fn attempt_external_provider(
         });
     }
 
-    let outcome = match provider {
-        ProviderBackend::OpenAi(provider_config) => {
-            let invocation_result = if config.provider_streaming_enabled {
-                let tx = stream_chunk_tx.clone();
-                openai_next_step_streaming(provider_request, provider_config, move |chunk| {
-                    if let Some(sender) = tx.as_ref() {
-                        let _ = sender.send(chunk.to_owned());
-                    }
-                })
-                .await
-            } else {
-                openai_next_step(provider_request, provider_config).await
-            };
-            match invocation_result {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let failure = ProviderFailure {
-                        provider: provider_name,
-                        model: model.to_owned(),
-                        api_base: api_base.to_owned(),
-                        message: error.message,
-                        stats: error.stats,
-                    };
-                    warn!(
-                        error = %failure.message,
-                        provider = %failure.provider,
-                        model = %failure.model,
-                        api_base = %failure.api_base,
-                        attempts = failure.stats.attempts,
-                        elapsed_ms = failure.stats.elapsed_ms,
-                        "provider failed; returning fallback assistant response"
-                    );
-                    let _ = emit_runtime_event(
-                        config,
-                        "provider_error",
-                        Some(session_id.to_owned()),
-                        Some(inbound_message_id.to_owned()),
-                        provider_event_detail(
-                            failure.provider,
-                            &failure.model,
-                            &failure.api_base,
-                            failure.stats,
-                            Some(&failure.message),
-                        ),
-                    )
-                    .await;
-
-                    let opened_circuit =
-                        if let Some(circuit) = provider_runtime_state.circuit_mut(provider_name) {
-                            record_circuit_failure(circuit, threshold, cooldown, Instant::now())
-                        } else {
-                            false
-                        };
-                    if opened_circuit {
-                        let _ = emit_runtime_event(
-                            config,
-                            "provider_circuit_open",
-                            Some(session_id.to_owned()),
-                            Some(inbound_message_id.to_owned()),
-                            serde_json::json!({
-                                "provider": failure.provider,
-                                "model": failure.model,
-                                "api_base": failure.api_base,
-                                "cooldown_ms": cooldown.as_millis().min(u64::MAX as u128) as u64,
-                                "failure_threshold": threshold,
-                            }),
-                        )
-                        .await;
-                    }
-                    return Err(failure);
-                }
+    let streaming = config.provider_streaming_enabled;
+    let on_text_chunk = {
+        let tx = stream_chunk_tx.clone();
+        move |chunk: &str| {
+            if let Some(sender) = tx.as_ref() {
+                let _ = sender.send(chunk.to_owned());
             }
         }
-        ProviderBackend::Anthropic(provider_config) => {
-            let invocation_result = if config.provider_streaming_enabled {
-                let tx = stream_chunk_tx.clone();
-                anthropic_next_step_streaming(provider_request, provider_config, move |chunk| {
-                    if let Some(sender) = tx.as_ref() {
-                        let _ = sender.send(chunk.to_owned());
-                    }
-                })
+    };
+    let invocation_result = match provider {
+        ProviderBackend::OpenAi(provider_config) if streaming => {
+            openai_next_step_streaming(provider_request, provider_config, on_text_chunk).await
+        }
+        ProviderBackend::OpenAi(provider_config) => {
+            openai_next_step(provider_request, provider_config).await
+        }
+        ProviderBackend::OpenAiCompatible(provider_config) if streaming => {
+            openai_compatible_next_step_streaming(provider_request, provider_config, on_text_chunk)
                 .await
-            } else {
-                anthropic_next_step(provider_request, provider_config).await
-            };
-            match invocation_result {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let failure = ProviderFailure {
-                        provider: provider_name,
-                        model: model.to_owned(),
-                        api_base: api_base.to_owned(),
-                        message: error.message,
-                        stats: error.stats,
-                    };
-                    warn!(
-                        error = %failure.message,
-                        provider = %failure.provider,
-                        model = %failure.model,
-                        api_base = %failure.api_base,
-                        attempts = failure.stats.attempts,
-                        elapsed_ms = failure.stats.elapsed_ms,
-                        "provider failed; returning fallback assistant response"
-                    );
-                    let _ = emit_runtime_event(
-                        config,
-                        "provider_error",
-                        Some(session_id.to_owned()),
-                        Some(inbound_message_id.to_owned()),
-                        provider_event_detail(
-                            failure.provider,
-                            &failure.model,
-                            &failure.api_base,
-                            failure.stats,
-                            Some(&failure.message),
-                        ),
-                    )
-                    .await;
-
-                    let opened_circuit =
-                        if let Some(circuit) = provider_runtime_state.circuit_mut(provider_name) {
-                            record_circuit_failure(circuit, threshold, cooldown, Instant::now())
-                        } else {
-                            false
-                        };
-                    if opened_circuit {
-                        let _ = emit_runtime_event(
-                            config,
-                            "provider_circuit_open",
-                            Some(session_id.to_owned()),
-                            Some(inbound_message_id.to_owned()),
-                            serde_json::json!({
-                                "provider": failure.provider,
-                                "model": failure.model,
-                                "api_base": failure.api_base,
-                                "cooldown_ms": cooldown.as_millis().min(u64::MAX as u128) as u64,
-                                "failure_threshold": threshold,
-                            }),
-                        )
-                        .await;
-                    }
-                    return Err(failure);
-                }
-            }
+        }
+        ProviderBackend::OpenAiCompatible(provider_config) => {
+            openai_compatible_next_step(provider_request, provider_config).await
+        }
+        ProviderBackend::Anthropic(provider_config) if streaming => {
+            anthropic_next_step_streaming(provider_request, provider_config, on_text_chunk).await
+        }
+        ProviderBackend::Anthropic(provider_config) => {
+            anthropic_next_step(provider_request, provider_config).await
+        }
+        ProviderBackend::Gemini(provider_config) if streaming => {
+            gemini_next_step_streaming(provider_request, provider_config, on_text_chunk).await
+        }
+        ProviderBackend::Gemini(provider_config) => {
+            gemini_next_step(provider_request, provider_config).await
         }
         ProviderBackend::RuleBased => {
             return Ok(ProviderStep::Respond {
                 text: provider_unavailable_response(),
             });
+        }
+    };
+    let outcome = match invocation_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let failure = ProviderFailure {
+                provider: provider_name,
+                model: model.to_owned(),
+                api_base: api_base.to_owned(),
+                kind: Some(error.kind),
+                message: error.message,
+                stats: error.stats,
+            };
+            warn!(
+                error = %failure.message,
+                error_kind = %error.kind,
+                provider = %failure.provider,
+                model = %failure.model,
+                api_base = %failure.api_base,
+                attempts = failure.stats.attempts,
+                elapsed_ms = failure.stats.elapsed_ms,
+                "provider failed; returning fallback assistant response"
+            );
+            let _ = emit_runtime_event(
+                config,
+                "provider_error",
+                Some(session_id.to_owned()),
+                Some(inbound_message_id.to_owned()),
+                provider_event_detail(
+                    failure.provider,
+                    &failure.model,
+                    &failure.api_base,
+                    failure.stats,
+                    Some((error.kind, &failure.message)),
+                ),
+            )
+            .await;
+
+            let opened_circuit =
+                if let Some(circuit) = provider_runtime_state.circuit_mut(provider_name) {
+                    record_circuit_failure(circuit, threshold, cooldown, Instant::now())
+                } else {
+                    false
+                };
+            if opened_circuit {
+                let _ = emit_runtime_event(
+                    config,
+                    "provider_circuit_open",
+                    Some(session_id.to_owned()),
+                    Some(inbound_message_id.to_owned()),
+                    serde_json::json!({
+                        "provider": failure.provider,
+                        "model": failure.model,
+                        "api_base": failure.api_base,
+                        "cooldown_ms": cooldown.as_millis().min(u64::MAX as u128) as u64,
+                        "failure_threshold": threshold,
+                    }),
+                )
+                .await;
+            }
+            return Err(failure);
         }
     };
 
@@ -1610,13 +1584,14 @@ mod tests {
             "gpt-5-mini",
             "https://api.openai.com/v1",
             stats,
-            Some("HTTP 429"),
+            Some((ProviderErrorKind::RateLimited, "HTTP 429")),
         );
         assert_eq!(with_error["provider"], "openai");
         assert_eq!(with_error["model"], "gpt-5-mini");
         assert_eq!(with_error["attempts"], 3);
         assert_eq!(with_error["elapsed_ms"], 912);
         assert_eq!(with_error["error"], "HTTP 429");
+        assert_eq!(with_error["error_kind"], "rate_limited");
 
         let without_error = provider_event_detail(
             "anthropic",
@@ -1714,6 +1689,7 @@ mod tests {
             provider: "anthropic",
             model: "claude-3-5-sonnet-latest".to_owned(),
             api_base: AnthropicConfig::default_api_base(),
+            kind: Some(ProviderErrorKind::ServerError),
             message: "boom".to_owned(),
             stats: ProviderInvocationStats {
                 attempts: 1,
