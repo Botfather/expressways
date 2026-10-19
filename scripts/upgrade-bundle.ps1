@@ -90,7 +90,8 @@ try {
 }
 
 try {
-    $Transaction = "{0}-{1}" -f (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"), $PID
+    # Scripts invoked in-process share $PID, so add a random suffix to keep same-second transactions apart.
+    $Transaction = "{0}-{1}-{2}" -f (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ"), $PID, [Guid]::NewGuid().ToString("N").Substring(0, 8)
     $Backup = Join-Path $UpgradeRoot $Transaction
     $Staging = Join-Path $Backup "staging"
     New-Item -ItemType Directory -Force -Path $Staging, (Join-Path $Backup "previous") | Out-Null

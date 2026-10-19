@@ -5,7 +5,11 @@ $TestRoot = Join-Path ([IO.Path]::GetTempPath()) ("expressways-bundle-upgrade-" 
 function New-TestExe([string]$Path, [int]$ExitCode) {
     $ClassName = "Program" + [Guid]::NewGuid().ToString("N")
     $Source = "public static class $ClassName { public static int Main(string[] args) { return $ExitCode; } }"
-    Add-Type -TypeDefinition $Source -Language CSharp -OutputAssembly $Path -OutputType ConsoleApplication
+    # PowerShell 7 Add-Type cannot emit executables, so use the .NET Framework compiler shipped with Windows.
+    $SourcePath = Join-Path $TestRoot "$ClassName.cs"
+    Set-Content -LiteralPath $SourcePath -Value $Source
+    & (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe") /nologo /target:exe "/out:$Path" $SourcePath | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "csc failed to build test executable: $Path" }
 }
 
 function New-Bundle([string]$Path, [string]$Version, [bool]$Healthy) {

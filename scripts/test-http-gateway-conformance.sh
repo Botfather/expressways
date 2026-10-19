@@ -71,7 +71,8 @@ mkdir -p \
 cargo build -q \
   -p expressways-server \
   -p expressways-http-gateway \
-  -p expressways-client --bin expresswaysctl
+  -p expressways-client \
+  --bins
 
 target/debug/expresswaysctl generate-keypair \
   --key-id dev \
