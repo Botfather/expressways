@@ -70,11 +70,11 @@ Consumes the discovery-registry stream to maintain a local, event-driven view of
 
 ### Segmented Storage
 
-Stores append-only records per topic in binary segment files with sidecar indexes for offset-based reads. Topics also carry default compliance tags and retention classes. The storage layer also enforces per-retention-class byte budgets, a global disk-pressure ceiling, and segment recovery that can rebuild indexes and truncate partial trailing frames after an unclean write.
+Stores append-only records per topic in binary segment files with sidecar indexes for offset-based reads. Topics also carry default compliance tags and retention classes. The storage layer also enforces per-retention-class byte budgets, a global disk-pressure ceiling, and segment recovery that can rebuild indexes and truncate partial trailing frames after an unclean write. Publish success is returned only after both the segment frame and its index entry have crossed the filesystem durability boundary; newly created entries and atomic state replacements include parent-directory synchronization.
 
 ### Audit Sink
 
-Persists append-only audit events with hash chaining so tampering can be detected. Operators can also verify and export the audit chain offline.
+Persists append-only audit events with hash chaining so tampering can be detected. Successful appends cross the filesystem durability boundary before acknowledgement, and failed partial appends roll back to the prior durable length. Operators can also verify and export the audit chain offline.
 
 ### Metrics Snapshot
 

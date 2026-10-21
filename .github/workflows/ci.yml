@@ -48,6 +48,13 @@ jobs:
       - name: Lint Workspace
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Deny Production Unwrap and Expect Panics
+        run: >-
+          cargo clippy --workspace --all-features --
+          -D warnings
+          -D clippy::unwrap_used
+          -D clippy::expect_used
+
       - name: Test Workspace
         run: cargo test --workspace --all-features
 
@@ -100,6 +107,19 @@ jobs:
           -p expressways-nanobot-system
           -p expressways-interop-bridge
           --bins
+
+      - name: Test Cross-platform Persistence Paths (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          cargo test
+          -p expressways-client
+          -p expressways-adapter-sdk
+          -p expressways-orchestrator
+          -p expressways-nanobot-system
+          -p expressways-storage
+          -p expressways-bench
+          -p expressways-console
+          --all-targets
 
       - name: Render Native Per-user Service Definition (macOS)
         if: runner.os == 'macOS'

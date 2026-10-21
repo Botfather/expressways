@@ -1255,10 +1255,7 @@ async fn process_request_with_attachment(
             None,
         ),
         ControlCommand::OpenAgentWatchStream { .. } => (
-            ControlResponse::error(
-                "invalid_request",
-                "streaming watch must use the streaming transport",
-            ),
+            handle_invalid_stream_transport(state, request.capability_token).await,
             None,
         ),
         ControlCommand::CleanupStaleAgents => (
@@ -1355,6 +1352,37 @@ async fn process_request_with_attachment(
             None,
         ),
     }
+}
+
+async fn handle_invalid_stream_transport(
+    state: &BrokerState,
+    capability_token: String,
+) -> ControlResponse {
+    let resource = REGISTRY_RESOURCE.to_owned();
+    let identity = match authenticate_and_authorize(
+        state,
+        &capability_token,
+        Action::Admin,
+        &resource,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    let message = "streaming watch must use the streaming transport".to_owned();
+    if let Err(error) = finalize_failure(
+        state,
+        &identity,
+        Action::Admin,
+        &resource,
+        Some(message.clone()),
+    )
+    .await
+    {
+        return ControlResponse::error("audit_failure", error.to_string());
+    }
+    ControlResponse::error("invalid_request", message)
 }
 
 async fn handle_health(state: &BrokerState, capability_token: String) -> ControlResponse {
@@ -4198,6 +4226,45 @@ mod tests {
         assert!(audit.contains("\"decision\":\"deny\""));
         assert!(audit.contains("local:agent-alpha"));
         assert!(audit.contains("system:broker"));
+    }
+
+    #[tokio::test]
+    async fn stream_command_on_request_transport_is_authenticated_and_audited() {
+        let root = test_root();
+        let (issuer, public_key_path) = write_issuer(&root, "dev");
+        let config = app_config(&root, public_key_path);
+        let state = build_state(&config).expect("build broker state");
+        let (_, token) = issue_token(
+            &issuer,
+            "local:developer",
+            vec![CapabilityScope {
+                resource: "registry:agents*".to_owned(),
+                actions: vec![Action::Admin],
+            }],
+        );
+
+        let response = process_request(
+            &state,
+            ControlRequest {
+                capability_token: token,
+                command: ControlCommand::OpenAgentWatchStream {
+                    query: AgentQuery::default(),
+                    cursor: None,
+                    max_events: 10,
+                    wait_timeout_ms: 1_000,
+                },
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            ControlResponse::Error { ref code, .. } if code == "invalid_request"
+        ));
+        let audit = fs::read_to_string(&config.audit.path).expect("read audit");
+        assert!(audit.contains("\"outcome\":\"failed\""));
+        assert!(audit.contains("streaming watch must use the streaming transport"));
+        assert!(audit.contains("local:developer"));
     }
 
     #[tokio::test]

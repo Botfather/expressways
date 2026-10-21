@@ -120,14 +120,30 @@ impl ArtifactStore {
             });
         }
 
+        let metadata = ArtifactMetadata {
+            artifact_id: artifact_id.clone(),
+            content_type: request.content_type,
+            byte_length,
+            sha256: actual_sha256.clone(),
+            classification: request.classification,
+            retention_class: request.retention_class,
+            created_at: Utc::now(),
+            principal: request.principal,
+            // Broker filesystem paths are never part of the remote artifact contract.
+            local_path: None,
+        };
+        let serialized_metadata = serde_json::to_vec_pretty(&metadata)?;
+
         // Serialize the existence check and two-file commit within this store.
         // A retried named upload is therefore deterministic even when requests
         // arrive concurrently through cloned handles.
         let _put_guard = self.put_lock.lock().map_err(|_| {
             ArtifactError::Io(std::io::Error::other("artifact put lock is poisoned"))
         })?;
-        if blob_path.exists() || metadata_path.exists() {
-            if blob_path.exists() && metadata_path.exists() {
+        let blob_exists = blob_path.exists();
+        let metadata_exists = metadata_path.exists();
+        if blob_exists || metadata_exists {
+            if blob_exists && metadata_exists {
                 let (existing, _) = self.get(&artifact_id)?;
                 if existing.byte_length == byte_length
                     && existing.sha256.eq_ignore_ascii_case(&actual_sha256)
@@ -136,6 +152,31 @@ impl ArtifactStore {
                 }
                 return Err(ArtifactError::AlreadyExists(artifact_id));
             }
+
+            // Metadata is the commit record for an artifact. A crash can leave a
+            // fully durable blob without that record. Complete the interrupted
+            // transaction only when the retried bytes match exactly; never let a
+            // different upload claim an orphaned blob.
+            if blob_exists {
+                let blob_root = self.root.join("blobs");
+                let existing =
+                    read_bounded_contained(&blob_path, &blob_root, MAX_ARTIFACT_BYTES, "blob")?;
+                let existing_length = u64::try_from(existing.len()).unwrap_or(u64::MAX);
+                let existing_sha256 = sha256_hex(&existing);
+                if existing_length != byte_length
+                    || !existing_sha256.eq_ignore_ascii_case(&actual_sha256)
+                {
+                    return Err(ArtifactError::InvalidMetadata(format!(
+                        "artifact `{artifact_id}` has an uncommitted blob that does not match the retried upload"
+                    )));
+                }
+
+                write_new(&metadata_path, &serialized_metadata).map_err(ArtifactError::Io)?;
+                return Ok(metadata);
+            }
+
+            // A commit record without its blob represents data loss, not an
+            // interrupted commit that can be reconstructed from this request.
             return Err(ArtifactError::InvalidMetadata(format!(
                 "artifact `{artifact_id}` has an incomplete blob/metadata pair"
             )));
@@ -148,20 +189,6 @@ impl ArtifactStore {
             create_private_dir(parent)?;
         }
 
-        let metadata = ArtifactMetadata {
-            artifact_id: artifact_id.clone(),
-            content_type: request.content_type,
-            byte_length,
-            sha256: actual_sha256,
-            classification: request.classification,
-            retention_class: request.retention_class,
-            created_at: Utc::now(),
-            principal: request.principal,
-            // Broker filesystem paths are never part of the remote artifact contract.
-            local_path: None,
-        };
-        let serialized_metadata = serde_json::to_vec_pretty(&metadata)?;
-
         write_new(&blob_path, &request.data).map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 ArtifactError::AlreadyExists(artifact_id.clone())
@@ -170,7 +197,13 @@ impl ArtifactStore {
             }
         })?;
         if let Err(error) = write_new(&metadata_path, &serialized_metadata) {
-            let _ = fs::remove_file(&blob_path);
+            // If the metadata file exists, write_new may only have failed while
+            // syncing its parent directory. Keep the complete pair recoverable.
+            // Otherwise clean up the uncommitted blob best-effort; a crash or a
+            // failed cleanup is safe because an identical retry can finish it.
+            if !metadata_path.exists() && fs::remove_file(&blob_path).is_ok() {
+                let _ = sync_parent(&blob_path);
+            }
             return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
                 ArtifactError::AlreadyExists(artifact_id)
             } else {
@@ -258,7 +291,23 @@ fn write_new(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
-    file.sync_all()
+    file.sync_all()?;
+    sync_parent(path)
+}
+
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+        })?;
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
@@ -455,6 +504,76 @@ mod tests {
         assert!(matches!(
             store.put(conflict),
             Err(ArtifactError::AlreadyExists(id)) if id == "content-addressed-blob"
+        ));
+    }
+
+    #[test]
+    fn retry_completes_an_interrupted_blob_first_commit() {
+        let root = temp_root("interrupted-put");
+        let store = ArtifactStore::new(root).expect("create store");
+        let artifact_id = "recoverable-blob";
+        let data = b"durable bytes".to_vec();
+
+        write_new(&store.blob_path(artifact_id), &data).expect("simulate durable blob write");
+        assert!(!store.metadata_path(artifact_id).exists());
+
+        let conflicting = store
+            .put(PutArtifactRequest {
+                artifact_id: Some(artifact_id.to_owned()),
+                content_type: "application/octet-stream".to_owned(),
+                data: b"different bytes".to_vec(),
+                sha256: None,
+                classification: Classification::Internal,
+                retention_class: RetentionClass::Operational,
+                principal: "local:adapter".to_owned(),
+            })
+            .expect_err("different retry must not claim orphaned blob");
+        assert!(matches!(
+            conflicting,
+            ArtifactError::InvalidMetadata(message)
+                if message.contains("uncommitted blob")
+        ));
+        assert!(!store.metadata_path(artifact_id).exists());
+
+        let recovered = store
+            .put(PutArtifactRequest {
+                artifact_id: Some(artifact_id.to_owned()),
+                content_type: "application/octet-stream".to_owned(),
+                data: data.clone(),
+                sha256: None,
+                classification: Classification::Internal,
+                retention_class: RetentionClass::Operational,
+                principal: "local:adapter".to_owned(),
+            })
+            .expect("matching retry should finish metadata commit");
+
+        assert_eq!(recovered.byte_length, data.len() as u64);
+        assert!(store.metadata_path(artifact_id).exists());
+        assert_eq!(
+            store.get(artifact_id).expect("read recovered artifact").1,
+            data
+        );
+    }
+
+    #[test]
+    fn metadata_without_a_blob_fails_closed() {
+        let root = temp_root("missing-blob");
+        let store = ArtifactStore::new(root).expect("create store");
+        let artifact_id = "lost-blob";
+        write_new(&store.metadata_path(artifact_id), b"{}").expect("simulate metadata-only state");
+
+        assert!(matches!(
+            store.put(PutArtifactRequest {
+                artifact_id: Some(artifact_id.to_owned()),
+                content_type: "application/octet-stream".to_owned(),
+                data: b"replacement".to_vec(),
+                sha256: None,
+                classification: Classification::Internal,
+                retention_class: RetentionClass::Operational,
+                principal: "local:adapter".to_owned(),
+            }),
+            Err(ArtifactError::InvalidMetadata(message))
+                if message.contains("incomplete blob/metadata pair")
         ));
     }
 

@@ -15,12 +15,13 @@ BACKUP_OUTPUT_DIR ?= ./var/agent/backups
 BACKUP_SIGNING_PRIVATE_KEY ?= ./var/auth/issuer.private
 BACKUP_VERIFICATION_PUBLIC_KEY ?= ./var/auth/issuer.public
 RESTORE_BACKUP_DIR ?=
+CONFIRM_WRITERS_STOPPED ?= 0
 STATE_PATH ?= ./var/orchestrator/state.json
 CONFIG_AUDIT_LOG ?= ./var/agent/config-audit/entries.jsonl
 TASKS_TOPIC ?= tasks
 TASK_EVENTS_TOPIC ?= task_events
 DASHBOARD_LISTEN ?= 127.0.0.1:8787
-DASHBOARD_ACCESS_ARGS ?=
+DASHBOARD_ACCESS_ARGS ?= --access-bearer-file ./var/auth/dashboard.token
 STARTUP_DELAY_SECONDS ?= 1
 OLLAMA_AGENT_ID ?= ollama-chat-agent
 OLLAMA_MODEL ?= llama3.2
@@ -55,8 +56,8 @@ help:
 	@echo "  make verify-first-run  Verify health, metrics, publish, and consume using admin token"
 	@echo "  make export-support-bundle Export config/audit/config-audit/log diagnostics and broker snapshot JSON bundle"
 	@echo "  make validate-support-bundle Validate top-10 incident diagnostic coverage for a support bundle"
-	@echo "  make backup-runtime    Capture runtime backup bundle (config + state) under $(BACKUP_OUTPUT_DIR)"
-	@echo "  make restore-runtime   Restore runtime state from RESTORE_BACKUP_DIR (must be set)"
+	@echo "  make backup-runtime    Capture quiesced runtime state (requires CONFIRM_WRITERS_STOPPED=1)"
+	@echo "  make restore-runtime   Restore runtime state (requires RESTORE_BACKUP_DIR and CONFIRM_WRITERS_STOPPED=1)"
 	@echo "  make rehearse-clean-machine Run timed clean-machine bootstrap rehearsal and write evidence report"
 	@echo "  make rehearse-rollback Run failed-upgrade rollback rehearsal and write pass/fail report"
 	@echo "  make rehearse-config-rollback-reliability Run config-console rollback reliability rehearsal and emit trend report"
@@ -79,6 +80,7 @@ check-hygiene:
 check: check-hygiene
 	cargo fmt --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 	cargo deny check advisories licenses sources
 	cargo test --workspace --all-features
 
@@ -212,14 +214,22 @@ validate-support-bundle:
 	cargo run -p expressways-client --bin expresswaysctl -- validate-support-bundle --bundle $(SUPPORT_BUNDLE_OUTPUT) --output $(SUPPORT_BUNDLE_COVERAGE_OUTPUT)
 
 backup-runtime:
-	cargo run -p expressways-client --bin expresswaysctl -- backup-runtime --config $(EXPRESSWAYS_CONFIG) --output-dir $(BACKUP_OUTPUT_DIR) --config-audit-log $(CONFIG_AUDIT_LOG) --orchestrator-state $(STATE_PATH) --signing-private-key $(BACKUP_SIGNING_PRIVATE_KEY) --signing-key-id $(ADMIN_KEY_ID)
+	@if [ "$(CONFIRM_WRITERS_STOPPED)" != "1" ]; then \
+		echo "Stop the broker, orchestrator, adapters, and all other runtime-state writers, then rerun with CONFIRM_WRITERS_STOPPED=1"; \
+		exit 1; \
+	fi
+	cargo run -p expressways-client --bin expresswaysctl -- backup-runtime --config $(EXPRESSWAYS_CONFIG) --output-dir $(BACKUP_OUTPUT_DIR) --config-audit-log $(CONFIG_AUDIT_LOG) --orchestrator-state $(STATE_PATH) --signing-private-key $(BACKUP_SIGNING_PRIVATE_KEY) --signing-key-id $(ADMIN_KEY_ID) --confirm-writers-stopped
 
 restore-runtime:
 	@if [ -z "$(RESTORE_BACKUP_DIR)" ]; then \
 		echo "RESTORE_BACKUP_DIR is required. Example: make restore-runtime RESTORE_BACKUP_DIR=./var/agent/backups/expressways-backup-<timestamp>"; \
 		exit 1; \
 	fi
-	cargo run -p expressways-client --bin expresswaysctl -- restore-runtime --backup-dir $(RESTORE_BACKUP_DIR) --config $(EXPRESSWAYS_CONFIG) --config-audit-log $(CONFIG_AUDIT_LOG) --orchestrator-state $(STATE_PATH) --verification-public-key $(BACKUP_VERIFICATION_PUBLIC_KEY) --overwrite
+	@if [ "$(CONFIRM_WRITERS_STOPPED)" != "1" ]; then \
+		echo "Stop the broker, orchestrator, adapters, and all other runtime-state writers, then rerun with CONFIRM_WRITERS_STOPPED=1"; \
+		exit 1; \
+	fi
+	cargo run -p expressways-client --bin expresswaysctl -- restore-runtime --backup-dir $(RESTORE_BACKUP_DIR) --config $(EXPRESSWAYS_CONFIG) --config-audit-log $(CONFIG_AUDIT_LOG) --orchestrator-state $(STATE_PATH) --verification-public-key $(BACKUP_VERIFICATION_PUBLIC_KEY) --overwrite --confirm-writers-stopped
 
 rehearse-clean-machine:
 	bash scripts/rehearsal-clean-machine.sh

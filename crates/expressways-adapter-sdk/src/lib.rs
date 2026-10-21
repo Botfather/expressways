@@ -412,10 +412,6 @@ fn atomic_private_replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let mut file = options.open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
         fs::rename(&temporary, path)?;
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;

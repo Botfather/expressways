@@ -479,14 +479,10 @@ fn validate_default_retry_policy(
 }
 
 async fn run_server(runtime: BridgeRuntime) -> anyhow::Result<()> {
+    require_ingress_bearer(runtime.ingress_bearer.as_deref())?;
     let listener = TcpListener::bind(&runtime.listen)
         .await
         .with_context(|| format!("failed to bind bridge listener on {}", runtime.listen))?;
-    let local_addr = listener.local_addr()?;
-    validate_bridge_exposure(
-        local_addr.ip().is_loopback(),
-        runtime.ingress_bearer.as_deref(),
-    )?;
     let connection_limit = Arc::new(Semaphore::new(runtime.max_connections));
     let egress_task = runtime
         .egress_url
@@ -536,9 +532,9 @@ async fn run_server(runtime: BridgeRuntime) -> anyhow::Result<()> {
     }
 }
 
-fn validate_bridge_exposure(loopback: bool, ingress_bearer: Option<&str>) -> anyhow::Result<()> {
-    if !loopback && ingress_bearer.is_none() {
-        bail!("ingress bearer authentication is required for non-loopback listeners");
+fn require_ingress_bearer(ingress_bearer: Option<&str>) -> anyhow::Result<()> {
+    if ingress_bearer.is_none() {
+        bail!("ingress bearer authentication is required");
     }
     Ok(())
 }
@@ -667,14 +663,15 @@ async fn submit_webhook(
         .correlation_id
         .clone()
         .unwrap_or_else(|| derive_correlation_id(&webhook));
-    let task_id = webhook.task_id.clone().unwrap_or_else(|| {
-        deterministic_task_id(
+    let task_id = match webhook.task_id.clone() {
+        Some(task_id) => task_id,
+        None => deterministic_task_id(
             webhook
                 .idempotency_key
                 .as_deref()
                 .unwrap_or(&correlation_id),
-        )
-    });
+        )?,
+    };
     let task_type = webhook
         .task_type
         .unwrap_or_else(|| runtime.task_type.clone());
@@ -830,9 +827,9 @@ fn derive_correlation_id(webhook: &BridgeWebhookRequest) -> String {
     format!("corr-{:x}", Sha256::digest(source.as_bytes()))
 }
 
-fn deterministic_task_id(idempotency_key: &str) -> String {
+fn deterministic_task_id(idempotency_key: &str) -> Result<String, HttpError> {
     stable_id("interop", idempotency_key)
-        .expect("validated idempotency key and fixed prefix produce a stable id")
+        .map_err(|error| HttpError::bad_request(format!("invalid idempotency key: {error}")))
 }
 
 fn validate_webhook(webhook: &BridgeWebhookRequest) -> Result<(), HttpError> {
@@ -1718,7 +1715,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 fn bearer_authorized(headers: &HashMap<String, String>, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
-        return true;
+        return false;
     };
     headers
         .get("authorization")
@@ -1780,7 +1777,7 @@ fn json_response<T: Serialize>(status_code: u16, value: &T) -> HttpResponse {
 
 fn error_json_response(status_code: u16, message: String) -> HttpResponse {
     let body = serde_json::to_vec_pretty(&serde_json::json!({ "error": message }))
-        .expect("serialize error response");
+        .unwrap_or_else(|_| br#"{"error":"failed to encode error response"}"#.to_vec());
     HttpResponse {
         status_code,
         reason: status_reason(status_code),
@@ -1926,14 +1923,13 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secreu"));
         assert!(!constant_time_eq(b"secret", b"secret-longer"));
-        assert!(validate_bridge_exposure(true, None).is_ok());
-        assert!(validate_bridge_exposure(false, Some("secret")).is_ok());
-        assert!(validate_bridge_exposure(false, None).is_err());
+        assert!(require_ingress_bearer(None).is_err());
+        assert!(require_ingress_bearer(Some("secret")).is_ok());
         let mut headers = HashMap::new();
         assert!(!bearer_authorized(&headers, Some("secret")));
         headers.insert("authorization".to_owned(), "Bearer secret".to_owned());
         assert!(bearer_authorized(&headers, Some("secret")));
-        assert!(bearer_authorized(&HashMap::new(), None));
+        assert!(!bearer_authorized(&HashMap::new(), None));
         let response = encode_http_response(&error_json_response(400, "bad".to_owned()));
         let response = String::from_utf8(response).expect("response is UTF-8");
         assert!(response.contains("Content-Security-Policy: default-src 'none'"));
@@ -2057,8 +2053,8 @@ mod tests {
     #[test]
     fn identifiers_are_deterministic_and_an_identity_is_required() {
         assert_eq!(
-            deterministic_task_id("channel-message-1"),
-            deterministic_task_id("channel-message-1")
+            deterministic_task_id("channel-message-1").expect("derive first id"),
+            deterministic_task_id("channel-message-1").expect("derive second id")
         );
         let raw = serde_json::json!({
             "schema_version": INTEROP_CHAT_HANDOFF_SCHEMA_VERSION,

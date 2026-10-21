@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -44,9 +44,8 @@ impl SessionStore {
         rendered.push(b'\n');
         let mut file = open_bounded_private_append(&path, rendered.len())
             .with_context(|| format!("failed to open {}", path.display()))?;
-        file.write_all(&rendered)
+        append_durable_jsonl_record(&mut file, &path, &rendered)
             .with_context(|| format!("failed to append {}", path.display()))?;
-        file.flush()?;
         Ok(())
     }
 
@@ -101,9 +100,8 @@ impl MemoryStore {
         rendered.push(b'\n');
         let mut file = open_bounded_private_append(&path, rendered.len())
             .with_context(|| format!("failed to open {}", path.display()))?;
-        file.write_all(&rendered)
+        append_durable_jsonl_record(&mut file, &path, &rendered)
             .with_context(|| format!("failed to append {}", path.display()))?;
-        file.flush()?;
         Ok(())
     }
 
@@ -250,7 +248,7 @@ fn open_bounded_private_append(path: &Path, record_bytes: usize) -> anyhow::Resu
         bail!("state path {} is not a regular file", path.display());
     }
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.read(true).create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -262,7 +260,7 @@ fn open_bounded_private_append(path: &Path, record_bytes: usize) -> anyhow::Resu
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    let current_bytes = file.metadata()?.len();
+    let current_bytes = repair_partial_jsonl_tail(&file, file.metadata()?.len())?;
     let record_bytes = u64::try_from(record_bytes).context("record length overflow")?;
     if current_bytes.saturating_add(record_bytes) > MAX_JSONL_FILE_BYTES {
         bail!(
@@ -272,6 +270,81 @@ fn open_bounded_private_append(path: &Path, record_bytes: usize) -> anyhow::Resu
         );
     }
     Ok(file)
+}
+
+fn repair_partial_jsonl_tail(mut file: &File, current_bytes: u64) -> std::io::Result<u64> {
+    if current_bytes == 0 {
+        return Ok(0);
+    }
+
+    file.seek(SeekFrom::End(-1))?;
+    let mut final_byte = [0_u8; 1];
+    file.read_exact(&mut final_byte)?;
+    if final_byte[0] == b'\n' {
+        return Ok(current_bytes);
+    }
+
+    const SCAN_BYTES: u64 = 8 * 1024;
+    let mut end = current_bytes;
+    let mut buffer = vec![0_u8; SCAN_BYTES as usize];
+    while end > 0 {
+        let start = end.saturating_sub(SCAN_BYTES);
+        let length = usize::try_from(end - start).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "JSONL tail length overflow",
+            )
+        })?;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..length])?;
+        if let Some(position) = buffer[..length].iter().rposition(|byte| *byte == b'\n') {
+            let repaired_length = start + position as u64 + 1;
+            file.set_len(repaired_length)?;
+            file.sync_data()?;
+            return Ok(repaired_length);
+        }
+        end = start;
+    }
+
+    file.set_len(0)?;
+    file.sync_data()?;
+    Ok(0)
+}
+
+fn append_durable_jsonl_record(file: &mut File, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let original_length = file.metadata()?.len();
+    let append_result = (|| {
+        file.write_all(bytes)?;
+        file.sync_data()?;
+        sync_parent_dir(path)
+    })();
+    if let Err(append_error) = append_result {
+        let rollback_result = file
+            .set_len(original_length)
+            .and_then(|()| file.sync_data());
+        return Err(match rollback_result {
+            Ok(()) => append_error,
+            Err(rollback_error) => std::io::Error::other(format!(
+                "JSONL append failed ({append_error}); rollback to {original_length} bytes also failed ({rollback_error})"
+            )),
+        });
+    }
+    Ok(())
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+        })?;
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn read_bounded_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
@@ -301,7 +374,7 @@ fn read_bounded_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp_path = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
     let result = (|| {
         let mut options = OpenOptions::new();
@@ -314,10 +387,6 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let mut file = options.open(&temp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
         fs::rename(&temp_path, path)?;
         #[cfg(unix)]
         if let Some(parent) = path.parent() {
@@ -372,7 +441,7 @@ fn session_component(value: &str) -> anyhow::Result<String> {
     encoded.push('~');
     for byte in value.as_bytes() {
         use std::fmt::Write as _;
-        write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+        let _ = write!(&mut encoded, "{byte:02x}");
     }
     Ok(encoded)
 }
@@ -475,6 +544,16 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].text.as_deref(), Some("two"));
         assert_eq!(turns[1].text.as_deref(), Some("three"));
+
+        store
+            .append_turn("chat", &test_turn("four"))
+            .expect("repair partial tail and append four");
+        let recovered = store
+            .load_recent_turns("chat", 2)
+            .expect("load after tail repair");
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].text.as_deref(), Some("three"));
+        assert_eq!(recovered[1].text.as_deref(), Some("four"));
 
         #[cfg(unix)]
         {

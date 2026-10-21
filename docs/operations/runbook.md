@@ -31,21 +31,39 @@ make export-support-bundle
 make validate-support-bundle
 ```
 
+If verification reports only an incomplete final record after an unclean shutdown, stop all writers and preserve a copy of the original log. The bounded repair command verifies the complete prefix and saves the removed bytes to a new owner-only quarantine file before truncating:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- repair-audit-tail \
+  --path ./var/audit/audit.jsonl \
+  --quarantine-output ./var/agent/audit-incomplete-tail.json \
+  --confirm
+cargo run -p expressways-client --bin expresswaysctl -- verify-audit \
+  --path ./var/audit/audit.jsonl
+```
+
+Do not use tail repair for a complete malformed record or hash mismatch; the command deliberately refuses those cases. Preserve evidence and investigate instead.
+
 ## Backup and Restore
 
 Create a signed runtime backup:
 
 ```bash
-make backup-runtime
+# First stop the broker, orchestrator, adapters, and all other state writers.
+make backup-runtime CONFIRM_WRITERS_STOPPED=1
 ```
 
 Restore only during a controlled maintenance window, after preserving the current state and stopping writers:
 
 ```bash
-make restore-runtime RESTORE_BACKUP_DIR=./var/agent/backups/<backup-directory>
+make restore-runtime RESTORE_BACKUP_DIR=./var/agent/backups/<backup-directory> CONFIRM_WRITERS_STOPPED=1
 ```
 
 The restore command verifies the backup signature and requires explicit overwrite behavior. After restoration, restart the broker and run `make verify-first-run`. Periodically exercise the full isolated recovery path with `make rehearse-dr-restore-clean-env`.
+
+The runtime bundle intentionally excludes secrets: issuer private keys, issued capability tokens, provider API keys, dashboard or bridge bearer secrets, and external TLS material. Keep the backup verification public key and the matching issuer private-key recovery material in a separately encrypted, access-controlled escrow; do not store that escrow beside the runtime bundle. Record the key ID, recovery owner, rotation date, and a tested retrieval procedure. After a host-loss restore, recover the trusted public key first, verify and restore the runtime bundle, recover or rotate the issuer key under dual control, issue fresh short-lived operator and service tokens, and revoke credentials that may have been exposed. A runtime backup without independently recoverable trust material is not a complete disaster-recovery set.
+
+Before relying on a backup, verify that every non-default adapter or agent checkpoint is included through `--additional-state NAME=PATH`. Keep an inventory with an owner, recovery priority, target RPO, and last successful rehearsal. The built-in rehearsal proves broker state plus the shipped orchestrator, interop bridge, and Nanobot defaults; external databases, model-provider state, channel infrastructure, and custom integrations need their own restore tests.
 
 ## Upgrade and Rollback
 

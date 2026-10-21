@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -82,6 +82,17 @@ pub struct AuditVerificationReport {
     pub last_event_id: Option<Uuid>,
     pub first_timestamp: Option<DateTime<Utc>>,
     pub last_timestamp: Option<DateTime<Utc>>,
+    pub last_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditTailRepairReport {
+    pub path: PathBuf,
+    pub quarantine_path: PathBuf,
+    pub original_bytes: u64,
+    pub repaired_bytes: u64,
+    pub removed_bytes: u64,
+    pub retained_events: u64,
     pub last_hash: Option<String>,
 }
 
@@ -169,6 +180,7 @@ impl AuditSink {
             )));
         }
         set_private_file_permissions(&file)?;
+        let original_length = file.metadata()?.len();
 
         let encoded = serde_json::to_vec(&event)?;
         if encoded.len() > MAX_AUDIT_EVENT_BYTES {
@@ -179,9 +191,24 @@ impl AuditSink {
             .checked_add(1)
             .ok_or(AuditError::EventCountExhausted)?;
 
-        file.write_all(&encoded)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
+        let append_result = (|| -> std::io::Result<()> {
+            file.write_all(&encoded)?;
+            file.write_all(b"\n")?;
+            file.sync_data()?;
+            sync_parent_dir(&self.path)?;
+            Ok(())
+        })();
+        if let Err(append_error) = append_result {
+            let rollback_result = file
+                .set_len(original_length)
+                .and_then(|()| file.sync_data());
+            return Err(AuditError::Io(match rollback_result {
+                Ok(()) => append_error,
+                Err(rollback_error) => std::io::Error::other(format!(
+                    "audit append failed ({append_error}); rollback to {original_length} bytes also failed ({rollback_error})"
+                )),
+            }));
+        }
 
         self.event_count = next_event_count;
         self.previous_hash = Some(hash);
@@ -198,6 +225,21 @@ impl AuditSink {
             last_hash: self.previous_hash.clone(),
         }
     }
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+        })?;
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
@@ -291,6 +333,14 @@ pub fn visit_verified_events(
     };
 
     let mut reader = BufReader::new(file);
+    visit_verified_reader(path, &mut reader, &mut visitor)
+}
+
+fn visit_verified_reader(
+    path: PathBuf,
+    reader: &mut impl BufRead,
+    visitor: &mut impl FnMut(&AuditEvent) -> Result<(), AuditError>,
+) -> Result<AuditVerificationReport, AuditError> {
     let mut previous_hash: Option<String> = None;
     let mut event_count = 0_u64;
     let mut first_event_id = None;
@@ -299,7 +349,7 @@ pub fn visit_verified_events(
     let mut last_timestamp = None;
     let mut encoded = Vec::new();
 
-    while read_limited_line(&mut reader, &mut encoded)? {
+    while read_limited_line(reader, &mut encoded)? {
         if encoded.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -358,6 +408,128 @@ pub fn visit_verified_events(
         first_timestamp,
         last_timestamp,
         last_hash: previous_hash,
+    })
+}
+
+pub fn repair_incomplete_tail(
+    path: impl AsRef<Path>,
+    quarantine_path: impl AsRef<Path>,
+) -> Result<AuditTailRepairReport, AuditError> {
+    let path = path.as_ref().to_path_buf();
+    let quarantine_path = quarantine_path.as_ref().to_path_buf();
+    if path == quarantine_path {
+        return Err(AuditError::Integrity(
+            "audit repair quarantine must differ from the audit log".to_owned(),
+        ));
+    }
+
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(AuditError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit path is not a regular file",
+        )));
+    }
+    let original_bytes = metadata.len();
+    if original_bytes == 0 {
+        return Err(AuditError::Integrity(
+            "audit log is empty and has no incomplete tail".to_owned(),
+        ));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(AuditError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit path is not a regular file",
+        )));
+    }
+
+    file.seek(SeekFrom::End(-1))?;
+    let mut final_byte = [0_u8; 1];
+    file.read_exact(&mut final_byte)?;
+    if final_byte[0] == b'\n' {
+        return Err(AuditError::Integrity(
+            "audit log ends at a complete record boundary; refusing repair".to_owned(),
+        ));
+    }
+
+    let scan_limit = (MAX_AUDIT_EVENT_BYTES as u64).saturating_add(1);
+    let scan_floor = original_bytes.saturating_sub(scan_limit);
+    let mut end = original_bytes;
+    let mut repaired_bytes = None;
+    let mut buffer = vec![0_u8; 8 * 1024];
+    while end > scan_floor {
+        let start = end.saturating_sub(buffer.len() as u64).max(scan_floor);
+        let length = usize::try_from(end - start).map_err(|_| {
+            AuditError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "audit tail length overflow",
+            ))
+        })?;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..length])?;
+        if let Some(position) = buffer[..length].iter().rposition(|byte| *byte == b'\n') {
+            repaired_bytes = Some(start + position as u64 + 1);
+            break;
+        }
+        end = start;
+    }
+    let repaired_bytes = match repaired_bytes {
+        Some(bytes) => bytes,
+        None if scan_floor == 0 => 0,
+        None => return Err(AuditError::EventTooLarge),
+    };
+    let removed_bytes = original_bytes.saturating_sub(repaired_bytes);
+
+    let mut verification_file = file.try_clone()?;
+    verification_file.seek(SeekFrom::Start(0))?;
+    let mut verification_reader = BufReader::new(verification_file.take(repaired_bytes));
+    let verification =
+        visit_verified_reader(path.clone(), &mut verification_reader, &mut |_| Ok(()))?;
+
+    file.seek(SeekFrom::Start(repaired_bytes))?;
+    let mut tail = Vec::with_capacity(usize::try_from(removed_bytes).unwrap_or_default());
+    (&mut file).take(scan_limit).read_to_end(&mut tail)?;
+    if tail.len() as u64 != removed_bytes {
+        return Err(AuditError::Integrity(
+            "audit tail changed while preparing repair".to_owned(),
+        ));
+    }
+
+    if let Some(parent) = quarantine_path.parent() {
+        create_private_dir(parent)?;
+    }
+    let mut quarantine_options = OpenOptions::new();
+    quarantine_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        quarantine_options.mode(0o600);
+    }
+    let mut quarantine = quarantine_options.open(&quarantine_path)?;
+    quarantine.write_all(&tail)?;
+    quarantine.sync_all()?;
+    sync_parent_dir(&quarantine_path)?;
+
+    file.set_len(repaired_bytes)?;
+    file.sync_data()?;
+
+    Ok(AuditTailRepairReport {
+        path,
+        quarantine_path,
+        original_bytes,
+        repaired_bytes,
+        removed_bytes,
+        retained_events: verification.event_count,
+        last_hash: verification.last_hash,
     })
 }
 
@@ -472,6 +644,50 @@ mod tests {
 
         assert_eq!(second.prev_hash, Some(first.hash));
         assert_eq!(sink.summary().event_count, 2);
+    }
+
+    #[test]
+    fn incomplete_tail_repair_preserves_verified_prefix_and_quarantines_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("expressways-audit-repair-{}", Uuid::now_v7()));
+        let path = root.join("audit.jsonl");
+        let quarantine = root.join("audit.incomplete-tail");
+        let mut sink = AuditSink::new(&path).expect("create sink");
+        for detail in ["first", "second"] {
+            sink.append(DraftAuditEvent {
+                principal: "local:developer".to_owned(),
+                action: Action::Admin,
+                resource: "system:broker".to_owned(),
+                decision: AuditDecision::Allow,
+                outcome: AuditOutcome::Succeeded,
+                detail: Some(detail.to_owned()),
+            })
+            .expect("append event");
+        }
+        drop(sink);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open audit")
+            .write_all(b"{\"interrupted\":")
+            .expect("append incomplete tail");
+        assert!(verify_file(&path).is_err());
+
+        let report =
+            repair_incomplete_tail(&path, &quarantine).expect("repair incomplete audit tail");
+        assert_eq!(report.retained_events, 2);
+        assert_eq!(report.removed_bytes, b"{\"interrupted\":".len() as u64);
+        assert_eq!(
+            fs::read(&quarantine).expect("read quarantine"),
+            b"{\"interrupted\":"
+        );
+        assert_eq!(
+            verify_file(&path)
+                .expect("verify repaired audit")
+                .event_count,
+            2
+        );
+        assert!(repair_incomplete_tail(&path, root.join("unused")).is_err());
     }
 
     #[cfg(unix)]

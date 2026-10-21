@@ -292,6 +292,8 @@ impl Storage {
 
         let write_position = file_len(&segment_path)?;
         let original_index_len = file_len(&index_path)?;
+        let segment_existed = segment_path.exists();
+        let index_existed = index_path.exists();
         self.reserve_global_budget(entry_len)?;
         let write_result = (|| -> Result<(), StorageError> {
             let mut segment_options = OpenOptions::new();
@@ -300,14 +302,17 @@ impl Storage {
             let mut segment = segment_options.open(&segment_path)?;
             segment.write_all(&frame_len.to_le_bytes())?;
             segment.write_all(&encoded)?;
-            segment.flush()?;
+            segment.sync_data()?;
 
             let mut index_options = OpenOptions::new();
             index_options.create(true).append(true);
             set_private_open_mode(&mut index_options);
             let mut index = index_options.open(&index_path)?;
             index.write_all(&write_position.to_le_bytes())?;
-            index.flush()?;
+            index.sync_data()?;
+            if !segment_existed || !index_existed {
+                sync_parent_dir(&segment_path)?;
+            }
             Ok(())
         })();
         if let Err(error) = write_result {
@@ -590,8 +595,8 @@ impl Storage {
         messages.dedup_by_key(|message| message.offset);
 
         self.rewrite_binary_segments(topic, &messages)?;
-        fs::write(
-            self.migration_marker_path(topic),
+        atomic_replace(
+            &self.migration_marker_path(topic),
             b"legacy segments migrated",
         )?;
         Ok(())
@@ -604,6 +609,7 @@ impl Storage {
             return Ok(());
         }
 
+        let mut removed_orphan_index = false;
         for entry in fs::read_dir(&segments_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("idx")
@@ -612,7 +618,11 @@ impl Storage {
                 let bytes = fs::metadata(&path)?.len();
                 fs::remove_file(path)?;
                 self.decrease_total_bytes(bytes);
+                removed_orphan_index = true;
             }
+        }
+        if removed_orphan_index {
+            sync_parent_dir(&segments_dir.join("entry"))?;
         }
 
         for base_offset in self.segment_bases(topic)? {
@@ -792,14 +802,14 @@ impl Storage {
             let mut segment = segment_options.open(&segment_path)?;
             segment.write_all(&frame_len.to_le_bytes())?;
             segment.write_all(&encoded)?;
-            segment.flush()?;
+            segment.sync_data()?;
 
             let mut index_options = OpenOptions::new();
             index_options.create(true).append(true);
             set_private_open_mode(&mut index_options);
             let mut index = index_options.open(&index_path)?;
             index.write_all(&write_position.to_le_bytes())?;
-            index.flush()?;
+            index.sync_data()?;
 
             current_segment_len = current_segment_len.checked_add(entry_len).ok_or_else(|| {
                 StorageError::OffsetExhausted {
@@ -807,6 +817,8 @@ impl Storage {
                 }
             })?;
         }
+
+        sync_parent_dir(&segments_dir.join("entry"))?;
 
         state.active_segment_base = if messages.is_empty() { 0 } else { last_base };
         state.next_offset =
@@ -948,6 +960,9 @@ impl Storage {
             }
             rebuilt_index.flush()?;
             rebuilt_index.sync_all()?;
+            if truncated_bytes > 0 {
+                segment.sync_data()?;
+            }
             Ok(())
         })();
         if let Err(error) = rebuild_result {
@@ -969,11 +984,8 @@ impl Storage {
                 fs::remove_file(&temp_index_path)?;
                 return Ok(false);
             }
-            #[cfg(windows)]
-            if index_path.exists() {
-                fs::remove_file(&index_path)?;
-            }
             fs::rename(&temp_index_path, &index_path)?;
+            sync_parent_dir(&index_path)?;
             Ok(true)
         })();
         let recovered = match install_result {
@@ -1153,11 +1165,12 @@ impl Storage {
         let bytes = segment.segment_bytes.saturating_add(segment.index_bytes);
 
         if segment_path.exists() {
-            fs::remove_file(segment_path)?;
+            fs::remove_file(&segment_path)?;
         }
         if index_path.exists() {
-            fs::remove_file(index_path)?;
+            fs::remove_file(&index_path)?;
         }
+        sync_parent_dir(&segment_path)?;
 
         self.bump_reclaimed(1, bytes);
         Ok(bytes)
@@ -1226,7 +1239,9 @@ fn file_len(path: &Path) -> Result<u64, StorageError> {
 
 fn truncate_file(path: &Path, length: u64) -> Result<(), StorageError> {
     if path.exists() {
-        OpenOptions::new().write(true).open(path)?.set_len(length)?;
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(length)?;
+        file.sync_data()?;
     }
     Ok(())
 }
@@ -1313,13 +1328,29 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         set_private_open_mode(&mut options);
         let mut file = options.open(&temp_path)?;
         file.write_all(bytes)?;
-        file.flush()?;
-        fs::rename(&temp_path, path)
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        sync_parent_dir(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+        })?;
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn set_private_open_mode(options: &mut OpenOptions) {

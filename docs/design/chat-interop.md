@@ -36,7 +36,7 @@ The ingress credential needs only request-topic publish/admin and artifact publi
 
 The bridge consumes replies from its persisted offset. It advances that offset only after the channel endpoint returns a 2xx response and the new cursor is atomically synced to disk. Failures are retried without advancing the cursor, so delivery is at least once. The receiving channel must deduplicate the `Idempotency-Key` header or the reply envelope's `delivery_id`.
 
-HTTP egress must use HTTPS except for loopback development endpoints. Non-loopback ingress requires bearer authentication.
+HTTP egress must use HTTPS except for loopback development endpoints. Every ingress listener requires bearer authentication, including loopback listeners.
 
 ## Ingress
 

@@ -888,6 +888,8 @@ struct DashboardServerOptions {
 
 const MIN_DASHBOARD_REQUEST_TIMEOUT_MS: u64 = 100;
 const MAX_DASHBOARD_REQUEST_TIMEOUT_MS: u64 = 300_000;
+const MAX_DASHBOARD_HISTORY_BATCH_SIZE: usize = 1_000;
+const MAX_DASHBOARD_HISTORY_LIMIT: usize = 1_000;
 
 fn validate_dashboard_limits(
     max_connections: usize,
@@ -915,14 +917,10 @@ async fn serve_dashboard(
     options: DashboardServerOptions,
 ) -> anyhow::Result<()> {
     validate_dashboard_limits(options.max_connections, options.request_timeout_ms)?;
+    require_dashboard_bearer(options.access_bearer.as_deref())?;
     let listener = TcpListener::bind(&options.listen)
         .await
         .with_context(|| format!("failed to bind dashboard listener on {}", options.listen))?;
-    let local_addr = listener.local_addr()?;
-    validate_dashboard_exposure(
-        local_addr.ip().is_loopback(),
-        options.access_bearer.as_deref(),
-    )?;
     let context = DashboardContext {
         endpoint,
         capability_token,
@@ -968,9 +966,9 @@ async fn serve_dashboard(
     }
 }
 
-fn validate_dashboard_exposure(loopback: bool, access_bearer: Option<&str>) -> anyhow::Result<()> {
-    if !loopback && access_bearer.is_none() {
-        bail!("dashboard bearer authentication is required for non-loopback listeners");
+fn require_dashboard_bearer(access_bearer: Option<&str>) -> anyhow::Result<()> {
+    if access_bearer.is_none() {
+        bail!("dashboard bearer authentication is required");
     }
     Ok(())
 }
@@ -1808,6 +1806,15 @@ fn dashboard_history_request(
     query: &HashMap<String, String>,
     task_id: String,
 ) -> anyhow::Result<DashboardHistoryRequest> {
+    let batch_size = parse_query_usize(query, "batch_size")?.unwrap_or(100);
+    if !(1..=MAX_DASHBOARD_HISTORY_BATCH_SIZE).contains(&batch_size) {
+        bail!("batch_size must be between 1 and {MAX_DASHBOARD_HISTORY_BATCH_SIZE}");
+    }
+    let limit = parse_query_usize(query, "limit")?.unwrap_or(20);
+    if !(1..=MAX_DASHBOARD_HISTORY_LIMIT).contains(&limit) {
+        bail!("limit must be between 1 and {MAX_DASHBOARD_HISTORY_LIMIT}");
+    }
+
     Ok(DashboardHistoryRequest {
         filter: TaskEventFilter {
             task_id: Some(task_id),
@@ -1824,10 +1831,8 @@ fn dashboard_history_request(
                 .transpose()?,
         },
         offset: parse_query_u64(query, "offset")?.unwrap_or(0),
-        batch_size: parse_query_usize(query, "batch_size")?
-            .unwrap_or(100)
-            .max(1),
-        limit: parse_query_usize(query, "limit")?.unwrap_or(20).max(1),
+        batch_size,
+        limit,
     })
 }
 
@@ -1961,7 +1966,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 fn bearer_authorized(headers: &HashMap<String, String>, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
-        return true;
+        return false;
     };
     headers
         .get("authorization")
@@ -2073,6 +2078,8 @@ fn text_response(status_code: u16, reason: &'static str, body: &str) -> HttpResp
 }
 
 fn error_response(status_code: u16, message: String) -> HttpResponse {
+    let body = serde_json::to_vec_pretty(&serde_json::json!({ "error": message }))
+        .unwrap_or_else(|_| br#"{"error":"failed to encode error response"}"#.to_vec());
     HttpResponse {
         status_code,
         reason: match status_code {
@@ -2082,22 +2089,20 @@ fn error_response(status_code: u16, message: String) -> HttpResponse {
             _ => "Internal Server Error",
         },
         content_type: "application/json; charset=utf-8",
-        body: serde_json::to_vec_pretty(&serde_json::json!({ "error": message }))
-            .expect("serialize dashboard error"),
+        body,
     }
 }
 
 fn encode_http_response(response: &HttpResponse) -> Vec<u8> {
     let mut encoded = Vec::new();
-    write!(
+    let _ = write!(
         &mut encoded,
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
         response.status_code,
         response.reason,
         response.content_type,
         response.body.len(),
-    )
-    .expect("encode response head");
+    );
     encoded.extend_from_slice(&response.body);
     encoded
 }
@@ -2253,8 +2258,7 @@ fn render_task_list(
         TaskListOutputKind::Jsonl => {
             let mut rendered = String::new();
             for task in tasks {
-                writeln!(&mut rendered, "{}", serde_json::to_string(task)?)
-                    .expect("write to string");
+                let _ = writeln!(&mut rendered, "{}", serde_json::to_string(task)?);
             }
             Ok(rendered)
         }
@@ -3080,15 +3084,14 @@ fn render_watch_task_frame(
     rendered_at: chrono::DateTime<Utc>,
 ) -> anyhow::Result<String> {
     let mut rendered = String::new();
-    write!(&mut rendered, "\x1b[2J\x1b[H").expect("write clear");
-    writeln!(
+    let _ = write!(&mut rendered, "\x1b[2J\x1b[H");
+    let _ = writeln!(
         &mut rendered,
         "Watching tasks from {} at {}",
         state_path.display(),
         rendered_at.to_rfc3339()
-    )
-    .expect("write header");
-    writeln!(
+    );
+    let _ = writeln!(
         &mut rendered,
         "Filters: status={} skill={} agent={} sort_by={:?} limit={}",
         query
@@ -3102,8 +3105,7 @@ fn render_watch_task_frame(
             .limit
             .map(|value| value.to_string())
             .unwrap_or_else(|| "all".to_owned()),
-    )
-    .expect("write filters");
+    );
     rendered.push('\n');
     rendered.push_str(&render_task_list(tasks, output)?);
     if !rendered.ends_with('\n') {
@@ -3154,15 +3156,14 @@ fn render_task_event_entry(
 
 fn render_task_table(tasks: &[TaskSummaryView]) -> String {
     let mut rendered = String::new();
-    writeln!(
+    let _ = writeln!(
         &mut rendered,
         "{:<18} {:<12} {:>4} {:>5} {:<12} {:<14} {:<12} REASON",
         "TASK_ID", "STATUS", "PRI", "TRY", "PAYLOAD", "AGENT", "SKILL"
-    )
-    .expect("write header");
+    );
 
     for task in tasks {
-        writeln!(
+        let _ = writeln!(
             &mut rendered,
             "{:<18} {:<12} {:>4} {:>5} {:<12} {:<14} {:<12} {}",
             truncate_cell(&task.task_id, 18),
@@ -3173,8 +3174,7 @@ fn render_task_table(tasks: &[TaskSummaryView]) -> String {
             truncate_cell(task.active_agent_id.as_deref().unwrap_or("-"), 14),
             truncate_cell(task.skill.as_deref().unwrap_or("-"), 12),
             task.last_assignment_reason.as_deref().unwrap_or("-"),
-        )
-        .expect("write row");
+        );
     }
 
     rendered
@@ -3196,16 +3196,15 @@ fn render_task_event_table_row(
 ) -> String {
     let mut rendered = String::new();
     if !*table_header_rendered {
-        writeln!(
+        let _ = writeln!(
             &mut rendered,
             "{:<8} {:<16} {:<18} {:<14} {:>5} {:<12} REASON",
             "OFFSET", "STATUS", "TASK_ID", "AGENT", "TRY", "ASSIGNMENT"
-        )
-        .expect("write header");
+        );
         *table_header_rendered = true;
     }
 
-    writeln!(
+    let _ = writeln!(
         &mut rendered,
         "{:<8} {:<16} {:<18} {:<14} {:>5} {:<12} {}",
         entry.offset,
@@ -3222,8 +3221,7 @@ fn render_task_event_table_row(
             12,
         ),
         entry.event.reason.as_deref().unwrap_or("-"),
-    )
-    .expect("write row");
+    );
 
     rendered
 }
@@ -3247,8 +3245,8 @@ mod tests {
         TaskListSortKind, bearer_authorized, build_task_list_query, constant_time_eq,
         dashboard_history_request, decode_task_event_entry, parse_http_request_head,
         render_dashboard_html, render_task_event_entry, render_task_history, render_task_list,
-        render_watch_task_frame, route_dashboard_path, split_request_target,
-        task_event_matches_filter, task_list_query_from_params, validate_dashboard_exposure,
+        render_watch_task_frame, require_dashboard_bearer, route_dashboard_path,
+        split_request_target, task_event_matches_filter, task_list_query_from_params,
         validate_dashboard_limits,
     };
     use chrono::Utc;
@@ -3499,9 +3497,8 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secreu"));
         assert!(!constant_time_eq(b"secret", b"secret-longer"));
-        assert!(validate_dashboard_exposure(true, None).is_ok());
-        assert!(validate_dashboard_exposure(false, Some("secret")).is_ok());
-        assert!(validate_dashboard_exposure(false, None).is_err());
+        assert!(require_dashboard_bearer(None).is_err());
+        assert!(require_dashboard_bearer(Some("secret")).is_ok());
         assert!(validate_dashboard_limits(1, 100).is_ok());
         assert!(validate_dashboard_limits(usize::MAX, 100).is_err());
         assert!(validate_dashboard_limits(1, 99).is_err());
@@ -3510,7 +3507,7 @@ mod tests {
         assert!(!bearer_authorized(&headers, Some("secret")));
         headers.insert("authorization".to_owned(), "Bearer secret".to_owned());
         assert!(bearer_authorized(&headers, Some("secret")));
-        assert!(bearer_authorized(&HashMap::new(), None));
+        assert!(!bearer_authorized(&HashMap::new(), None));
         let response = super::encode_http_response(&super::text_response(200, "OK", "ok"));
         let response = String::from_utf8(response).expect("response is UTF-8");
         assert!(response.contains("Content-Security-Policy:"));
@@ -3575,6 +3572,12 @@ mod tests {
         assert_eq!(parsed.offset, 12);
         assert_eq!(parsed.batch_size, 50);
         assert_eq!(parsed.limit, 6);
+
+        query.insert("batch_size".to_owned(), "1001".to_owned());
+        assert!(dashboard_history_request(&query, "task-7".to_owned()).is_err());
+        query.insert("batch_size".to_owned(), "50".to_owned());
+        query.insert("limit".to_owned(), "1001".to_owned());
+        assert!(dashboard_history_request(&query, "task-7".to_owned()).is_err());
     }
 
     #[test]

@@ -415,16 +415,17 @@ The broker requires both to pass before a request is allowed.
 - per-retention-class budgets,
 - atomic global disk-pressure reservations across concurrent topics,
 - rollback of partial segment/index writes,
+- power-loss-safe publish acknowledgements that sync segment and index data,
 - bounded topic-state and stored-frame reads,
 - and streamed recovery for stale indexes and truncated or oversized frames.
 
-The global byte counter and recovered topic state are initialized from disk and maintained in memory. Normal consumes therefore do not rescan complete segment contents, while the first access after restart still validates frames and reconstructs indexes using constant memory. Per-topic synchronization prevents recovery and reads from racing an active append.
+The global byte counter and recovered topic state are initialized from disk and maintained in memory. Normal consumes therefore do not rescan complete segment contents, while the first access after restart still validates frames and reconstructs indexes using constant memory. Per-topic synchronization prevents recovery and reads from racing an active append. A publish is acknowledged only after its segment frame and sidecar index entry are synced; newly created file entries and atomic topic-state replacements also sync their parent directory before returning success.
 
 On Unix, the storage root is owner-only (`0700`) and newly created segments, indexes, and state files are `0600`, preventing broker payloads from becoming readable through a permissive process umask.
 
 ### Audit
 
-`expressways-audit` records append-only, hash-chained audit events and provides offline verification/export utilities.
+`expressways-audit` records append-only, hash-chained audit events and provides offline verification/export utilities. An event is acknowledged only after its complete line and directory entry are synced. A failed multi-write append is durably truncated back to its original length before the sink returns an error, preserving a retryable chain.
 Existing and newly created audit logs are restricted to `0600` on Unix; their containing directory is `0700`.
 
 ### Registry
@@ -775,12 +776,14 @@ cargo run -p expressways-client --bin expresswaysctl -- validate-support-bundle 
 ### Example: Backup and restore runtime state
 
 ```bash
-cargo run -p expressways-client --bin expresswaysctl -- backup-runtime --config configs/expressways.example.toml --output-dir ./var/agent/backups --signing-private-key ./var/auth/issuer.private --signing-key-id dev
-cargo run -p expressways-client --bin expresswaysctl -- restore-runtime --backup-dir ./var/agent/backups/expressways-backup-20260326T000000Z --verification-public-key ./var/auth/issuer.public --overwrite
+cargo run -p expressways-client --bin expresswaysctl -- backup-runtime --config configs/expressways.example.toml --output-dir ./var/agent/backups --signing-private-key ./var/auth/issuer.private --signing-key-id dev --confirm-writers-stopped
+cargo run -p expressways-client --bin expresswaysctl -- restore-runtime --backup-dir ./var/agent/backups/expressways-backup-20260326T000000Z --verification-public-key ./var/auth/issuer.public --overwrite --confirm-writers-stopped
 ```
 
-The backup utility captures config plus broker/runtime state paths referenced by the config (data dir, auth revocations, issuer public keys, audit/registry files when present), and emits a manifest-driven bundle under `./var/agent/backups/`.
-CLI file ingestion fails before allocation when configured limits are exceeded: configs are capped at 1 MiB, support bundles and signed backup manifests at 16 MiB, manifest signatures at 64 KiB, and inline task or artifact attachments at 64 MiB. These readers require regular files and do not follow symlinks.
+Stop the broker, orchestrator, adapters, and every other runtime-state writer before backup or restore. The CLI requires `--confirm-writers-stopped` for backup and for a non-dry-run restore because independently copied files cannot form a trustworthy point-in-time snapshot while writers remain active. The backup utility captures config plus broker/runtime state paths referenced by the config (data dir, auth revocations, issuer public keys, audit/registry files when present), the orchestrator state, and shipped default state for the interop bridge and Nanobot runtime, then emits a manifest-driven bundle under `./var/agent/backups/`. Repeat `--additional-state NAME=PATH` on both backup and restore to include other adapter or agent checkpoints under stable manifest names. The output directory must be disjoint from every backed-up directory so backup publication cannot recursively copy or mutate its own source. It fails rather than publishing a bundle when any required target is missing, a symlink, or an unsupported file type; absent optional state is recorded as a warning. Backup success is returned only after copied payloads, the signed manifest, the signature commit record, and their directory entries are synced. Named backup replacement is staged behind a durable publication journal: an interrupted overwrite restores the previous complete bundle, while a committed overwrite retains the new bundle and finishes cleanup on the next attempt. Restore verifies every signed payload and stages and syncs every target before replacing live state. Restore destinations come exclusively from the supplied live config or the signed backup config plus the named additional-state arguments; recorded source paths are informational, allowing a bundle to move between checkout or home-directory roots without authorizing manifest-controlled destinations. Restore destinations must be mutually disjoint and may not contain the backup bundle or transaction journal; registry state already contained by the server data directory is restored through that parent snapshot instead of as a conflicting second target. If the live config itself was lost, restore derives the destination map from the signed, digest-verified config payload in the bundle and recreates the requested config path; when a live config exists, it remains the trusted destination source. A separate durable restore journal rolls an interrupted restore commit back on the next attempt, completes cleanup after a committed restore, and prevents operators from inheriting a mixed-version runtime. OS-backed transaction locks serialize backup publication and restore so one live command cannot be mistaken for an abandoned transaction.
+
+Runtime backups intentionally exclude issuer private keys, issued tokens, provider API keys, bearer secrets, and external TLS material. Protect the backup verification public key and issuer recovery material in a separate encrypted, access-controlled escrow, with a documented owner and tested retrieval procedure. Following host loss, verify and restore the bundle, recover or rotate the issuer under dual control, issue fresh operator and service credentials, and revoke potentially exposed credentials. Inventory custom runtime checkpoints and pass each one with `--additional-state`; external databases and third-party systems require separate backups and restore rehearsals. See [the operations runbook](docs/operations/runbook.md#backup-and-restore) for the recovery sequence.
+CLI file ingestion fails before allocation when configured limits are exceeded: configs are capped at 1 MiB, support bundles and signed backup manifests at 16 MiB, manifest signatures at 64 KiB, and inline task or artifact attachments at 64 MiB. These readers require regular files and do not follow symlinks. Support-bundle exports, coverage reports, audit exports, and downloaded artifacts are staged, synced, and atomically replaced so an interrupted command preserves any previous complete output.
 Backup signs the exact manifest bytes with Ed25519. Restore requires an explicitly trusted verification key and authenticates that signature before parsing the manifest, then re-derives allowed destinations from the current trusted config (override it with `--config`), rejects unknown or retargeted entries, confines payload paths to the bundle's `payload/` directory, and verifies deterministic SHA-256 digests for every file and directory tree before replacing anything. Replacements are staged beside each destination and rolled back if installation fails; unsigned legacy manifests or manifests without content digests are intentionally rejected as unverifiable.
 Runtime loaders migrate legacy persisted state documents in place to the current schema version (`1`) and fail fast on newer unsupported schema versions.
 
@@ -889,11 +892,22 @@ cargo run -p expressways-client --bin expresswaysctl -- export-audit --path ./va
 
 Verification and export scan the hash chain as a bounded-record stream rather than loading the full log into memory. Export verifies each event in the same pass that writes it, stages the result with owner-only permissions, and replaces the destination only after the complete export is durable; the source audit log cannot be selected as the destination.
 
+If an unclean shutdown leaves only an incomplete final record, stop the broker, preserve the original log, and run the explicit repair after investigation:
+
+```bash
+cargo run -p expressways-client --bin expresswaysctl -- repair-audit-tail --path ./var/audit/audit.jsonl --quarantine-output ./var/agent/audit-incomplete-tail.json --confirm
+cargo run -p expressways-client --bin expresswaysctl -- verify-audit --path ./var/audit/audit.jsonl
+```
+
+Repair refuses a log ending at a complete boundary, verifies the full retained hash chain, durably quarantines the incomplete bytes, and only then truncates the source. It cannot be used to bypass complete-record or hash-chain tampering.
+
 ### Example: Run the orchestrator
 
 ```bash
 cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 supervise --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --tasks-topic tasks --task-events-topic task_events
-cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 serve-dashboard --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --listen 127.0.0.1:8787
+openssl rand -hex 32 > ./var/auth/dashboard.token
+chmod 600 ./var/auth/dashboard.token
+cargo run -p expressways-orchestrator -- --transport tcp --address 127.0.0.1:7766 serve-dashboard --token-file ./var/auth/developer.token --state-path ./var/orchestrator/state.json --listen 127.0.0.1:8787 --access-bearer-file ./var/auth/dashboard.token
 make run-orchestrator
 make run-dashboard
 make run-stack
@@ -915,9 +929,11 @@ cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --addres
 cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address 127.0.0.1:7766 report-task --token-file ./var/auth/developer.token --task-id task-1 --assignment-id <assignment-id> --agent-id summarizer --status completed --attempt 1
 ```
 
-The dashboard permits unauthenticated access only on a loopback bind. A non-loopback listener requires `--access-bearer` or, preferably, `--access-bearer-file`; every client or terminating reverse proxy request must send `Authorization: Bearer <value>`. Request headers are capped at 8 KiB, reads time out after 5 seconds, and concurrent connections default to 64 (`--request-timeout-ms` and `--max-connections` adjust these limits). For the Make targets, pass the authentication option through `DASHBOARD_ACCESS_ARGS`, for example `DASHBOARD_ACCESS_ARGS='--access-bearer-file ./var/auth/dashboard.token'`.
+The dashboard always requires `--access-bearer` or, preferably, `--access-bearer-file`, including on loopback; every client or terminating reverse proxy request must send `Authorization: Bearer <value>`. History requests bound `batch_size` and `limit` to 1,000 records. Request headers are capped at 8 KiB, reads time out after 5 seconds, and concurrent connections default to 64 (`--request-timeout-ms` and `--max-connections` adjust these limits). For the Make targets, pass the authentication option through `DASHBOARD_ACCESS_ARGS`, for example `DASHBOARD_ACCESS_ARGS='--access-bearer-file ./var/auth/dashboard.token'`.
 
 This loop lets the supervisor consume `tasks`, emit audited `assigned` records to `task_events`, and then close the task when an agent reports `completed` or `failed`. The same topic also carries orchestrator-published `timed_out`, `retry_scheduled`, `exhausted`, and `canceled` lifecycle events. `show-metrics` summarizes the persisted orchestrator state with per-status counts, total retries, and oldest in-flight assignment age, while `list-tasks`, `watch-tasks`, and `show-task` let operators inspect which specific task is active, retrying, or stuck. `watch-tasks` is a live terminal view that refreshes the same filtered and sorted queue output used by `list-tasks`, so operators can monitor assignments without rerunning commands manually. `serve-dashboard` exposes the same queue and lifecycle data over a small local HTTP server with `/api/metrics`, `/api/tasks`, `/api/tasks/<task-id>`, and `/api/tasks/<task-id>/history`, plus a built-in browser dashboard on `http://127.0.0.1:8787/`. The queue and task detail views now also surface payload kind and content type, which makes binary tasks such as images, PDFs, and protobuf blobs inspectable alongside the original JSON task flow. If you want quick local entrypoints instead of pasting the full commands, `make help` lists the common workflows and `make run-expressways`, `make run-orchestrator`, `make run-dashboard`, and `make run-stack` wrap the same broker, supervisor, and dashboard flows. Both `list-tasks` and `show-task` now include the latest assignment rationale from the scheduler, and `list-tasks` can sort by `offset`, `priority`, `age`, or `retries` to make the queue more actionable. `show-task-history` and `tail-task-events` now share the same event filters for `task_id`, `status`, `agent_id`, and `assignment_id`, plus matching `json`, `jsonl`, and compact `table` outputs, so point-in-time inspection and live tailing use the same operator workflow. `submit-task` now accepts scheduler hints such as `--priority`, repeated `--preferred-agent`, and repeated `--avoid-agent`, plus generic payload forms with `--payload-json`, `--payload-text`, `--payload-base64`, or `--payload-file`. File payloads are uploaded to the broker as managed artifacts by default, so task messages carry `artifact_ref` metadata instead of host-local paths; `--payload-inline` is still available when you want images, PDFs, protobuf bytes, or other blobs up to the 64 MiB attachment ceiling embedded directly in the task message. Workers fetch managed artifacts through the authenticated broker API and verify the returned length and SHA-256 before handlers can read them. Broker-local paths and task-supplied `file_ref` paths are treated as untrusted metadata and are never opened implicitly by `AssignedTask`; remote artifact responses omit broker-local paths entirely. The broker also exposes `put-artifact`, `stat-artifact`, and `get-artifact` for explicit artifact workflows, including hash verification and durable local storage under the broker data directory. Artifact directories are `0700` and blobs/metadata are durably written as `0600` on Unix. Each orchestrator-generated `assigned` event now also includes a human-readable scheduler reason so operators can see why that agent won. `requeue-task` and `cancel-task` publish audited control events instead of mutating local state silently, and cancellation-aware workers can observe those events before they emit a stale completion.
+
+Artifact metadata is the commit record for its blob. If a process or host failure occurs after a blob becomes durable but before metadata is committed, an identical named retry verifies the existing bytes and completes the commit. A conflicting retry fails closed and reports artifact degradation rather than replacing uncommitted data.
 
 Orchestrator state is size-bounded and semantically validated before use, including collection limits and map-key/record-ID consistency. Incoming task work items are rejected before mutation when their serialized form exceeds 1 MiB or when identifiers, agent-hint collections, retry counts, or durations violate safety bounds; oversized raw task messages are discarded before JSON parsing. Lifecycle events are limited to 64 KiB and their identifiers, reasons, task offsets, attempts, and active-lease identity are validated before any state mutation. Saves use an atomically renamed, durably flushed owner-only file (`0600` on Unix), so an interrupted write cannot expose a partially serialized live state document.
 
@@ -976,7 +992,7 @@ LLM/tool agent, destination delivery, and restart recovery—with:
 make test-local-backbone-profile
 ```
 
-Nanobot file access and process execution are default-deny: at least one canonical `--workspace-root` is required for `read_file`, and `exec` accepts only exact program names supplied with `--allow-exec-program`. An empty executable allowlist disables `exec`. Subprocesses receive only a minimal `PATH`/locale environment, output capture is capped at 1 MiB per stream, and timed-out processes are terminated instead of continuing in the background.
+Nanobot file access and process execution are default-deny: at least one canonical `--workspace-root` is required for `read_file`, and `exec` accepts only exact program names supplied with `--allow-exec-program`. An empty executable allowlist disables `exec`. Subprocesses receive only a minimal `PATH`/locale environment, output capture is capped at 1 MiB per stream, and timed-out processes are terminated instead of continuing in the background. Session and memory records are synced before append success; an incomplete trailing record from an interrupted prior write is truncated to the last complete JSONL boundary before the next append. Runtime checkpoints and contained handler outputs use synced same-directory replacements, including parent-directory synchronization.
 
 Run the runtime with native OpenAI provider:
 
@@ -1125,7 +1141,7 @@ The same tab now includes:
 - nested table-array add/remove/edit support in form mode for auth/policy/quota rule/profile lists,
 - a `Config Audit Trail` panel backed by append-only local entries in `var/agent/config-audit/entries.jsonl`.
 
-The console bounds configuration files and backups to 1 MiB and applies them through contained, owner-only atomic replacements. Audit records are bounded to 64 KiB and the local audit log to 64 MiB; once full, audit appends fail visibly and configuration changes are rolled back until the log is exported and rotated.
+The console bounds configuration files and backups to 1 MiB and applies them through contained, owner-only atomic replacements. Audit records are bounded to 64 KiB and the local audit log to 64 MiB; once full, audit appends fail visibly and configuration changes are rolled back until the log is exported and rotated. Audit appends sync both data and a newly created directory entry, roll a failed append back to its prior length, and repair only a bounded incomplete final record on restart. Complete malformed records and oversized boundaryless tails remain visible corruption instead of being silently discarded.
 
 The `Advanced Control` tab lets operators execute arbitrary control-plane commands from JSON templates (including attachment-aware artifact workflows), inspect full broker responses, and retain recent execution history for debugging and rehearsal runs. Mutating command types now require a guard acknowledgment plus a short reason before execution.
 
@@ -1167,7 +1183,7 @@ Run the webhook ingress bridge:
 cargo run -p expressways-interop-bridge -- --transport tcp --address 127.0.0.1:7766 --listen 127.0.0.1:8891 --ingress-token-file ./var/auth/bridge-ingress.token --egress-token-file ./var/auth/bridge-egress.token --ingress-bearer-file ./var/auth/bridge-ingress.secret --egress-url https://channel.example/v1/expressways/replies --egress-bearer-file ./var/auth/channel-egress.token --state-path ./var/agent/interop-bridge-state.json --tasks-topic interop.chat.requests --task-type interop.chat.handoff --default-skill chat.reply
 ```
 
-Non-loopback bridge listeners require an ingress bearer. The ingress and egress broker credentials are separate so each principal receives only the permissions its direction needs. Prefer secret files so credentials are not exposed in process arguments. JSON webhooks default to 1 MiB, while the separate raw artifact endpoint accepts up to 64 MiB without base64 inflation. Identical named artifact retries return the existing immutable artifact, and authenticated `GET /v1/artifacts/{id}` reads let reply adapters resolve media through the bridge without a second HTTP service. Messages can also carry bounded structured locations, contacts, polls, edits, deletes, and protocol events when no text or attachment exists. The request reader caps headers at 64 KiB, rejects overflowing lengths, and grows storage only as bytes arrive. Versioned webhook records accept additive unknown fields while continuing to bound and validate known identifiers, metadata, attachments, routing, retry policy, and integrity claims. Durable egress persists its reply cursor and advances it only after a 2xx acknowledgement. See the [supported chat interoperability contract](docs/design/chat-interop.md) for idempotency, affinity ordering, media upload, and reply semantics.
+All bridge listeners, including loopback listeners, require an ingress bearer. The ingress and egress broker credentials are separate so each principal receives only the permissions its direction needs. Prefer secret files so credentials are not exposed in process arguments. JSON webhooks default to 1 MiB, while the separate raw artifact endpoint accepts up to 64 MiB without base64 inflation. Identical named artifact retries return the existing immutable artifact, and authenticated `GET /v1/artifacts/{id}` reads let reply adapters resolve media through the bridge without a second HTTP service. Messages can also carry bounded structured locations, contacts, polls, edits, deletes, and protocol events when no text or attachment exists. The request reader caps headers at 64 KiB, rejects overflowing lengths, and grows storage only as bytes arrive. Versioned webhook records accept additive unknown fields while continuing to bound and validate known identifiers, metadata, attachments, routing, retry policy, and integrity claims. Durable egress persists its reply cursor and advances it only after a 2xx acknowledgement. See the [supported chat interoperability contract](docs/design/chat-interop.md) for idempotency, affinity ordering, media upload, and reply semantics.
 
 Submit a sample channel handoff:
 
@@ -1474,10 +1490,12 @@ When degraded, metrics include component-level detail such as:
 
 Recovery today is pragmatic and local:
 
-- storage can recover indexes and trailing frames,
-- audit can retry and re-open,
+- storage recovers indexes and incomplete trailing frames,
+- audit appends roll back in-process failures and provide an explicit evidence-preserving incomplete-tail repair,
+- signed backup publication and multi-target restore recover interrupted transactions through durable journals,
 - adopters can probe and self-heal some paths,
-- registry can bootstrap missing files when configured.
+- registry can bootstrap missing files when configured,
+- worker, orchestrator, cursor, session, and memory checkpoints use atomic or bounded append recovery.
 
 ## Benchmarks and Orchestration
 

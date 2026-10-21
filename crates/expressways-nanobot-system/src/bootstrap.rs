@@ -76,7 +76,7 @@ pub async fn create_system(config: CreateSystemConfig) -> anyhow::Result<CreateS
 
     let summary_path = config.output_dir.join("nanobot-system.toml");
     let snippets_path = config.output_dir.join("nanobot-auth-policy-snippets.toml");
-    std::fs::write(
+    crate::state::atomic_replace(
         &summary_path,
         render_summary_file(
             &prefix,
@@ -84,10 +84,11 @@ pub async fn create_system(config: CreateSystemConfig) -> anyhow::Result<CreateS
             &outbound_topic,
             &outbound_stream_topic,
             &runtime_events_topic,
-        ),
+        )
+        .as_bytes(),
     )
     .with_context(|| format!("failed to write {}", summary_path.display()))?;
-    std::fs::write(
+    crate::state::atomic_replace(
         &snippets_path,
         render_snippets_file(
             &config.runtime_principal,
@@ -96,7 +97,8 @@ pub async fn create_system(config: CreateSystemConfig) -> anyhow::Result<CreateS
             &outbound_topic,
             &outbound_stream_topic,
             &runtime_events_topic,
-        ),
+        )
+        .as_bytes(),
     )
     .with_context(|| format!("failed to write {}", snippets_path.display()))?;
 

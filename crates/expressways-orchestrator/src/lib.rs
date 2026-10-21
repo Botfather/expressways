@@ -935,10 +935,6 @@ fn atomic_replace_state(path: &Path, rendered: &[u8]) -> std::io::Result<()> {
         let mut file = options.open(&temp_path)?;
         file.write_all(rendered)?;
         file.sync_all()?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
         fs::rename(&temp_path, path)?;
         #[cfg(unix)]
         if let Some(parent) = path.parent() {
@@ -1024,10 +1020,9 @@ fn apply_task_event_inner(
 
     let mut assigned_agent = None;
     let outcome = {
-        let task = state
-            .tasks
-            .get_mut(&event.task_id)
-            .expect("task existence checked before mutation");
+        let Some(task) = state.tasks.get_mut(&event.task_id) else {
+            return TaskEventApplyOutcome::SkippedMissingTask;
+        };
 
         task.last_event_at = event.emitted_at;
         task.attempts = task.attempts.max(event.attempt);
@@ -1045,7 +1040,7 @@ fn apply_task_event_inner(
             TaskStatus::Assigned => {
                 let (Some(assignment_id), Some(agent_id)) = (event.assignment_id, &event.agent_id)
                 else {
-                    unreachable!("assignment fields checked before mutation");
+                    return TaskEventApplyOutcome::SkippedMalformed;
                 };
 
                 task.status = TaskStatus::Assigned;

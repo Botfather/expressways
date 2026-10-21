@@ -73,6 +73,32 @@ fn write_private_new_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .with_context(|| format!("failed to sync {}", path.display()))
 }
 
+fn atomic_write_report(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let file_name = path.file_name().context("report path has no file name")?;
+    let staged = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        Uuid::now_v7()
+    ));
+    let result = (|| -> anyhow::Result<()> {
+        write_private_new_file(&staged, bytes)?;
+        fs::rename(&staged, path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(staged);
+    }
+    result
+}
+
 #[derive(Debug, Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -1216,10 +1242,7 @@ fn duration_ms(duration: &Duration) -> f64 {
 fn print_or_write<T: Serialize>(value: &T, output: Option<&Path>) -> anyhow::Result<()> {
     let rendered = serde_json::to_vec_pretty(value)?;
     if let Some(output) = output {
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(output, rendered)
+        atomic_write_report(output, &rendered)
             .with_context(|| format!("failed to write {}", output.display()))?;
     } else {
         println!("{}", String::from_utf8(rendered)?);
@@ -1237,6 +1260,27 @@ fn stop_server(child: &mut Child) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benchmark_reports_are_atomically_replaced() {
+        let root =
+            std::env::temp_dir().join(format!("expressways-benchmark-report-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create report root");
+        let path = root.join("latest.json");
+        fs::write(&path, b"old").expect("write old report");
+
+        atomic_write_report(&path, b"new").expect("replace report");
+        assert_eq!(fs::read(&path).expect("read report"), b"new");
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("read report root")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0
+        );
+        fs::remove_dir_all(root).expect("remove report root");
+    }
 
     #[test]
     fn benchmark_config_reader_rejects_oversized_and_symlinked_files() {

@@ -12,6 +12,26 @@ OLD_KEY_ID="${OLD_KEY_ID:-dev}"
 NEW_KEY_ID="${NEW_KEY_ID:-dev-2026q2}"
 mkdir -p "$EVIDENCE_DIR" "$LOG_DIR" "$WORK_ROOT"
 
+validate_work_root() {
+  local evidence_root work_root work_leaf
+  evidence_root="$(cd "$EVIDENCE_DIR" && pwd -P)"
+  work_root="$(cd "$WORK_ROOT" && pwd -P)"
+  work_leaf="$(basename "$work_root")"
+  if [[ "$evidence_root" == "/" || "$work_root" == "/" || "$work_root" == "$evidence_root" ]]; then
+    echo "Unsafe key-rotation work root: $work_root" >&2
+    return 1
+  fi
+  case "$work_root" in
+    "$evidence_root"/*-workdir) ;;
+    *)
+      echo "key-rotation WORK_ROOT must resolve to a *-workdir directory beneath EVIDENCE_DIR: $work_root" >&2
+      return 1
+      ;;
+  esac
+  [[ "$work_leaf" == *-workdir ]]
+}
+validate_work_root
+
 TIMESTAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
 REPORT_PATH="${REPORT_PATH:-$EVIDENCE_DIR/key-rotation-rehearsal-${TIMESTAMP}.md}"
 JSON_PATH="${JSON_PATH:-$EVIDENCE_DIR/key-rotation-rehearsal-${TIMESTAMP}.json}"

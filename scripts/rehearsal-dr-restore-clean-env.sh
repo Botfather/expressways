@@ -10,6 +10,26 @@ WORK_ROOT="${WORK_ROOT:-$EVIDENCE_DIR/dr-restore-workdir}"
 BROKER_PORT="${BROKER_PORT:-7788}"
 mkdir -p "$EVIDENCE_DIR" "$LOG_DIR" "$WORK_ROOT"
 
+validate_work_root() {
+  local evidence_root work_root work_leaf
+  evidence_root="$(cd "$EVIDENCE_DIR" && pwd -P)"
+  work_root="$(cd "$WORK_ROOT" && pwd -P)"
+  work_leaf="$(basename "$work_root")"
+  if [[ "$evidence_root" == "/" || "$work_root" == "/" || "$work_root" == "$evidence_root" ]]; then
+    echo "Unsafe DR work root: $work_root" >&2
+    return 1
+  fi
+  case "$work_root" in
+    "$evidence_root"/*-workdir) ;;
+    *)
+      echo "DR WORK_ROOT must resolve to a *-workdir directory beneath EVIDENCE_DIR: $work_root" >&2
+      return 1
+      ;;
+  esac
+  [[ "$work_leaf" == *-workdir ]]
+}
+validate_work_root
+
 TIMESTAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
 REPORT_PATH="${REPORT_PATH:-$EVIDENCE_DIR/dr-restore-clean-env-${TIMESTAMP}.md}"
 JSON_PATH="${JSON_PATH:-$EVIDENCE_DIR/dr-restore-clean-env-${TIMESTAMP}.json}"
@@ -23,6 +43,8 @@ BACKUP_ID="dr-restore-${TIMESTAMP}"
 BACKUP_DIR="$BACKUP_OUTPUT_DIR/$BACKUP_ID"
 CONFIG_AUDIT_LOG="$WORK_ROOT/var/agent/config-audit/entries.jsonl"
 ORCH_STATE_PATH="$WORK_ROOT/var/orchestrator/state.json"
+INTEROP_STATE_PATH="$WORK_ROOT/var/agent/interop-bridge-state.json"
+NANOBOT_STATE_DIR="$WORK_ROOT/var/agent/nanobot-runtime"
 BROKER_LOG="$LOG_DIR/${TIMESTAMP}-dr-restore-broker.log"
 BROKER_ADDRESS="127.0.0.1:${BROKER_PORT}"
 
@@ -112,7 +134,7 @@ trap cleanup EXIT
 
 prepare_workspace() {
   rm -rf "$WORK_ROOT"
-  mkdir -p "$WORK_ROOT/configs" "$WORK_ROOT/var/auth" "$WORK_ROOT/var/audit" "$WORK_ROOT/var/data" "$WORK_ROOT/var/registry" "$WORK_ROOT/var/agent/config-audit" "$WORK_ROOT/var/orchestrator"
+  mkdir -p "$WORK_ROOT/configs" "$WORK_ROOT/var/auth" "$WORK_ROOT/var/audit" "$WORK_ROOT/var/data" "$WORK_ROOT/var/registry" "$WORK_ROOT/var/agent/config-audit" "$NANOBOT_STATE_DIR" "$WORK_ROOT/var/orchestrator"
 
   cat >"$CONFIG_PATH" <<CFG
 [schema]
@@ -197,6 +219,8 @@ CFG
 
   printf '{"entry":"dr-rehearsal"}\n' >"$CONFIG_AUDIT_LOG"
   printf '{"tasks":[]}\n' >"$ORCH_STATE_PATH"
+  printf '{"schema_version":1,"cursors":{}}\n' >"$INTEROP_STATE_PATH"
+  printf '{"schema_version":1}\n' >"$NANOBOT_STATE_DIR/runtime-state.json"
   printf '{"schema_version":1,"agents":[]}\n' >"$WORK_ROOT/var/registry/agents.json"
   printf '{"revoked_tokens":[],"revoked_principals":[],"revoked_key_ids":[]}\n' >"$WORK_ROOT/var/auth/revocations.json"
   : >"$WORK_ROOT/var/audit/audit.jsonl"
@@ -226,12 +250,20 @@ wait_for_health() {
 }
 
 corrupt_runtime_state() {
+  rm -f "$CONFIG_PATH"
   rm -rf "$WORK_ROOT/var/data"
   rm -f "$WORK_ROOT/var/audit/audit.jsonl"
   rm -f "$WORK_ROOT/var/auth/revocations.json"
   rm -f "$WORK_ROOT/var/registry/agents.json"
   rm -f "$CONFIG_AUDIT_LOG"
   rm -f "$ORCH_STATE_PATH"
+  rm -f "$INTEROP_STATE_PATH"
+  rm -rf "$NANOBOT_STATE_DIR"
+}
+
+verify_auxiliary_state() {
+  test -f "$INTEROP_STATE_PATH"
+  test -f "$NANOBOT_STATE_DIR/runtime-state.json"
 }
 
 emit_report() {
@@ -292,9 +324,11 @@ if run_step "Prepare isolated workspace" prepare_workspace \
   && run_step "Start broker baseline" start_broker \
   && run_step "Verify baseline health" wait_for_health \
   && run_step "Stop broker baseline" stop_broker \
-  && run_step "Create runtime backup" cargo run -p expressways-client --bin expresswaysctl -- backup-runtime --config "$CONFIG_PATH" --output-dir "$BACKUP_OUTPUT_DIR" --backup-id "$BACKUP_ID" --config-audit-log "$CONFIG_AUDIT_LOG" --orchestrator-state "$ORCH_STATE_PATH" --signing-private-key "$PRIVATE_KEY_PATH" --signing-key-id dev --overwrite \
+  && run_step "Create runtime backup" cargo run -p expressways-client --bin expresswaysctl -- backup-runtime --config "$CONFIG_PATH" --output-dir "$BACKUP_OUTPUT_DIR" --backup-id "$BACKUP_ID" --config-audit-log "$CONFIG_AUDIT_LOG" --orchestrator-state "$ORCH_STATE_PATH" --additional-state "interop_bridge=$INTEROP_STATE_PATH" --additional-state "nanobot_runtime=$NANOBOT_STATE_DIR" --signing-private-key "$PRIVATE_KEY_PATH" --signing-key-id dev --overwrite --confirm-writers-stopped \
+  && run_step "Overwrite named runtime backup" cargo run -p expressways-client --bin expresswaysctl -- backup-runtime --config "$CONFIG_PATH" --output-dir "$BACKUP_OUTPUT_DIR" --backup-id "$BACKUP_ID" --config-audit-log "$CONFIG_AUDIT_LOG" --orchestrator-state "$ORCH_STATE_PATH" --additional-state "interop_bridge=$INTEROP_STATE_PATH" --additional-state "nanobot_runtime=$NANOBOT_STATE_DIR" --signing-private-key "$PRIVATE_KEY_PATH" --signing-key-id dev --overwrite --confirm-writers-stopped \
   && run_step "Corrupt runtime state" corrupt_runtime_state \
-  && run_step "Restore runtime backup" cargo run -p expressways-client --bin expresswaysctl -- restore-runtime --backup-dir "$BACKUP_DIR" --config "$CONFIG_PATH" --config-audit-log "$CONFIG_AUDIT_LOG" --orchestrator-state "$ORCH_STATE_PATH" --verification-public-key "$PUBLIC_KEY_PATH" --overwrite \
+  && run_step "Restore runtime backup" cargo run -p expressways-client --bin expresswaysctl -- restore-runtime --backup-dir "$BACKUP_DIR" --config "$CONFIG_PATH" --config-audit-log "$CONFIG_AUDIT_LOG" --orchestrator-state "$ORCH_STATE_PATH" --additional-state "interop_bridge=$INTEROP_STATE_PATH" --additional-state "nanobot_runtime=$NANOBOT_STATE_DIR" --verification-public-key "$PUBLIC_KEY_PATH" --overwrite --confirm-writers-stopped \
+  && run_step "Verify auxiliary runtime state" verify_auxiliary_state \
   && run_step "Start broker after restore" start_broker \
   && run_step "Verify health after restore" wait_for_health \
   && run_step "Verify metrics after restore" cargo run -p expressways-client --bin expresswaysctl -- --transport tcp --address "$BROKER_ADDRESS" metrics --token-file "$TOKEN_FILE" \

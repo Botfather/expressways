@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1468,10 +1468,6 @@ fn atomic_replace_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()>
     ));
     let result = (|| {
         write_new_private_file(&temporary, bytes)?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
         fs::rename(&temporary, path)?;
         #[cfg(unix)]
         fs::File::open(parent)?.sync_all()?;
@@ -2484,7 +2480,7 @@ fn append_config_audit_entry(root: &Path, entry: ConfigAuditEntryView) -> Result
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut options = fs::OpenOptions::new();
-    options.create(true).append(true);
+    options.read(true).create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -2507,8 +2503,9 @@ fn append_config_audit_entry(root: &Path, entry: ConfigAuditEntryView) -> Result
             path.display()
         ));
     }
-    let projected = metadata
-        .len()
+    let original_length = repair_partial_config_audit_tail(&file, metadata.len())
+        .map_err(|error| format!("failed to repair {}: {error}", path.display()))?;
+    let projected = original_length
         .checked_add(record.len() as u64)
         .ok_or_else(|| "config audit size overflowed while preparing an append".to_owned())?;
     if projected > MAX_CONFIG_AUDIT_BYTES {
@@ -2522,19 +2519,94 @@ fn append_config_audit_entry(root: &Path, entry: ConfigAuditEntryView) -> Result
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("failed to secure {}: {error}", path.display()))?;
     }
-    file.write_all(&record).map_err(|error| {
-        format!(
-            "failed to append config audit log {}: {error}",
-            path.display()
-        )
-    })?;
-    file.sync_data().map_err(|error| {
-        format!(
-            "failed to sync config audit log {}: {error}",
-            path.display()
-        )
-    })?;
+    let append_result = (|| -> std::io::Result<()> {
+        file.write_all(&record)?;
+        file.sync_data()?;
+        #[cfg(unix)]
+        fs::File::open(&audit_root)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(append_error) = append_result {
+        let rollback_result = file
+            .set_len(original_length)
+            .and_then(|()| file.sync_data());
+        return Err(match rollback_result {
+            Ok(()) => format!(
+                "failed to append config audit log {}: {append_error}",
+                path.display()
+            ),
+            Err(rollback_error) => format!(
+                "config audit append failed ({append_error}); rollback to {original_length} bytes also failed ({rollback_error})"
+            ),
+        });
+    }
     Ok(())
+}
+
+fn repair_partial_config_audit_tail(
+    mut file: &fs::File,
+    current_bytes: u64,
+) -> std::io::Result<u64> {
+    if current_bytes == 0 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut final_byte = [0_u8; 1];
+    file.read_exact(&mut final_byte)?;
+    if final_byte[0] == b'\n' {
+        return Ok(current_bytes);
+    }
+
+    const SCAN_BYTES: u64 = 8 * 1024;
+    let mut end = current_bytes;
+    let scan_floor = current_bytes.saturating_sub(MAX_CONFIG_AUDIT_RECORD_BYTES + 1);
+    let mut buffer = vec![0_u8; SCAN_BYTES as usize];
+    let mut complete_prefix_bytes = None;
+    while end > scan_floor {
+        let start = end.saturating_sub(SCAN_BYTES).max(scan_floor);
+        let length = usize::try_from(end - start).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "config audit tail length overflow",
+            )
+        })?;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..length])?;
+        if let Some(position) = buffer[..length].iter().rposition(|byte| *byte == b'\n') {
+            complete_prefix_bytes = Some(start + position as u64 + 1);
+            break;
+        }
+        end = start;
+    }
+    let complete_prefix_bytes = match complete_prefix_bytes {
+        Some(bytes) => bytes,
+        None if scan_floor == 0 => 0,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "incomplete config audit tail exceeds the record size limit",
+            ));
+        }
+    };
+
+    file.seek(SeekFrom::Start(complete_prefix_bytes))?;
+    let tail_bytes = usize::try_from(current_bytes - complete_prefix_bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config audit tail length overflow",
+        )
+    })?;
+    let mut tail = vec![0_u8; tail_bytes];
+    file.read_exact(&mut tail)?;
+    if serde_json::from_slice::<ConfigAuditEntryView>(&tail).is_ok() {
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+        return Ok(current_bytes.saturating_add(1));
+    }
+
+    file.set_len(complete_prefix_bytes)?;
+    file.sync_data()?;
+    Ok(complete_prefix_bytes)
 }
 
 fn list_config_audit_entries(
@@ -2613,11 +2685,19 @@ fn list_config_audit_entries(
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(entry) = serde_json::from_str::<ConfigAuditEntryView>(trimmed) {
-            if entries.len() == limit.max(1) {
-                entries.pop_front();
+        match serde_json::from_str::<ConfigAuditEntryView>(trimmed) {
+            Ok(entry) => {
+                if entries.len() == limit.max(1) {
+                    entries.pop_front();
+                }
+                entries.push_back(entry);
             }
-            entries.push_back(entry);
+            Err(_) if line.as_bytes().last() != Some(&b'\n') => break,
+            Err(error) => {
+                return Err(format!(
+                    "config audit log contains malformed complete JSON: {error}"
+                ));
+            }
         }
     }
     let mut entries = entries.into_iter().collect::<Vec<_>>();
@@ -4063,7 +4143,7 @@ fn command_name(command: &ControlCommand) -> &'static str {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .manage(RegistryStreamState::default())
         .invoke_handler(tauri::generate_handler![
             monitor_snapshot,
@@ -4092,8 +4172,18 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+    if let Err(error) = result {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "level": "error",
+                "event": "console_runtime_failed",
+                "error": error.to_string(),
+            })
+        );
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -4509,7 +4599,83 @@ actions = ["health", "admin"]
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].summary, "second");
 
+        let audit_path = config_audit_log_path(&root);
+        let audit_length = fs::metadata(&audit_path).expect("inspect audit log").len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&audit_path)
+            .expect("open audit log for truncation")
+            .set_len(audit_length - 1)
+            .expect("remove final newline");
+        append_config_audit_entry(
+            &root,
+            ConfigAuditEntryView {
+                entry_id: "3".to_owned(),
+                recorded_at_ms: 3,
+                actor: "console:test".to_owned(),
+                category: "config".to_owned(),
+                action: "recover-complete".to_owned(),
+                component_id: None,
+                section_key: None,
+                service_id: None,
+                command_type: None,
+                success: Some(true),
+                status_code: None,
+                summary: "third".to_owned(),
+                diff: None,
+            },
+        )
+        .expect("complete missing newline and append");
+        assert_eq!(
+            list_config_audit_entries(&root, 10)
+                .expect("list newline-recovered entries")
+                .len(),
+            3
+        );
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&audit_path)
+            .expect("open audit log")
+            .write_all(b"{\"partial\":")
+            .expect("append interrupted tail");
+        append_config_audit_entry(
+            &root,
+            ConfigAuditEntryView {
+                entry_id: "4".to_owned(),
+                recorded_at_ms: 4,
+                actor: "console:test".to_owned(),
+                category: "config".to_owned(),
+                action: "recover".to_owned(),
+                component_id: None,
+                section_key: None,
+                service_id: None,
+                command_type: None,
+                success: Some(true),
+                status_code: None,
+                summary: "fourth".to_owned(),
+                diff: None,
+            },
+        )
+        .expect("repair interrupted tail and append");
+        let recovered = list_config_audit_entries(&root, 10).expect("list recovered entries");
+        assert_eq!(recovered.len(), 4);
+        assert_eq!(recovered[0].summary, "fourth");
+
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn config_audit_rejects_malformed_complete_records() {
+        let root = temporary_root("audit-malformed");
+        let audit_root = config_audit_root_path(&root);
+        ensure_directory_tree_within_root(&root, &audit_root).expect("create audit root");
+        fs::write(config_audit_log_path(&root), b"not-json\n").expect("write malformed audit");
+
+        let error =
+            list_config_audit_entries(&root, 10).expect_err("complete corruption must be visible");
+        assert!(error.contains("malformed complete JSON"));
+        fs::remove_dir_all(root).expect("remove temporary root");
     }
 
     #[cfg(unix)]

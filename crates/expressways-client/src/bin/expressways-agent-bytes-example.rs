@@ -605,10 +605,7 @@ fn log_worker_outcome(outcome: &WorkerRunOutcome) {
 }
 
 fn log_json(value: serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string(&value).expect("serialize structured log")
-    );
+    println!("{value}");
 }
 
 fn endpoint_from_cli(

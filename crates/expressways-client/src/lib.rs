@@ -248,10 +248,6 @@ pub fn save_agent_worker_state(path: &Path, state: &AgentWorkerState) -> anyhow:
         let mut file = options.open(&temporary)?;
         file.write_all(&rendered)?;
         file.sync_all()?;
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
         fs::rename(&temporary, path)?;
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;
@@ -605,7 +601,13 @@ pub async fn write_contained_file(
         file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
-        tokio::fs::rename(&temporary, canonical_parent.join(file_name)).await
+        tokio::fs::rename(&temporary, canonical_parent.join(file_name)).await?;
+        #[cfg(unix)]
+        tokio::fs::File::open(&canonical_parent)
+            .await?
+            .sync_all()
+            .await?;
+        Ok::<(), std::io::Error>(())
     }
     .await;
     if result.is_err() {
